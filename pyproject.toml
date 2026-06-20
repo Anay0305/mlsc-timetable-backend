@@ -1,0 +1,8 @@
+[project]
+name = "timetable-parser"
+version = "0.1.0"
+description = "Utilities for parsing spreadsheet-based college timetables."
+requires-python = ">=3.11"
+dependencies = [
+    "openpyxl>=3.1",
+]

@@ -24,11 +24,3 @@ def class_type_for_subject(subject_code: str | None) -> str:
     if subject_code is None:
         return "UNKNOWN"
     return CLASS_TYPE_BY_SUFFIX.get(subject_code[-1], "UNKNOWN")
-
-
-def confidence_for_subject(subject_code: str | None, subject_name: str | None) -> str:
-    if subject_code is None:
-        return "Poor"
-    if subject_name is None:
-        return "Pathetic"
-    return "Good"

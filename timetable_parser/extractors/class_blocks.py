@@ -3,13 +3,15 @@ from __future__ import annotations
 from openpyxl.cell.cell import Cell
 from openpyxl.worksheet.worksheet import Worksheet
 
-from timetable_parser.core.elective_parser import build_elective_options, find_subject_codes
+from timetable_parser.core.confidence import assess_confidence
+from timetable_parser.core.elective_parser import build_elective_options, elective_mapping_counts, find_subject_codes
 from timetable_parser.core.models import CellBounds, ClassBlock, RawCell
 from timetable_parser.core.sheet_geometry import (
     build_merge_bounds,
     dedupe_raw_cells,
     dedupe_values,
     end_time,
+    malformed_excel_detail,
     raw_cells_in_bounds,
     rectangle_has_raw,
     row_has_bottom_border,
@@ -18,7 +20,7 @@ from timetable_parser.core.sheet_geometry import (
     visible_bounds_for_cell,
 )
 from timetable_parser.core.subject_catalog import SubjectCatalog, load_default_subject_catalog
-from timetable_parser.core.subject_parser import class_type_for_subject, confidence_for_subject, find_subject_code
+from timetable_parser.core.subject_parser import class_type_for_subject, find_subject_code
 from timetable_parser.extractors.batch import BatchExtractor
 from timetable_parser.extractors.day_slots import DaySlotExtractor, Slot
 
@@ -127,6 +129,25 @@ class ClassBlockExtractor:
         subject_code = subject_codes[0] if subject_codes else find_subject_code(raw)
         subject_name = subject_catalog.name_for(subject_code)
         options = build_elective_options(raw, subject_catalog)
+        final_bounds = CellBounds(
+            min_row=start_slot.cell.row,
+            min_col=base_bounds.min_col,
+            max_row=max_row,
+            max_col=base_bounds.max_col,
+        )
+        confidence = assess_confidence(
+            subject_code=subject_code,
+            subject_name=subject_name,
+            raw=raw,
+            periods=periods,
+            malformed_excel_detail=malformed_excel_detail(
+                sheet=sheet,
+                bounds=final_bounds,
+                merge_bounds=merge_bounds,
+                periods=periods,
+            ),
+            elective_mapping_counts=elective_mapping_counts(raw),
+        )
         return ClassBlock(
             batch=batch,
             day=day,
@@ -137,15 +158,12 @@ class ClassBlockExtractor:
             subject_code=subject_code,
             subject_name=subject_name,
             type=class_type_for_subject(subject_code),
-            confidence=confidence_for_subject(subject_code, subject_name),
+            confidence=confidence.level,
+            confidence_score=confidence.score,
+            confidence_reasons=confidence.reasons,
             block_kind="ELECTIVE_GROUP" if options else "CLASS",
             options=options,
-            bounds=CellBounds(
-                min_row=start_slot.cell.row,
-                min_col=base_bounds.min_col,
-                max_row=max_row,
-                max_col=base_bounds.max_col,
-            ),
+            bounds=final_bounds,
             raw=raw,
             cells=raw_cells,
         )

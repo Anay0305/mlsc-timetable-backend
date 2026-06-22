@@ -68,6 +68,67 @@ def row_has_bottom_border(sheet: Worksheet, row: int, bounds: CellBounds) -> boo
     return False
 
 
+def malformed_excel_detail(
+    sheet: Worksheet,
+    bounds: CellBounds,
+    merge_bounds: dict[tuple[int, int], CellBounds],
+    periods: int,
+) -> str | None:
+    issues: list[str] = []
+    merged = False
+    crosses_merge = False
+
+    for row in range(bounds.min_row, bounds.max_row + 1):
+        for col in range(bounds.min_col, bounds.max_col + 1):
+            merged_bounds = merge_bounds.get((row, col))
+            if merged_bounds is None:
+                continue
+            merged = True
+            if not contains(bounds, merged_bounds):
+                crosses_merge = True
+
+    edge_count = sum(
+        (
+            row_has_top_border(sheet, bounds.min_row, bounds),
+            row_has_bottom_border(sheet, bounds.max_row, bounds),
+            column_has_left_border(sheet, bounds.min_col, bounds),
+            column_has_right_border(sheet, bounds.max_col, bounds),
+        )
+    )
+
+    if crosses_merge:
+        issues.append("the extracted bounds cut through a merged range")
+    if not merged and edge_count == 0:
+        issues.append("the block has no detectable merged range or outer border")
+    if periods > 4 and not row_has_bottom_border(sheet, bounds.max_row, bounds):
+        issues.append("the long block has no closing bottom border")
+
+    return "; ".join(issues) or None
+
+
+def column_has_left_border(sheet: Worksheet, col: int, bounds: CellBounds) -> bool:
+    return any(
+        sheet.cell(row=row, column=col).border.left.style
+        for row in range(bounds.min_row, bounds.max_row + 1)
+    )
+
+
+def column_has_right_border(sheet: Worksheet, col: int, bounds: CellBounds) -> bool:
+    return any(
+        sheet.cell(row=row, column=col).border.right.style
+        for row in range(bounds.min_row, bounds.max_row + 1)
+    )
+
+
+def contains(outer: CellBounds, inner: CellBounds) -> bool:
+    return (
+        outer.min_row <= inner.min_row
+        and outer.min_col <= inner.min_col
+        and outer.max_row >= inner.max_row
+        and outer.max_col >= inner.max_col
+    )
+
+
 def slot_end_row(slot: Slot, remaining_slots: list[Slot], offset: int) -> int:
     if offset + 1 < len(remaining_slots):
         return remaining_slots[offset + 1].cell.row - 1

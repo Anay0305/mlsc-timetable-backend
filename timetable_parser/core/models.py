@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from timetable_parser.core.confidence import ConfidenceReason
+
 
 @dataclass(frozen=True)
 class CellBounds:
@@ -27,6 +29,8 @@ class ElectiveOption:
     place: str | None
     teacher: str | None
     confidence: str
+    confidence_score: int
+    confidence_reasons: tuple[ConfidenceReason, ...]
     raw: list[str]
 
 
@@ -42,6 +46,8 @@ class ClassBlock:
     subject_name: str | None
     type: str
     confidence: str
+    confidence_score: int
+    confidence_reasons: tuple[ConfidenceReason, ...]
     block_kind: str
     options: list[ElectiveOption]
     bounds: CellBounds

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from openpyxl.utils import get_column_letter
 
+from timetable_parser.core.confidence import ConfidenceReason
 from timetable_parser.core.models import ClassBlock
 
 
@@ -18,6 +21,8 @@ def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> 
                     "subject_name": block.subject_name,
                     "type": block.type,
                     "confidence": block.confidence,
+                    "confidence_score": block.confidence_score,
+                    "confidence_reasons": confidence_reasons_to_jsonable(block.confidence_reasons),
                     "block_kind": block.block_kind,
                     "options": [
                         {
@@ -27,6 +32,8 @@ def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> 
                             "place": option.place,
                             "teacher": option.teacher,
                             "confidence": option.confidence,
+                            "confidence_score": option.confidence_score,
+                            "confidence_reasons": confidence_reasons_to_jsonable(option.confidence_reasons),
                             "raw": option.raw,
                         }
                         for option in block.options
@@ -43,3 +50,14 @@ def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> 
         }
         for batch, days in blocks.items()
     }
+
+
+def confidence_reasons_to_jsonable(reasons: Sequence[ConfidenceReason]) -> list[dict[str, object]]:
+    return [
+        {
+            "code": reason.code.value,
+            "penalty": reason.penalty,
+            "detail": reason.detail,
+        }
+        for reason in reasons
+    ]

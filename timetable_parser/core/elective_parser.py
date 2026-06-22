@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import re
 
+from timetable_parser.core.confidence import assess_confidence
 from timetable_parser.core.models import ElectiveOption
 from timetable_parser.core.subject_catalog import SubjectCatalog
-from timetable_parser.core.subject_parser import class_type_for_subject, confidence_for_subject
+from timetable_parser.core.subject_parser import class_type_for_subject
 
 
 SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Z]{3}\d{3}|[A-Z]{5}\d)[LTP]")
@@ -17,16 +18,21 @@ def build_elective_options(raw: list[str], subject_catalog: SubjectCatalog) -> l
 
     places = collect_place_candidates(raw)
     teachers = collect_teacher_candidates(raw)
-    count_matches = len(places) in {0, len(subject_codes)} and len(teachers) in {0, len(subject_codes)}
 
     options: list[ElectiveOption] = []
     for index, subject_code in enumerate(subject_codes):
         subject_name = subject_catalog.name_for(subject_code)
         place = value_at_or_none(places, index)
         teacher = value_at_or_none(teachers, index)
-        confidence = confidence_for_subject(subject_code, subject_name)
-        if confidence == "Good" and not count_matches:
-            confidence = "Normal"
+        confidence = assess_confidence(
+            subject_code=subject_code,
+            subject_name=subject_name,
+            raw=[value for value in (subject_code, place, teacher) if value],
+            periods=1,
+            elective_mapping_counts=(len(subject_codes), len(places), len(teachers)),
+            missing_elective_place=bool(places) and place is None,
+            missing_elective_teacher=bool(teachers) and teacher is None,
+        )
         options.append(
             ElectiveOption(
                 subject_code=subject_code,
@@ -34,12 +40,21 @@ def build_elective_options(raw: list[str], subject_catalog: SubjectCatalog) -> l
                 type=class_type_for_subject(subject_code),
                 place=place,
                 teacher=teacher,
-                confidence=confidence,
+                confidence=confidence.level,
+                confidence_score=confidence.score,
+                confidence_reasons=confidence.reasons,
                 raw=[value for value in (subject_code, place, teacher) if value],
             )
         )
 
     return options
+
+
+def elective_mapping_counts(raw: list[str]) -> tuple[int, int, int] | None:
+    subject_codes = find_subject_codes(raw)
+    if len(subject_codes) <= 1:
+        return None
+    return len(subject_codes), len(collect_place_candidates(raw)), len(collect_teacher_candidates(raw))
 
 
 def find_subject_codes(raw: list[str]) -> list[str]:

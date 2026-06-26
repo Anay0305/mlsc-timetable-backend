@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from server.config import Settings, get_settings
-from server.db.models import BaselineDoc, BatchDoc, ContributorDoc, SemesterDoc, TimetableDoc
+from server.db.models import BaselineDoc, BatchDoc, ChangeRequestDoc, ContributorDoc, SemesterDoc, TimetableDoc
 
 logger = logging.getLogger(__name__)
 
@@ -361,6 +361,356 @@ async def delete_contributor(username: str, settings: Settings | None = None) ->
         return False
     await doc.delete()
     return True
+
+
+# ── Overrides ──────────────────────────────────────────────────────
+_BATCH_CODE = re.compile(r"^[A-Z0-9]{2,16}$")
+_DAY_PATTERN = re.compile(r"^[A-Za-z]{3,12}$")
+# Reasonable upper bound; storage layer rejects floods even if the HTTP rate
+# limiter is bypassed/misconfigured. Keep tight — admin-reviewed queue.
+MAX_PENDING_PER_REQUESTER = 20
+MAX_PENDING_PER_BATCH = 100
+MAX_PENDING_TOTAL = 1000
+# Reject identical pending requests (same batch+slot+kind+entry signature) so
+# a refresh-bug or accidental double-submit doesn't fan out the queue.
+
+
+class ChangeRequestRefused(Exception):
+    """Storage refused an override (validation, quota, duplicate)."""
+
+    def __init__(self, message: str, code: str = "refused") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _safe_class_prefix(batch_code: str) -> str:
+    """First-3-char prefix of a batch (e.g. ``"1B12"`` -> ``"1B1"``)."""
+    cleaned = _safe_batch(batch_code)
+    if len(cleaned) < 3:
+        raise ChangeRequestRefused(
+            f"batch {batch_code!r} is too short to derive a class prefix",
+            code="bad_batch",
+        )
+    return cleaned[:3]
+
+
+def _resolve_scope_batches(scope: str, requester_batch: str) -> list[str]:
+    """Return the list of canonical batches an approved request should touch."""
+    requester = _safe_batch(requester_batch)
+    if scope == "batch":
+        return [requester]
+    if scope == "class":
+        prefix = _safe_class_prefix(requester)
+        return [prefix]  # placeholder; resolved against actual batches in approval
+    raise ChangeRequestRefused(f"unknown scope {scope!r}", code="bad_scope")
+
+
+def _serialize_change_request(doc) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "id": str(doc.id),
+        "requester_id": doc.requester_id,
+        "requester_batch": doc.requester_batch,
+        "semester": doc.semester,
+        "scope": doc.scope,
+        "kind": doc.kind,
+        "day": doc.day,
+        "start_time": doc.start_time,
+        "entry": _serialize_class(doc.entry) if doc.entry is not None else None,
+        "status": doc.status,
+        "decision_note": doc.decision_note,
+        "decided_by": doc.decided_by,
+        "decided_at": doc.decided_at.isoformat() if doc.decided_at else None,
+        "applied_batches": list(doc.applied_batches or []),
+        "created_at": doc.created_at.isoformat(),
+    }
+    return payload
+
+
+async def create_change_request(
+    *,
+    requester_batch: str,
+    scope: str,
+    kind: str,
+    day: str,
+    start_time: str,
+    entry: dict[str, Any] | None = None,
+    requester_id: str | None = None,
+) -> dict[str, Any]:
+    """Validate + insert a pending ChangeRequestDoc.
+
+    Raises ChangeRequestRefused with a stable ``code`` on quota / dupe / shape
+    problems so the HTTP layer can map it to 400 / 409 cleanly.
+    """
+    if kind not in {"add", "edit", "delete"}:
+        raise ChangeRequestRefused(f"unknown kind {kind!r}", code="bad_kind")
+    if scope not in {"batch", "class"}:
+        raise ChangeRequestRefused(f"unknown scope {scope!r}", code="bad_scope")
+    if not isinstance(day, str) or not _DAY_PATTERN.match(day.strip()):
+        raise ChangeRequestRefused("invalid day", code="bad_day")
+    if not isinstance(start_time, str) or not start_time.strip():
+        raise ChangeRequestRefused("missing start_time", code="bad_slot")
+
+    requester_batch_safe = _safe_batch(requester_batch)
+    if scope == "class":
+        # Derive (and validate) the class prefix upfront so a malformed batch
+        # is rejected at create time, not surfaced later during approval.
+        _safe_class_prefix(requester_batch_safe)
+
+    if kind in {"add", "edit"} and not isinstance(entry, dict):
+        raise ChangeRequestRefused(
+            f"{kind} requires an 'entry' object",
+            code="missing_entry",
+        )
+    if kind == "delete" and entry is not None:
+        # Be forgiving but ignore caller-provided entry on delete; storage
+        # treats delete as a slot wipe regardless.
+        entry = None
+
+    # Class-scope is only allowed for Lecture changes (matches frontend
+    # business rule: lab/tutorial sectioning may differ per batch).
+    if scope == "class" and kind in {"add", "edit"}:
+        entry_type = (entry or {}).get("type")
+        if entry_type != "Lecture":
+            raise ChangeRequestRefused(
+                "class scope is only allowed for Lecture entries",
+                code="scope_requires_lecture",
+            )
+
+    # Resolve current semester so the request is anchored to the live one
+    # regardless of when the admin reviews it.
+    current = await read_current()
+    semester_label = current["label"]
+
+    # Server-side flood guards (extra to HTTP rate limiter).
+    if requester_id:
+        per_user = await ChangeRequestDoc.find(
+            ChangeRequestDoc.requester_id == requester_id,
+            ChangeRequestDoc.status == "pending",
+        ).count()
+        if per_user >= MAX_PENDING_PER_REQUESTER:
+            raise ChangeRequestRefused(
+                "too many pending requests from this user",
+                code="quota_user",
+            )
+    per_batch = await ChangeRequestDoc.find(
+        ChangeRequestDoc.requester_batch == requester_batch_safe,
+        ChangeRequestDoc.status == "pending",
+    ).count()
+    if per_batch >= MAX_PENDING_PER_BATCH:
+        raise ChangeRequestRefused(
+            "too many pending requests for this batch",
+            code="quota_batch",
+        )
+    total = await ChangeRequestDoc.find(
+        ChangeRequestDoc.status == "pending"
+    ).count()
+    if total >= MAX_PENDING_TOTAL:
+        raise ChangeRequestRefused(
+            "override queue is full; try again later",
+            code="quota_global",
+        )
+
+    # Dupe guard: identical pending request for same (batch, scope, slot, kind)
+    dupe = await ChangeRequestDoc.find_one(
+        ChangeRequestDoc.requester_batch == requester_batch_safe,
+        ChangeRequestDoc.scope == scope,
+        ChangeRequestDoc.kind == kind,
+        ChangeRequestDoc.day == day,
+        ChangeRequestDoc.start_time == start_time,
+        ChangeRequestDoc.status == "pending",
+    )
+    if dupe is not None:
+        raise ChangeRequestRefused(
+            "an identical pending request already exists",
+            code="duplicate",
+        )
+
+    doc = ChangeRequestDoc(
+        requester_id=requester_id,
+        requester_batch=requester_batch_safe,
+        semester=semester_label,
+        scope=scope,  # type: ignore[arg-type]
+        kind=kind,  # type: ignore[arg-type]
+        day=day.strip(),
+        start_time=start_time.strip(),
+        entry=entry,  # type: ignore[arg-type]
+    )
+    await doc.insert()
+    return _serialize_change_request(doc)
+
+
+async def list_change_requests(
+    *,
+    status: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
+    if status is not None and status not in {"pending", "approved", "rejected"}:
+        raise ValueError(f"invalid status {status!r}")
+    query = ChangeRequestDoc.find_all(sort=[("created_at", -1)])
+    if status:
+        query = ChangeRequestDoc.find(ChangeRequestDoc.status == status, sort=[("created_at", -1)])
+    out: list[dict[str, Any]] = []
+    async for doc in query:
+        out.append(_serialize_change_request(doc))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def _resolve_target_batches(scope: str, requester_batch: str) -> list[str]:
+    """Expand scope into the actual list of batch codes to mutate."""
+    if scope == "batch":
+        return [_safe_batch(requester_batch)]
+    prefix = _safe_class_prefix(requester_batch)
+    codes: list[str] = []
+    async for doc in BatchDoc.find_all(sort=[("code", 1)]):
+        if doc.code.startswith(prefix):
+            codes.append(doc.code)
+    if not codes:
+        # Fall back to timetables so an unseeded BatchDoc collection still works.
+        seen: set[str] = set()
+        async for tt in TimetableDoc.find_all(sort=[("code", 1)]):
+            if tt.code.startswith(prefix) and tt.code not in seen:
+                seen.add(tt.code)
+                codes.append(tt.code)
+    return codes
+
+
+def _apply_change_to_classes(
+    classes: list[Any],
+    *,
+    kind: str,
+    day: str,
+    start_time: str,
+    entry: dict[str, Any] | None,
+) -> list[dict[str, Any]]:
+    """Pure function: apply add/edit/delete to a list of class entries."""
+    out: list[dict[str, Any]] = []
+    target_key = (day, start_time)
+    replaced = False
+    for c in classes:
+        c_dict = _serialize_class(c)
+        if (c_dict.get("day"), c_dict.get("start_time")) == target_key:
+            if kind == "delete":
+                continue
+            if kind == "edit":
+                merged = {**c_dict, **(entry or {})}
+                merged["day"] = day
+                merged["start_time"] = start_time
+                out.append(merged)
+                replaced = True
+                continue
+        out.append(c_dict)
+    if kind == "add" and entry is not None:
+        new_entry = {**entry, "day": day, "start_time": start_time}
+        out.append(new_entry)
+    elif kind == "edit" and not replaced and entry is not None:
+        # Slot was empty in the canonical data — treat the edit as an add.
+        new_entry = {**entry, "day": day, "start_time": start_time}
+        out.append(new_entry)
+    return out
+
+
+async def approve_change_request(
+    request_id: str,
+    *,
+    decided_by: str | None = None,
+    decision_note: str | None = None,
+) -> dict[str, Any]:
+    from bson import ObjectId  # local import: only needed by admin path
+
+    try:
+        oid = ObjectId(request_id)
+    except Exception as exc:  # noqa: BLE001 — any bson decode error
+        raise ChangeRequestRefused("invalid request id", code="bad_id") from exc
+
+    doc = await ChangeRequestDoc.get(oid)
+    if doc is None:
+        raise ChangeRequestRefused("override not found", code="not_found")
+    if doc.status != "pending":
+        raise ChangeRequestRefused(
+            f"request already {doc.status}",
+            code="not_pending",
+        )
+
+    targets = await _resolve_target_batches(doc.scope, doc.requester_batch)
+    if not targets:
+        raise ChangeRequestRefused(
+            "no matching batches found in scope",
+            code="empty_scope",
+        )
+
+    entry_payload = (
+        doc.entry.model_dump(exclude_none=False) if doc.entry is not None else None
+    )
+    applied: list[str] = []
+    for code in targets:
+        tt = await TimetableDoc.find_one(TimetableDoc.code == code)
+        if tt is None:
+            continue
+        new_classes = _apply_change_to_classes(
+            tt.classes,
+            kind=doc.kind,
+            day=doc.day,
+            start_time=doc.start_time,
+            entry=entry_payload,
+        )
+        await tt.set({
+            "classes": new_classes,
+            "updated_at": datetime.now(timezone.utc),
+        })
+        applied.append(code)
+        settings = get_settings()
+        if settings.json_mirror:
+            path = settings.data_dir / "timetable" / f"{code}.json"
+            _mirror_json(
+                path,
+                _timetable_payload_from_raw(code, tt.semester, new_classes),
+            )
+
+    if not applied:
+        raise ChangeRequestRefused(
+            "no canonical timetables found for resolved batches",
+            code="empty_targets",
+        )
+
+    await doc.set({
+        "status": "approved",
+        "decided_by": decided_by,
+        "decision_note": decision_note,
+        "decided_at": datetime.now(timezone.utc),
+        "applied_batches": applied,
+    })
+    return _serialize_change_request(doc)
+
+
+async def reject_change_request(
+    request_id: str,
+    *,
+    decided_by: str | None = None,
+    decision_note: str | None = None,
+) -> dict[str, Any]:
+    from bson import ObjectId
+
+    try:
+        oid = ObjectId(request_id)
+    except Exception as exc:  # noqa: BLE001
+        raise ChangeRequestRefused("invalid request id", code="bad_id") from exc
+    doc = await ChangeRequestDoc.get(oid)
+    if doc is None:
+        raise ChangeRequestRefused("override not found", code="not_found")
+    if doc.status != "pending":
+        raise ChangeRequestRefused(
+            f"request already {doc.status}",
+            code="not_pending",
+        )
+    await doc.set({
+        "status": "rejected",
+        "decided_by": decided_by,
+        "decision_note": decision_note,
+        "decided_at": datetime.now(timezone.utc),
+    })
+    return _serialize_change_request(doc)
 
 
 # ── Misc ─────────────────────────────────────────────────────────────────

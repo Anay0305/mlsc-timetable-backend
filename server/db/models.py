@@ -104,13 +104,14 @@ class OverrideEntry(BaseModel):
 
 
 class OverrideDoc(Document):
-    """All overrides for one (user, semester) bundled into a single document.
+    """All overrides for one (user, batch) bundled into a single document.
 
     Keys in `entries` are `f"{day}|{start_time}"` (e.g. "Monday|9:00 AM").
+    A user's batch is fixed for the semester so we don't index on semester
+    separately — the batch already implies it.
     """
 
     user_id: str
-    semester: str
     batch: str
     entries: dict[str, OverrideEntry] = Field(default_factory=dict)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -118,7 +119,7 @@ class OverrideDoc(Document):
     class Settings:
         name = "overrides"
         indexes = [
-            [("user_id", 1), ("semester", 1)],
+            [("user_id", 1), ("batch", 1)],
         ]
 
 
@@ -158,6 +159,39 @@ class ContributorDoc(Document):
         name = "contributors"
 
 
+class ChangeRequestDoc(Document):
+    """Crowd-sourced proposal to mutate a canonical timetable.
+
+    A user editing their grid can promote the change to either their whole
+    batch or — for ``Lecture`` types — the whole class (all batches sharing
+    the first 3 characters of the batch code, e.g. ``1B11/1B12/1B13``).
+    Admins review pending requests and approve/reject them; approval
+    rewrites the canonical timetable for every batch in scope.
+    """
+
+    requester_id: Optional[str] = None
+    requester_batch: str
+    semester: str
+    scope: Literal["batch", "class"]
+    kind: Literal["add", "edit", "delete"]
+    day: str
+    start_time: str
+    entry: Optional[ClassEntry] = None
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    decision_note: Optional[str] = None
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    applied_batches: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "change_requests"
+        indexes = [
+            "status",
+            [("status", 1), ("created_at", -1)],
+        ]
+
+
 ALL_DOCUMENTS = [
     SemesterDoc,
     BatchDoc,
@@ -166,4 +200,5 @@ ALL_DOCUMENTS = [
     OverrideDoc,
     BaselineDoc,
     ContributorDoc,
+    ChangeRequestDoc,
 ]

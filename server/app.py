@@ -11,11 +11,23 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
 from server import storage
 from server.config import get_settings
 from server.db import close_db, init_db
-from server.routers import admin, baselines, batch, contributors, current, me, timetable
+from server.rate_limit import limiter
+from server.routers import (
+    admin,
+    baselines,
+    batch,
+    change_requests,
+    contributors,
+    current,
+    me,
+    timetable,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -46,6 +58,21 @@ def create_app() -> FastAPI:
         allow_headers=["Authorization", "Content-Type", "X-User-Id"],
     )
 
+    # Rate limiting (slowapi). The limiter instance lives in server.rate_limit
+    # so individual routers can decorate handlers with @limiter.limit(...).
+    app.state.limiter = limiter
+    app.add_middleware(SlowAPIMiddleware)
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _handle_rate_limit(_: Request, exc: RateLimitExceeded) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": f"Rate limit exceeded: {exc.detail}",
+                "code": "rate_limited",
+            },
+        )
+
     @app.get("/healthz")
     def healthz() -> dict[str, object]:
         return {"ok": True}
@@ -63,6 +90,8 @@ def create_app() -> FastAPI:
     app.include_router(me.router)
     app.include_router(baselines.router)
     app.include_router(contributors.router)
+    app.include_router(change_requests.router)
+    app.include_router(change_requests.admin_router)
     app.include_router(admin.router)
 
     return app

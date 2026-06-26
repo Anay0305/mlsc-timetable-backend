@@ -20,7 +20,6 @@ from server.db.models import (
     ClassEntry,
     OverrideDoc,
     OverrideEntry,
-    SemesterDoc,
     UserDoc,
 )
 
@@ -51,18 +50,29 @@ async def _touch_user(user_id: str) -> UserDoc:
     return doc
 
 
-async def _current_semester_label() -> str:
-    doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
-    if doc is None:
-        raise storage.DataMissing("no current semester set (PUT /admin/current)")
-    return doc.label
-
-
-async def _load_overrides(user_id: str, semester: str) -> Optional[OverrideDoc]:
+async def _load_overrides(user_id: str, batch: str) -> Optional[OverrideDoc]:
     return await OverrideDoc.find_one(
         OverrideDoc.user_id == user_id,
-        OverrideDoc.semester == semester,
+        OverrideDoc.batch == batch,
     )
+
+
+def _normalize_batch(value: str) -> str:
+    return "".join(ch for ch in value.strip().upper() if ch.isalnum())
+
+
+async def _require_batch(user_id: str, batch: Optional[str]) -> str:
+    """Resolve the batch to operate on: explicit arg wins, else user.default_batch."""
+    code = _normalize_batch(batch) if batch else ""
+    if not code:
+        user = await UserDoc.find_one(UserDoc.user_id == user_id)
+        code = (user.default_batch or "") if user else ""
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "no batch supplied and no default set", "code": "no_batch"},
+        )
+    return code
 
 
 def _slot_key(day: str, start_time: str) -> str:
@@ -139,7 +149,7 @@ async def get_my_timetable(
     user_id: str = Depends(require_user_id),
 ) -> dict[str, Any]:
     user = await _touch_user(user_id)
-    code = batch or user.default_batch
+    code = _normalize_batch(batch) if batch else (user.default_batch or "")
     if not code:
         raise HTTPException(
             status_code=400,
@@ -152,21 +162,22 @@ async def get_my_timetable(
             status_code=404,
             detail={"error": str(exc), "code": "batch_not_found", "batch": exc.batch},
         ) from exc
-    semester = canonical.get("semester", {}).get("label") or await _current_semester_label()
-    overrides = await _load_overrides(user_id, semester)
+    overrides = await _load_overrides(user_id, code)
     merged = _merge(canonical, overrides)
     merged["overrides_applied"] = 0 if overrides is None else len(overrides.entries)
     return merged
 
 
 @router.get("/overrides")
-async def list_overrides(user_id: str = Depends(require_user_id)) -> dict[str, Any]:
-    semester = await _current_semester_label()
-    doc = await _load_overrides(user_id, semester)
+async def list_overrides(
+    batch: Optional[str] = Query(default=None),
+    user_id: str = Depends(require_user_id),
+) -> dict[str, Any]:
+    code = await _require_batch(user_id, batch)
+    doc = await _load_overrides(user_id, code)
     if doc is None:
-        return {"semester": semester, "batch": None, "entries": {}}
+        return {"batch": code, "entries": {}}
     return {
-        "semester": doc.semester,
         "batch": doc.batch,
         "entries": {
             key: {"kind": ov.kind, "entry": ov.entry.model_dump(exclude_none=False) if ov.entry else None}
@@ -180,6 +191,7 @@ async def upsert_override(
     day: str,
     slot: str,
     body: OverrideBody,
+    batch: Optional[str] = Query(default=None),
     user_id: str = Depends(require_user_id),
 ) -> dict[str, Any]:
     day, slot = _validate_slot(day, slot)
@@ -191,30 +203,26 @@ async def upsert_override(
             detail={"error": "entry is required for non-delete overrides", "code": "missing_entry"},
         )
 
-    semester = await _current_semester_label()
-    user = await _touch_user(user_id)
-    batch_for_override = user.default_batch or ""
+    await _touch_user(user_id)
+    code = await _require_batch(user_id, batch)
 
     key = _slot_key(day, slot)
     if not _SLOT_KEY_RE.match(key):
         raise HTTPException(status_code=400, detail={"error": "invalid slot key", "code": "bad_slot"})
 
     entry = OverrideEntry(kind=body.kind, entry=body.entry)
-    doc = await _load_overrides(user_id, semester)
+    doc = await _load_overrides(user_id, code)
     now = datetime.now(timezone.utc)
     if doc is None:
         doc = OverrideDoc(
             user_id=user_id,
-            semester=semester,
-            batch=batch_for_override,
+            batch=code,
             entries={key: entry},
         )
         await doc.insert()
     else:
         doc.entries[key] = entry
         doc.updated_at = now
-        if batch_for_override and not doc.batch:
-            doc.batch = batch_for_override
         await doc.save()
 
     return {"key": key, "override": {"kind": entry.kind, "entry": entry.entry.model_dump(exclude_none=False) if entry.entry else None}}
@@ -224,12 +232,13 @@ async def upsert_override(
 async def delete_override(
     day: str,
     slot: str,
+    batch: Optional[str] = Query(default=None),
     user_id: str = Depends(require_user_id),
 ) -> dict[str, Any]:
     day, slot = _validate_slot(day, slot)
-    semester = await _current_semester_label()
+    code = await _require_batch(user_id, batch)
     key = _slot_key(day, slot)
-    doc = await _load_overrides(user_id, semester)
+    doc = await _load_overrides(user_id, code)
     if doc is None or key not in doc.entries:
         return {"deleted": False, "key": key}
     del doc.entries[key]

@@ -5,8 +5,8 @@ from datetime import datetime, timedelta
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
-from timetable_parser.core.models import CellBounds, RawCell
-from timetable_parser.extractors.day_slots import Slot
+from timetable_api._parser.core.models import CellBounds, RawCell
+from timetable_api._parser.extractors.day_slots import Slot
 
 
 def build_merge_bounds(sheet: Worksheet) -> dict[tuple[int, int], CellBounds]:

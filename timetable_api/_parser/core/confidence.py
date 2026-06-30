@@ -1,3 +1,5 @@
+"""Confidence scoring for internally parsed workbook records."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

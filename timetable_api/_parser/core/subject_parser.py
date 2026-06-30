@@ -1,3 +1,5 @@
+"""Subject token parsing for internal workbook ingestion."""
+
 from __future__ import annotations
 
 import re

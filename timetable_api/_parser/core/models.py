@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from timetable_parser.core.confidence import ConfidenceReason
+from timetable_api._parser.core.confidence import ConfidenceReason
 
 
 @dataclass(frozen=True)

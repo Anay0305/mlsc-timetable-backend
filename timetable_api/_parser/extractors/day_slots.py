@@ -1,3 +1,5 @@
+"""Day and slot extraction used only during API startup."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass, field

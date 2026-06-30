@@ -1,3 +1,5 @@
+"""Subject catalog lookup for the internal parser."""
+
 from __future__ import annotations
 
 import json
@@ -6,7 +8,7 @@ from functools import lru_cache
 from pathlib import Path
 
 
-DEFAULT_SUBJECTS_PATH = Path(__file__).resolve().parents[2] / "assets" / "subjects.json"
+DEFAULT_SUBJECTS_PATH = Path(__file__).resolve().parents[3] / "assets" / "subjects.json"
 
 
 @dataclass(frozen=True)

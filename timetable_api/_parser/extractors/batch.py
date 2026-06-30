@@ -1,3 +1,5 @@
+"""Batch extraction used only during API startup."""
+
 from __future__ import annotations
 
 import logging

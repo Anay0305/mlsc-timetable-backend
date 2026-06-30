@@ -3,10 +3,14 @@ from __future__ import annotations
 from openpyxl.cell.cell import Cell
 from openpyxl.worksheet.worksheet import Worksheet
 
-from timetable_parser.core.confidence import assess_confidence
-from timetable_parser.core.elective_parser import build_elective_options, elective_mapping_counts, find_subject_codes
-from timetable_parser.core.models import CellBounds, ClassBlock, RawCell
-from timetable_parser.core.sheet_geometry import (
+from timetable_api._parser.core.confidence import assess_confidence
+from timetable_api._parser.core.elective_parser import (
+    build_elective_options,
+    elective_mapping_counts,
+    find_subject_codes,
+)
+from timetable_api._parser.core.models import CellBounds, ClassBlock, RawCell
+from timetable_api._parser.core.sheet_geometry import (
     build_merge_bounds,
     dedupe_raw_cells,
     dedupe_values,
@@ -19,10 +23,16 @@ from timetable_parser.core.sheet_geometry import (
     slot_end_row,
     visible_bounds_for_cell,
 )
-from timetable_parser.core.subject_catalog import SubjectCatalog, load_default_subject_catalog
-from timetable_parser.core.subject_parser import class_type_for_subject, find_subject_code
-from timetable_parser.extractors.batch import BatchExtractor
-from timetable_parser.extractors.day_slots import DaySlotExtractor, Slot
+from timetable_api._parser.core.subject_catalog import (
+    SubjectCatalog,
+    load_default_subject_catalog,
+)
+from timetable_api._parser.core.subject_parser import (
+    class_type_for_subject,
+    find_subject_code,
+)
+from timetable_api._parser.extractors.batch import BatchExtractor
+from timetable_api._parser.extractors.day_slots import DaySlotExtractor, Slot
 
 
 class ClassBlockExtractor:

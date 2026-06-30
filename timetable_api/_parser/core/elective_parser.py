@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import re
 
-from timetable_parser.core.confidence import assess_confidence
-from timetable_parser.core.models import ElectiveOption
-from timetable_parser.core.subject_catalog import SubjectCatalog
-from timetable_parser.core.subject_parser import class_type_for_subject
+from timetable_api._parser.core.confidence import assess_confidence
+from timetable_api._parser.core.models import ElectiveOption
+from timetable_api._parser.core.subject_catalog import SubjectCatalog
+from timetable_api._parser.core.subject_parser import class_type_for_subject
 
 
 SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Z]{3}\d{3}|[A-Z]{5}\d)[LTP]")

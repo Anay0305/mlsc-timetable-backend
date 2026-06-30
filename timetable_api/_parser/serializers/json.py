@@ -4,8 +4,8 @@ from collections.abc import Sequence
 
 from openpyxl.utils import get_column_letter
 
-from timetable_parser.core.confidence import ConfidenceReason
-from timetable_parser.core.models import ClassBlock
+from timetable_api._parser.core.confidence import ConfidenceReason
+from timetable_api._parser.core.models import ClassBlock
 
 
 def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> dict[str, dict[str, list[dict[str, object]]]]:

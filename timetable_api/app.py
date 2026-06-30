@@ -27,6 +27,7 @@ from timetable_api.schemas import (
     HealthResponse,
     MetadataResponse,
     TimetableResponse,
+    WorkbookClearResponse,
     WorkbookUploadResponse,
 )
 from timetable_api._store import TimetableStore
@@ -163,6 +164,21 @@ def create_app(store: TimetableStore | None = None) -> FastAPI:
         request.app.state.store = next_store
         return WorkbookUploadResponse(
             status="updated",
+            **_metadata_response(next_store).model_dump(),
+        )
+
+    @application.delete(
+        "/api/v1/admin/workbook",
+        response_model=WorkbookClearResponse,
+        tags=["Admin"],
+        status_code=status.HTTP_200_OK,
+        dependencies=[Depends(require_admin_secret)],
+    )
+    def clear_workbook(request: Request) -> WorkbookClearResponse:
+        next_store = TimetableStore.empty()
+        request.app.state.store = next_store
+        return WorkbookClearResponse(
+            status="cleared",
             **_metadata_response(next_store).model_dump(),
         )
 

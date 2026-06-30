@@ -93,3 +93,7 @@ class MetadataResponse(ApiModel):
 
 class WorkbookUploadResponse(MetadataResponse):
     status: Literal["updated"]
+
+
+class WorkbookClearResponse(MetadataResponse):
+    status: Literal["cleared"]

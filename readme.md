@@ -57,6 +57,7 @@ python -m uvicorn timetable_api.app:app --reload
 | `GET` | `/api/v1/classes` | Search and filter classes. |
 | `GET` | `/api/v1/metadata` | Get workbook source and load metadata. |
 | `POST` | `/api/v1/admin/workbook` | Upload a new Excel workbook, parse it, and replace the live in-memory timetable. |
+| `DELETE` | `/api/v1/admin/workbook` | Clear the live in-memory timetable back to an empty state. |
 
 Before the first successful upload, read endpoints return empty results or `404` for batch-specific lookups.
 

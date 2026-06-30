@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import fnmatch
 import logging
+from datetime import datetime, timezone
 from pathlib import Path
 
 from openpyxl import load_workbook
@@ -69,103 +70,203 @@ async def parse_workbook(
     settings: Settings | None = None,
     *,
     sheet: str = "all",
+    actor_kind: str | None = None,
+    actor_email: str | None = None,
+    record_attempt: bool = True,
 ) -> dict[str, object]:
     """Parse `xlsx_path` and upsert results into Mongo. Returns a small summary."""
     settings = settings or get_settings()
     xlsx_path = Path(xlsx_path).resolve()
+    started_at = datetime.now(timezone.utc)
+    filename = xlsx_path.name
+
     if not xlsx_path.exists():
+        if record_attempt:
+            await storage.record_upload_attempt({
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc),
+                "actor_kind": actor_kind,
+                "actor_email": actor_email,
+                "filename": filename,
+                "sheet_selector": sheet,
+                "semester_label": semester_label,
+                "status": "failed",
+                "failure_message": f"Spreadsheet not found: {xlsx_path}",
+            })
         raise FileNotFoundError(f"Spreadsheet not found: {xlsx_path}")
 
-    logger.info("Loading workbook: %s (sheet=%s)", xlsx_path, sheet)
-    workbook = load_workbook(xlsx_path, data_only=True)
-    sheets = _select_sheets(workbook.worksheets, workbook.active, sheet)
-    if not sheets:
-        raise ValueError(f"No worksheets matched selector {sheet!r}")
+    try:
+        logger.info("Loading workbook: %s (sheet=%s)", xlsx_path, sheet)
+        workbook = load_workbook(xlsx_path, data_only=True)
+        sheets = _select_sheets(workbook.worksheets, workbook.active, sheet)
+        if not sheets:
+            raise ValueError(f"No worksheets matched selector {sheet!r}")
 
-    catalog = load_default_subject_catalog()
+        catalog = load_default_subject_catalog()
 
-    merged: dict[str, dict[str, list[ClassBlock]]] = {}
-    # First sheet that contributed each batch (kept as the primary source_sheet
-    # in storage). The full list of contributors lives in `sheets_by_code`.
-    sheet_by_code: dict[str, str] = {}
-    sheets_by_code: dict[str, list[str]] = {}
-    used_sheets: list[str] = []
+        merged: dict[str, dict[str, list[ClassBlock]]] = {}
+        # First sheet that contributed each batch (kept as the primary source_sheet
+        # in storage). The full list of contributors lives in `sheets_by_code`.
+        sheet_by_code: dict[str, str] = {}
+        sheets_by_code: dict[str, list[str]] = {}
+        used_sheets: list[str] = []
 
-    for ws in sheets:
-        title = ws.title.strip()
-        try:
-            blocks_by_batch_day = ClassBlockExtractor.extract(ws, subject_catalog=catalog)
-        except Exception:  # parser is best-effort across heterogeneous sheets
-            logger.exception("Skipping sheet %r: extractor failed", title)
-            continue
-        if not blocks_by_batch_day:
-            logger.info("Sheet %r contributed no batches", title)
-            continue
-        used_sheets.append(title)
-        for code, day_blocks in blocks_by_batch_day.items():
-            if code in merged:
-                before = sum(len(v) for v in merged[code].values())
-                merged[code] = _merge_day_blocks(merged[code], day_blocks)
-                after = sum(len(v) for v in merged[code].values())
-                added = after - before
-                if added:
-                    logger.info(
-                        "Batch %s: merged %d block(s) from %r (total %d)",
-                        code, added, title, after,
-                    )
-                contributors = sheets_by_code.setdefault(code, [sheet_by_code[code]])
-                if title not in contributors:
-                    contributors.append(title)
-            else:
-                merged[code] = day_blocks
-                sheet_by_code[code] = title
-                sheets_by_code[code] = [title]
+        for ws in sheets:
+            title = ws.title.strip()
+            try:
+                blocks_by_batch_day = ClassBlockExtractor.extract(ws, subject_catalog=catalog)
+            except Exception:  # parser is best-effort across heterogeneous sheets
+                logger.exception("Skipping sheet %r: extractor failed", title)
+                continue
+            if not blocks_by_batch_day:
+                logger.info("Sheet %r contributed no batches", title)
+                continue
+            used_sheets.append(title)
+            for code, day_blocks in blocks_by_batch_day.items():
+                if code in merged:
+                    before = sum(len(v) for v in merged[code].values())
+                    merged[code] = _merge_day_blocks(merged[code], day_blocks)
+                    after = sum(len(v) for v in merged[code].values())
+                    added = after - before
+                    if added:
+                        logger.info(
+                            "Batch %s: merged %d block(s) from %r (total %d)",
+                            code, added, title, after,
+                        )
+                    contributors = sheets_by_code.setdefault(code, [sheet_by_code[code]])
+                    if title not in contributors:
+                        contributors.append(title)
+                else:
+                    merged[code] = day_blocks
+                    sheet_by_code[code] = title
+                    sheets_by_code[code] = [title]
 
-    multi_sheet = {c: ss for c, ss in sheets_by_code.items() if len(ss) > 1}
+        multi_sheet = {c: ss for c, ss in sheets_by_code.items() if len(ss) > 1}
+        multi_sheet_list = [
+            {"batch": code, "sheets": ss} for code, ss in sorted(multi_sheet.items())
+        ]
 
-    payloads = class_blocks_to_api(merged, semester_label)
-    batches = sorted(merged.keys())
+        confidence_summary, error_rows = _summarize_blocks(merged, sheet_by_code)
 
-    await storage.write_current({"label": semester_label}, settings=settings)
-    await storage.write_batch_list(batches, settings=settings, sheet_by_code=sheet_by_code)
-    for code, payload in payloads.items():
-        await storage.write_timetable(
-            code,
-            payload,
+        payloads = class_blocks_to_api(merged, semester_label)
+        batches = sorted(merged.keys())
+
+        await storage.write_current({"label": semester_label}, settings=settings)
+        await storage.write_batch_list(batches, settings=settings, sheet_by_code=sheet_by_code)
+        for code, payload in payloads.items():
+            await storage.write_timetable(
+                code,
+                payload,
+                settings=settings,
+                source_sheet=sheet_by_code.get(code),
+                source_file=xlsx_path.name,
+            )
+
+        total_classes = sum(len(payload["classes"]) for payload in payloads.values())
+        storage.maybe_git_commit(
+            f"ingest: {xlsx_path.name} ({len(batches)} batches, {total_classes} classes)",
             settings=settings,
-            source_sheet=sheet_by_code.get(code),
-            source_file=xlsx_path.name,
         )
 
-    total_classes = sum(len(payload["classes"]) for payload in payloads.values())
-    storage.maybe_git_commit(
-        f"ingest: {xlsx_path.name} ({len(batches)} batches, {total_classes} classes)",
-        settings=settings,
-    )
+        prefix = storage.semester_prefix(semester_label)
+        baselines = await storage.read_baselines_for_prefix(prefix, settings=settings)
+        doctor = build_doctor_report(
+            {code: count_classes(payload["classes"]) for code, payload in payloads.items()},
+            baselines_by_group=baselines,
+            semester_prefix=prefix,
+        )
 
-    prefix = storage.semester_prefix(semester_label)
-    baselines = await storage.read_baselines_for_prefix(prefix, settings=settings)
-    doctor = build_doctor_report(
-        {code: count_classes(payload["classes"]) for code, payload in payloads.items()},
-        baselines_by_group=baselines,
-        semester_prefix=prefix,
-    )
-    summary = {
-        "batches": len(batches),
-        "classes": total_classes,
-        "sheets_used": used_sheets,
-        "multi_sheet_batches": [
-            {"batch": code, "sheets": sheets}
-            for code, sheets in sorted(multi_sheet.items())
-        ],
-        "doctor": doctor,
-    }
-    logger.info(
-        "Ingest complete: %d batches, %d classes (sheets=%s, multi-sheet=%d, mismatched-groups=%d)",
-        summary["batches"], summary["classes"], used_sheets,
-        len(multi_sheet), doctor["mismatched_groups"],
-    )
-    return summary
+        total_blocks = sum(confidence_summary.values())
+        attempt_status: str = "ok"
+        if not batches:
+            attempt_status = "failed"
+        elif error_rows or doctor.get("mismatched_groups", 0) > 0:
+            attempt_status = "partial"
+
+        summary: dict[str, object] = {
+            "batches": len(batches),
+            "classes": total_classes,
+            "sheets_used": used_sheets,
+            "multi_sheet_batches": multi_sheet_list,
+            "doctor": doctor,
+            "total_blocks": total_blocks,
+            "confidence_summary": confidence_summary,
+            "error_count": len(error_rows),
+        }
+        logger.info(
+            "Ingest complete: %d batches, %d classes (sheets=%s, multi-sheet=%d, "
+            "mismatched-groups=%d, parser-errors=%d)",
+            summary["batches"], summary["classes"], used_sheets,
+            len(multi_sheet), doctor["mismatched_groups"], len(error_rows),
+        )
+
+        if record_attempt:
+            recorded = await storage.record_upload_attempt({
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc),
+                "actor_kind": actor_kind,
+                "actor_email": actor_email,
+                "filename": filename,
+                "sheet_selector": sheet,
+                "semester_label": semester_label,
+                "status": attempt_status,
+                "batches_written": len(batches),
+                "classes_written": total_classes,
+                "sheets_used": used_sheets,
+                "multi_sheet_batches": multi_sheet_list,
+                "total_blocks": total_blocks,
+                "confidence_summary": confidence_summary,
+                "error_count": len(error_rows),
+                "errors": [row for row in error_rows],
+                "doctor": doctor,
+            })
+            if recorded.get("id"):
+                summary["attempt_id"] = recorded["id"]
+            summary["status"] = attempt_status
+
+        return summary
+    except Exception as exc:
+        if record_attempt:
+            await storage.record_upload_attempt({
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc),
+                "actor_kind": actor_kind,
+                "actor_email": actor_email,
+                "filename": filename,
+                "sheet_selector": sheet,
+                "semester_label": semester_label,
+                "status": "failed",
+                "failure_message": f"{type(exc).__name__}: {exc}",
+            })
+        raise
+
+
+def _summarize_blocks(
+    merged: dict[str, dict[str, list[ClassBlock]]],
+    sheet_by_code: dict[str, str],
+) -> tuple[dict[str, int], list[dict[str, object]]]:
+    """Tally confidence levels and collect per-reason error rows."""
+    summary: dict[str, int] = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNRELIABLE": 0}
+    errors: list[dict[str, object]] = []
+    for code, day_blocks in merged.items():
+        sheet_title = sheet_by_code.get(code)
+        for day, blocks in day_blocks.items():
+            for block in blocks:
+                level = (block.confidence or "MEDIUM").upper()
+                summary[level] = summary.get(level, 0) + 1
+                if level in {"HIGH"}:
+                    continue
+                for reason in (block.confidence_reasons or ()):  # type: ignore[truthy-iterable]
+                    errors.append({
+                        "batch": code,
+                        "sheet": sheet_title,
+                        "day": day,
+                        "start_time": block.start_time,
+                        "severity": level,
+                        "code": str(getattr(reason, "code", "UNKNOWN")),
+                        "message": getattr(reason, "detail", "") or "",
+                    })
+    return summary, errors
 
 
 def _select_sheets(

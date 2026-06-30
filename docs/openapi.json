@@ -622,6 +622,54 @@
         }
       }
     },
+    "/announcements": {
+      "get": {
+        "summary": "Get Announcements",
+        "description": "Latest-first list of announcements (mock-grade, file-backed).",
+        "operationId": "get_announcements_announcements_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response Get Announcements Announcements Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/exam-dates": {
+      "get": {
+        "summary": "Get Exam Dates",
+        "description": "Upcoming exam dates (mock-grade, file-backed). Sorted earliest first.",
+        "operationId": "get_exam_dates_exam_dates_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array",
+                  "title": "Response Get Exam Dates Exam Dates Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/change-requests": {
       "post": {
         "tags": [

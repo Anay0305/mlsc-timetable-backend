@@ -192,6 +192,118 @@ class ChangeRequestDoc(Document):
         ]
 
 
+class AdminEmailDoc(Document):
+    """An email address allowed to use the admin panel.
+
+    Env-managed admins (``ADMIN_EMAILS`` env var) are *not* stored here;
+    only emails granted via the panel (or a direct mongo insert) live in
+    this collection. The auth dep checks env-set ∪ this collection. Emails
+    are stored lowercased.
+    """
+
+    email: Annotated[str, Indexed(unique=True)]
+    display_name: Optional[str] = None
+    added_by: Optional[str] = None  # email of the admin who added this entry, or "token"
+    added_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "admin_emails"
+
+
+class UploadErrorRow(BaseModel):
+    """One parser warning surfaced on the admin dashboard."""
+
+    batch: Optional[str] = None
+    sheet: Optional[str] = None
+    day: Optional[str] = None
+    start_time: Optional[str] = None
+    severity: str = "MEDIUM"  # confidence level (HIGH|MEDIUM|LOW|UNRELIABLE)
+    code: str
+    message: str
+
+
+class UploadAttemptDoc(Document):
+    """One historical record of a `/admin/ingest` invocation.
+
+    Persisted whether the run succeeded, partially succeeded, or threw. Drives
+    the admin dashboard cards, the parsing-error log, and the accuracy donut.
+    """
+
+    started_at: datetime = Field(default_factory=_utcnow)
+    finished_at: Optional[datetime] = None
+    actor_kind: Optional[str] = None  # "user" | "token" | "cli"
+    actor_email: Optional[str] = None
+    filename: Optional[str] = None
+    sheet_selector: Optional[str] = None
+    semester_label: Optional[str] = None
+    status: Literal["ok", "partial", "failed"] = "ok"
+    batches_written: int = 0
+    classes_written: int = 0
+    sheets_used: list[str] = Field(default_factory=list)
+    multi_sheet_batches: list[dict] = Field(default_factory=list)
+    total_blocks: int = 0
+    confidence_summary: dict[str, int] = Field(default_factory=dict)
+    error_count: int = 0
+    errors: list[UploadErrorRow] = Field(default_factory=list)
+    doctor: Optional[dict] = None
+    failure_message: Optional[str] = None
+
+    class Settings:
+        name = "upload_attempts"
+        indexes = [
+            [("started_at", -1)],
+            "status",
+        ]
+
+
+class AnnouncementDoc(Document):
+    """Site-wide announcement shown on the public landing sidebar.
+
+    Curated by admins via the panel. ``severity`` drives a colour dot in the
+    UI (``info`` / ``warn`` / ``critical``). ``posted_at`` is what the public
+    list sorts by (latest first).
+    """
+
+    title: str
+    body: str
+    severity: Literal["info", "warn", "critical"] = "info"
+    posted_at: datetime = Field(default_factory=_utcnow)
+    link: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "announcements"
+        indexes = [
+            [("posted_at", -1)],
+        ]
+
+
+class ExamDateDoc(Document):
+    """Upcoming exam slot shown on the public landing sidebar.
+
+    ``date`` is intentionally a yyyy-mm-dd *string* (not a Mongo date) to
+    keep the API contract byte-identical with the previous JSON store and
+    make sort/equality trivial. ``target_year`` scopes the exam to a single
+    year (1..5) — when ``None`` the exam is broadcast to every year.
+    """
+
+    subject: str
+    code: str
+    date: str  # yyyy-mm-dd
+    slot: Optional[str] = None
+    type: Optional[str] = None
+    room: Optional[str] = None
+    target_year: Optional[int] = None  # None = all years
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "exam_dates"
+        indexes = [
+            [("date", 1), ("slot", 1)],
+            "target_year",
+        ]
+
+
 ALL_DOCUMENTS = [
     SemesterDoc,
     BatchDoc,
@@ -201,4 +313,8 @@ ALL_DOCUMENTS = [
     BaselineDoc,
     ContributorDoc,
     ChangeRequestDoc,
+    AdminEmailDoc,
+    UploadAttemptDoc,
+    AnnouncementDoc,
+    ExamDateDoc,
 ]

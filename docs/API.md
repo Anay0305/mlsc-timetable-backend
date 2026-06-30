@@ -160,6 +160,64 @@ List of expected per-type class counts per stream group. Used by the
 ### `GET /baselines/{key}`
 Single baseline (404 `not_found` if absent).
 
+### `GET /announcements`
+Latest-first list of chapter / academic announcements. File-backed
+(`assets/announcements.json`) for now — admin write workflow lands later.
+
+```json
+[
+  {
+    "id": "ann-2026-06-22-room-change",
+    "title": "Room change — UCS027",
+    "body": "Wednesday's UCS027 lecture moves from G312 to G407 until further notice.",
+    "severity": "warn",
+    "posted_at": "2026-06-22T16:30:00Z",
+    "link": "https://example.org/notice"
+  }
+]
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | string | Stable opaque id, safe as a React key. |
+| `title` | string | One-line headline. |
+| `body` | string | Plain text, no markdown. |
+| `severity` | `"info" \| "warn" \| "critical"` | Drives the badge colour on the frontend. |
+| `posted_at` | string (ISO-8601 UTC) | Server sorts response newest-first by this. |
+| `link` | string \| omitted | Optional click-through. |
+
+Returns `[]` (200) when the asset file is missing or empty.
+
+### `GET /exam-dates`
+Upcoming exams, earliest first. Same provenance as `/announcements` —
+file-backed (`assets/exam_dates.json`) until the admin UI is built.
+
+```json
+[
+  {
+    "id": "exam-uph013-mid-2026-07-15",
+    "subject": "Engineering Physics",
+    "code": "UPH013",
+    "date": "2026-07-15",
+    "slot": "09:00–10:30",
+    "type": "Mid-Sem",
+    "room": "G312"
+  }
+]
+```
+
+| Field | Type | Notes |
+| --- | --- | --- |
+| `id` | string | Stable opaque id. |
+| `subject` | string | Display name. |
+| `code` | string | Course code (matches `ClassEntry.code`). |
+| `date` | string (`YYYY-MM-DD`) | Exam date. |
+| `slot` | string | Free-text time range, e.g. `"09:00–10:30"`. |
+| `type` | `"Mid-Sem" \| "End-Sem" \| "Quiz" \| "Lab"` | Display badge. |
+| `room` | string \| omitted | Optional venue. |
+
+Returns `[]` (200) when the asset file is missing or empty.
+
 ---
 
 ## Per-user endpoints (`X-User-Id` required)

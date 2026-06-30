@@ -125,6 +125,7 @@ async def _run_build(args: argparse.Namespace) -> int:
             semester_label=args.semester,
             settings=settings,
             sheet=args.sheet,
+            actor_kind="cli",
         )
     finally:
         await close_db()

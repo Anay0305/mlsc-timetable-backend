@@ -20,6 +20,7 @@ from server.db import close_db, init_db
 from server.rate_limit import limiter
 from server.routers import (
     admin,
+    announcements,
     baselines,
     batch,
     change_requests,
@@ -90,6 +91,7 @@ def create_app() -> FastAPI:
     app.include_router(me.router)
     app.include_router(baselines.router)
     app.include_router(contributors.router)
+    app.include_router(announcements.router)
     app.include_router(change_requests.router)
     app.include_router(change_requests.admin_router)
     app.include_router(admin.router)

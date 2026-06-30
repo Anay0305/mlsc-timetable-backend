@@ -15,6 +15,9 @@ class Settings:
     data_dir: Path
     cors_origins: tuple[str, ...]
     admin_token: str | None
+    admin_emails: frozenset[str]
+    clerk_issuer: str | None
+    clerk_jwks_url: str | None
     git_auto_commit: bool
     mongodb_url: str
     mongodb_db: str
@@ -26,7 +29,17 @@ def get_settings() -> Settings:
     data_dir = Path(os.environ.get("DATA_DIR", _REPO_ROOT / "data")).resolve()
     raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
     cors_origins = tuple(origin.strip() for origin in raw_origins.split(",") if origin.strip())
-    admin_token = os.environ.get("ADMIN_TOKEN") or None
+    admin_token = os.environ.get("ADMIN_TOKEN", "ANAY")
+    raw_admin_emails = os.environ.get("ADMIN_EMAILS", "")
+    admin_emails = frozenset(
+        email.strip().lower() for email in raw_admin_emails.split(",") if email.strip()
+    )
+    clerk_issuer = (os.environ.get("CLERK_ISSUER") or "").strip() or None
+    if clerk_issuer:
+        clerk_issuer = clerk_issuer.rstrip("/")
+    clerk_jwks_url = (os.environ.get("CLERK_JWKS_URL") or "").strip() or None
+    if not clerk_jwks_url and clerk_issuer:
+        clerk_jwks_url = f"{clerk_issuer}/.well-known/jwks.json"
     git_auto_commit = _truthy(os.environ.get("GIT_AUTO_COMMIT", "0"))
     mongodb_url = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
     mongodb_db = os.environ.get("MONGODB_DB", "mlsc_timetable")
@@ -35,6 +48,9 @@ def get_settings() -> Settings:
         data_dir=data_dir,
         cors_origins=cors_origins,
         admin_token=admin_token,
+        admin_emails=admin_emails,
+        clerk_issuer=clerk_issuer,
+        clerk_jwks_url=clerk_jwks_url,
         git_auto_commit=git_auto_commit,
         mongodb_url=mongodb_url,
         mongodb_db=mongodb_db,

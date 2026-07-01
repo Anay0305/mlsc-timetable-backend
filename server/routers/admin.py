@@ -103,7 +103,13 @@ async def put_current(payload: dict) -> dict[str, object]:
             "error": "Missing 'label' string",
             "code": "invalid_payload",
         })
-    await storage.write_current({"label": payload["label"]})
+    try:
+        await storage.write_current({"label": payload["label"]})
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail={
+            "error": str(e),
+            "code": "invalid_semester_label",
+        })
     storage.maybe_git_commit(f"admin: update semester label to {payload['label']!r}")
     return {"ok": True, "label": payload["label"]}
 
@@ -113,6 +119,7 @@ async def post_ingest(
     semester: str = Form(...),
     sheet: str = Form("all"),
     file: UploadFile = File(...),
+    force: bool = Form(False),
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
@@ -120,6 +127,18 @@ async def post_ingest(
             "error": "Upload must be an .xlsx/.xlsm file",
             "code": "invalid_file",
         })
+
+    # Cooldown gate — admin can pass force=true to override.
+    gate = await storage.check_ingest_cooldown(force=force)
+    if not gate.get("ok"):
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "Ingest cooldown active",
+                "code": "ingest_cooldown",
+                **{k: v for k, v in gate.items() if k != "ok"},
+            },
+        )
 
     with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
         tmp.write(await file.read())
@@ -141,8 +160,51 @@ async def post_ingest(
         "semester": semester,
         "sheet": sheet,
         "filename": file.filename,
+        "forced": bool(force),
         **summary,
     }
+
+
+@router.get("/ingest/cooldown")
+async def get_ingest_cooldown() -> dict[str, object]:
+    """Surface the current cooldown state to the admin UI so it can show
+    "Next ingest available in 3h 42m" and grey out the upload button.
+    """
+    gate = await storage.check_ingest_cooldown()
+    if gate.get("ok"):
+        last = await storage.last_ingest_started_at()
+        return {
+            "ok": True,
+            "active": False,
+            "last_ingest_at": last.isoformat() if last else None,
+        }
+    return {"ok": True, "active": True, **{k: v for k, v in gate.items() if k != "ok"}}
+
+
+@router.get("/ingest/rollback")
+async def get_ingest_rollback_meta() -> dict[str, object]:
+    """Return metadata for the latest snapshot, if any. The Fix page uses
+    this to show the rollback button + countdown to expiry.
+    """
+    meta = await storage.get_ingest_snapshot_meta()
+    if meta is None:
+        return {"available": False}
+    return {"available": True, **meta}
+
+
+@router.post("/ingest/rollback")
+async def post_ingest_rollback(
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        result = await storage.restore_ingest_snapshot()
+    except LookupError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"error": str(exc), "code": "no_snapshot"},
+        ) from exc
+    logger.info("Rollback performed by %s: %r", principal.label, result)
+    return result
 
 
 # ── Dashboard observability ──────────────────────────────────────────────
@@ -165,17 +227,6 @@ async def list_uploads(
             detail={"error": str(exc), "code": "invalid_status"},
         ) from exc
     return {"items": items, "count": len(items)}
-
-
-@router.get("/uploads/latest")
-async def latest_upload() -> dict[str, object]:
-    doc = await storage.get_latest_upload_attempt()
-    if doc is None:
-        raise HTTPException(status_code=404, detail={
-            "error": "no uploads recorded yet",
-            "code": "not_found",
-        })
-    return doc
 
 
 @router.get("/uploads/{attempt_id}")
@@ -373,3 +424,317 @@ def _validate_timetable_payload(payload: dict) -> None:
                     "error": f"classes[{index}] missing '{required}'",
                     "code": "invalid_payload",
                 })
+
+
+# ── Parsing errors / Fix tab ─────────────────────────────────────────────
+@router.get("/errors")
+async def list_errors(
+    status: Optional[str] = Query(default=None),
+    upload_id: Optional[str] = Query(default=None),
+    error_type: Optional[str] = Query(default=None),
+    batch_code: Optional[str] = Query(default=None),
+    limit: int = Query(default=500, ge=1, le=2000),
+) -> dict[str, object]:
+    items = await storage.list_parsing_errors(
+        status=status,
+        upload_id=upload_id,
+        error_type=error_type,
+        batch_code=batch_code,
+        limit=limit,
+    )
+    return {"items": items, "count": len(items)}
+
+
+@router.get("/errors/summary")
+async def errors_summary(
+    upload_id: Optional[str] = Query(default=None),
+) -> dict[str, object]:
+    return await storage.parsing_errors_summary(upload_id=upload_id)
+
+
+class _ErrorActionBody(BaseModel):
+    note: Optional[str] = None
+
+
+@router.post("/errors/{error_id}/resolve")
+async def resolve_error(
+    error_id: str,
+    body: Optional[_ErrorActionBody] = None,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    doc = await storage.update_parsing_error_status(
+        error_id=error_id,
+        new_status="resolved",
+        resolved_by=principal.label,
+        note=body.note if body else None,
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no error {error_id!r}",
+            "code": "not_found",
+        })
+    return {"ok": True, **doc}
+
+
+@router.post("/errors/{error_id}/ignore")
+async def ignore_error(
+    error_id: str,
+    body: Optional[_ErrorActionBody] = None,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    doc = await storage.update_parsing_error_status(
+        error_id=error_id,
+        new_status="ignored",
+        resolved_by=principal.label,
+        note=body.note if body else None,
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no error {error_id!r}",
+            "code": "not_found",
+        })
+    return {"ok": True, **doc}
+
+
+@router.post("/errors/{error_id}/reopen")
+async def reopen_error(error_id: str) -> dict[str, object]:
+    doc = await storage.update_parsing_error_status(
+        error_id=error_id, new_status="open"
+    )
+    if doc is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no error {error_id!r}",
+            "code": "not_found",
+        })
+    return {"ok": True, **doc}
+
+
+class _BulkErrorBody(BaseModel):
+    ids: list[str]
+    action: str  # "resolve" | "ignore" | "reopen"
+
+
+@router.post("/errors/bulk")
+async def bulk_errors(
+    body: _BulkErrorBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    action_to_status = {"resolve": "resolved", "ignore": "ignored", "reopen": "open"}
+    target = action_to_status.get(body.action)
+    if target is None:
+        raise HTTPException(status_code=400, detail={
+            "error": f"invalid action {body.action!r}; expected one of {list(action_to_status)}",
+            "code": "invalid_action",
+        })
+    count = await storage.bulk_update_parsing_errors(
+        error_ids=body.ids or [],
+        new_status=target,
+        resolved_by=principal.label,
+    )
+    return {"ok": True, "updated": count, "status": target}
+
+
+@router.post("/errors/backfill-baselines")
+async def backfill_baseline_errors(
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Re-run the doctor against live timetables + baselines and replace all
+    orphan ``BASELINE_MISMATCH`` / ``BASELINE_MISSING`` rows. Use after editing
+    baselines to refresh the Fix page without re-ingesting the spreadsheet.
+    """
+    return await storage.backfill_baseline_errors()
+
+
+@router.get("/timetables/{batch}")
+async def get_timetable_for_admin(batch: str) -> dict[str, object]:
+    """Read a batch's timetable in raw form — used by the Fix grid editor."""
+    try:
+        data = await storage.read_timetable(batch)
+    except storage.BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail={
+            "error": str(exc), "code": "not_found",
+        }) from exc
+    return data
+
+
+@router.patch("/timetables/{batch}")
+async def patch_timetable(batch: str, payload: dict) -> dict[str, object]:
+    """Partial update of a batch's timetable.
+
+    Body shape:
+      ``{"classes": [...]}``  full replacement of the class list, validated
+      against the same schema used by PUT. Future ops (single-cell add/remove
+      via index) can go here as a discriminator field.
+    """
+    _validate_timetable_payload(payload)
+    try:
+        current = await storage.read_timetable(batch)
+    except storage.BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail={
+            "error": str(exc), "code": "not_found",
+        }) from exc
+
+    merged = {
+        "batch": current.get("batch", batch),
+        "semester": current.get("semester") or {},
+        "classes": payload.get("classes", []),
+    }
+    if "label" in payload.get("semester", {}) and isinstance(payload["semester"]["label"], str):
+        merged["semester"] = {"label": payload["semester"]["label"]}
+    await storage.write_timetable(batch, merged)
+    storage.maybe_git_commit(f"admin: patch timetable for {batch}")
+    return {"ok": True, "batch": batch, "classes": len(merged["classes"])}
+
+
+# ── Subject catalog (DB-backed replacement for assets/subjects.json) ────
+
+class _SubjectBody(BaseModel):
+    code: str
+    name: str
+    aliases: list[str] | None = None
+    note: str | None = None
+
+
+class _SubjectPatchBody(BaseModel):
+    name: str | None = None
+    aliases: list[str] | None = None
+    note: str | None = None
+
+
+class _SubjectBulkBody(BaseModel):
+    items: list[dict]
+    resolve_errors: bool = True  # auto-bulk-resolve matching SUBJECT_NOT_IN_CATALOG rows
+
+
+@router.get("/subjects")
+async def list_subjects(
+    q: str | None = None,
+    source: str | None = None,
+    limit: int = 500,
+) -> dict[str, object]:
+    rows = await storage.list_subjects(q=q, source=source, limit=limit)
+    return {"items": rows, "count": len(rows)}
+
+
+@router.post("/subjects")
+async def create_subject(
+    body: _SubjectBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        row = await storage.upsert_subject(
+            code=body.code,
+            name=body.name,
+            aliases=body.aliases,
+            source="admin",
+            created_by=principal.label,
+            note=body.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_payload",
+        }) from exc
+    # Auto-clear any open SUBJECT_NOT_IN_CATALOG errors for the same code —
+    # the whole point of adding a row is to make those parsing errors go
+    # away. Best-effort; we don't fail the create if this part errors.
+    resolved = 0
+    try:
+        norm_code = row["code"]
+        candidates = await storage.list_parsing_errors(
+            status="open", error_type="SUBJECT_NOT_IN_CATALOG", limit=10000,
+        )
+        ids = [
+            r["id"] for r in candidates
+            if (
+                (r.get("code") or "").upper().startswith(norm_code)
+                or norm_code in str(r.get("context") or {}).upper()
+                or (r.get("message") and norm_code in r["message"].upper())
+            )
+        ]
+        if ids:
+            resolved = await storage.bulk_update_parsing_errors(
+                error_ids=ids, new_status="resolved", resolved_by=principal.label,
+            )
+    except Exception:
+        # logging happens inside storage; don't block the response
+        resolved = 0
+    return {"ok": True, "subject": row, "errors_resolved": resolved}
+
+
+@router.patch("/subjects/{code}")
+async def patch_subject(
+    code: str,
+    body: _SubjectPatchBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    if body.name is None and body.aliases is None and body.note is None:
+        raise HTTPException(status_code=400, detail={
+            "error": "no fields to update",
+            "code": "empty_patch",
+        })
+    # Fetch existing row to keep name/aliases when only one field is patched.
+    rows = await storage.list_subjects(q=code, limit=10)
+    existing = next((r for r in rows if r["code"].upper() == code.strip().upper()
+                    or r["code"].upper() == storage._normalize_subject_code(code)), None)
+    if existing is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"subject {code!r} not found",
+            "code": "not_found",
+        })
+    try:
+        row = await storage.upsert_subject(
+            code=existing["code"],
+            name=body.name if body.name is not None else existing["name"],
+            aliases=body.aliases if body.aliases is not None else existing.get("aliases"),
+            source="admin",
+            created_by=principal.label,
+            note=body.note if body.note is not None else existing.get("note"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_payload",
+        }) from exc
+    return {"ok": True, "subject": row}
+
+
+@router.delete("/subjects/{code}")
+async def delete_subject(
+    code: str,
+    force: bool = False,
+) -> dict[str, object]:
+    try:
+        ok = await storage.delete_subject(code, force=force)
+    except PermissionError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": str(exc), "code": "seed_protected",
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_code",
+        }) from exc
+    if not ok:
+        raise HTTPException(status_code=404, detail={
+            "error": f"subject {code!r} not found",
+            "code": "not_found",
+        })
+    return {"ok": True, "code": code}
+
+
+@router.post("/subjects/bulk")
+async def bulk_subjects(
+    body: _SubjectBulkBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    summary = await storage.bulk_upsert_subjects(body.items, created_by=principal.label)
+    return {"ok": True, **summary}
+
+
+@router.post("/subjects/backfill-timetables")
+async def backfill_timetables_against_catalog(
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """One-shot: re-run the catalog-strip rule over every TimetableDoc so
+    older data drops redundant subject names. Safe to call any time.
+    """
+    summary = await storage.normalize_all_timetables()
+    return {"ok": True, **summary}

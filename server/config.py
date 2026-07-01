@@ -22,6 +22,8 @@ class Settings:
     mongodb_url: str
     mongodb_db: str
     json_mirror: bool
+    ingest_cooldown_hours: float
+    ingest_snapshot_ttl_hours: float
 
 
 @lru_cache(maxsize=1)
@@ -44,6 +46,14 @@ def get_settings() -> Settings:
     mongodb_url = os.environ.get("MONGODB_URL", "mongodb://localhost:27017")
     mongodb_db = os.environ.get("MONGODB_DB", "mlsc_timetable")
     json_mirror = _truthy(os.environ.get("JSON_MIRROR", "0"))
+    try:
+        ingest_cooldown_hours = float(os.environ.get("INGEST_COOLDOWN_HOURS", "24"))
+    except ValueError:
+        ingest_cooldown_hours = 24.0
+    try:
+        ingest_snapshot_ttl_hours = float(os.environ.get("INGEST_SNAPSHOT_TTL_HOURS", "24"))
+    except ValueError:
+        ingest_snapshot_ttl_hours = 24.0
     return Settings(
         data_dir=data_dir,
         cors_origins=cors_origins,
@@ -55,6 +65,8 @@ def get_settings() -> Settings:
         mongodb_url=mongodb_url,
         mongodb_db=mongodb_db,
         json_mirror=json_mirror,
+        ingest_cooldown_hours=ingest_cooldown_hours,
+        ingest_snapshot_ttl_hours=ingest_snapshot_ttl_hours,
     )
 
 

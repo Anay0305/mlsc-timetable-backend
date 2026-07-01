@@ -103,6 +103,10 @@ async def parse_workbook(
             raise ValueError(f"No worksheets matched selector {sheet!r}")
 
         catalog = load_default_subject_catalog()
+        if not catalog.subjects:
+            # Cold cache (first call after invalidate); warm it from Mongo.
+            from timetable_parser.core.subject_catalog import ensure_catalog
+            catalog = await ensure_catalog()
 
         merged: dict[str, dict[str, list[ClassBlock]]] = {}
         # First sheet that contributed each batch (kept as the primary source_sheet
@@ -151,6 +155,21 @@ async def parse_workbook(
         payloads = class_blocks_to_api(merged, semester_label)
         batches = sorted(merged.keys())
 
+        # Snapshot the current state BEFORE we mutate anything, so a rollback
+        # can undo this run. We only do this when there's at least one batch
+        # to write — empty runs aren't worth snapshotting over (and would
+        # destroy the previous good state's recoverability).
+        if batches:
+            try:
+                snap_info = await storage.save_ingest_snapshot(settings=settings)
+                logger.info(
+                    "Pre-ingest snapshot saved: %d batches, %d timetables (expires %s)",
+                    snap_info.get("batches"), snap_info.get("timetables"),
+                    snap_info.get("expires_at"),
+                )
+            except Exception:
+                logger.exception("Pre-ingest snapshot failed — continuing without rollback")
+
         await storage.write_current({"label": semester_label}, settings=settings)
         await storage.write_batch_list(batches, settings=settings, sheet_by_code=sheet_by_code)
         for code, payload in payloads.items():
@@ -161,6 +180,14 @@ async def parse_workbook(
                 source_sheet=sheet_by_code.get(code),
                 source_file=xlsx_path.name,
             )
+        # Prune ghost timetables (codes that survived from a previous ingest
+        # but aren't in the new spreadsheet).
+        try:
+            pruned = await storage.replace_timetables(list(payloads.keys()))
+            if pruned:
+                logger.info("Pruned %d stale timetable(s) not in current ingest", pruned)
+        except Exception:
+            logger.exception("Stale-timetable prune failed (non-fatal)")
 
         total_classes = sum(len(payload["classes"]) for payload in payloads.values())
         storage.maybe_git_commit(
@@ -216,13 +243,25 @@ async def parse_workbook(
                 "multi_sheet_batches": multi_sheet_list,
                 "total_blocks": total_blocks,
                 "confidence_summary": confidence_summary,
-                "error_count": len(error_rows),
-                "errors": [row for row in error_rows],
                 "doctor": doctor,
             })
             if recorded.get("id"):
                 summary["attempt_id"] = recorded["id"]
             summary["status"] = attempt_status
+
+            # Persist the parser warnings + doctor mismatches into the
+            # ParsingErrorDoc collection so the admin Fix tab can list,
+            # filter, and resolve them. Best-effort: never let this fail
+            # the ingest summary.
+            try:
+                written = await storage.save_parsing_errors(
+                    upload_id=recorded.get("id"),
+                    error_rows=list(error_rows),
+                    doctor=doctor,
+                )
+                summary["errors_persisted"] = written
+            except Exception:
+                logger.exception("save_parsing_errors failed (non-fatal)")
 
         return summary
     except Exception as exc:

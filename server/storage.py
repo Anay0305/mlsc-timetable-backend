@@ -17,7 +17,7 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,10 +30,12 @@ from server.db.models import (
     ChangeRequestDoc,
     ContributorDoc,
     ExamDateDoc,
+    IngestSnapshotDoc,
+    ParsingErrorDoc,
     SemesterDoc,
+    SubjectDoc,
     TimetableDoc,
     UploadAttemptDoc,
-    UploadErrorRow,
 )
 
 logger = logging.getLogger(__name__)
@@ -71,7 +73,11 @@ async def read_timetable(batch: str, settings: Settings | None = None) -> dict[s
     doc = await TimetableDoc.find_one(TimetableDoc.code == code)
     if doc is None:
         raise BatchNotFound(batch)
-    return _timetable_payload(doc)
+    # Resolve any stripped subject names from the live catalog so the
+    # response shape stays compatible with every existing client.
+    from timetable_parser.core.subject_catalog import ensure_catalog
+    catalog = await ensure_catalog()
+    return _timetable_payload(doc, catalog)
 
 
 # ── Writes ───────────────────────────────────────────────────────────────
@@ -123,6 +129,17 @@ async def write_current(payload: dict[str, Any], settings: Settings | None = Non
     label = payload.get("label")
     if not isinstance(label, str) or not label.strip():
         raise ValueError("payload must include a non-empty 'label' string")
+    label = label.strip()
+    # Baselines are keyed by an E/O prefix (see semester_prefix), so the label
+    # must clearly indicate which parity it is. Anything else silently breaks
+    # doctor lookups and produces false "no baseline" advisories.
+    head = label.upper()
+    if not (head.startswith("EVEN") or head.startswith("ODD")
+            or head.startswith("E ") or head.startswith("O ")):
+        raise ValueError(
+            f"invalid semester label {label!r}: must start with 'EVEN' or 'ODD' "
+            "(e.g. 'EVEN 25-26', 'ODD 2025')"
+        )
     doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
     if doc is None:
         await SemesterDoc(key="current", label=label).insert()
@@ -153,6 +170,13 @@ async def write_timetable(
     if not isinstance(classes, list):
         raise ValueError("payload.classes must be a list")
 
+    # Strip subject names that match the catalog default so we don't store
+    # the same string thousands of times. ``ensure_catalog`` is cheap when
+    # the in-process snapshot is warm.
+    from timetable_parser.core.subject_catalog import ensure_catalog
+    catalog = await ensure_catalog()
+    classes = _normalize_classes_for_write(classes, catalog)
+
     source = {
         "sheet": source_sheet,
         "file": source_file,
@@ -177,7 +201,7 @@ async def write_timetable(
 
     if settings.json_mirror:
         path = settings.data_dir / "timetable" / f"{code}.json"
-        _mirror_json(path, _timetable_payload_from_raw(code, semester_label, classes))
+        _mirror_json(path, _timetable_payload_from_raw(code, semester_label, classes, catalog))
 
 
 async def delete_timetable(batch: str, settings: Settings | None = None) -> bool:
@@ -744,27 +768,103 @@ def maybe_git_commit(message: str, settings: Settings | None = None) -> None:
 
 
 # ── Internals ────────────────────────────────────────────────────────────
-def _timetable_payload(doc: TimetableDoc) -> dict[str, Any]:
+def _timetable_payload(doc: TimetableDoc, catalog: Any = None) -> dict[str, Any]:
     return {
         "batch": doc.code,
         "semester": {"label": doc.semester},
-        "classes": [_serialize_class(c) for c in doc.classes],
+        "classes": [_serialize_class(c, catalog) for c in doc.classes],
     }
 
 
-def _timetable_payload_from_raw(code: str, semester_label: str, classes: list[Any]) -> dict[str, Any]:
+def _timetable_payload_from_raw(
+    code: str, semester_label: str, classes: list[Any], catalog: Any = None,
+) -> dict[str, Any]:
     return {
         "batch": code,
         "semester": {"label": semester_label},
-        "classes": [_serialize_class(c) for c in classes],
+        "classes": [_serialize_class(c, catalog) for c in classes],
     }
 
 
-def _serialize_class(entry: Any) -> dict[str, Any]:
-    """Coerce a ClassEntry or plain dict to a stable JSON dict."""
+def _serialize_class(entry: Any, catalog: Any = None) -> dict[str, Any]:
+    """Coerce a ClassEntry or plain dict to a stable JSON dict.
+
+    When ``catalog`` is supplied, any entry with an empty ``subject`` but a
+    non-empty ``code`` gets filled in from the catalog — this is how the
+    "strip on write, resolve on read" rule keeps the public payload looking
+    identical to the pre-refactor shape (see ``_normalize_classes_for_write``).
+    The same fill is applied to each elective option's ``subject_name``.
+    """
     if hasattr(entry, "model_dump"):
-        return entry.model_dump(exclude_none=False)
-    return dict(entry)
+        out = entry.model_dump(exclude_none=False)
+    else:
+        out = dict(entry)
+    if catalog is not None:
+        code = out.get("code")
+        subject = out.get("subject")
+        if code and not (isinstance(subject, str) and subject.strip()):
+            resolved = catalog.name_for(code)
+            if resolved:
+                out["subject"] = resolved
+        opts = out.get("options")
+        if isinstance(opts, list):
+            for opt in opts:
+                if not isinstance(opt, dict):
+                    continue
+                opt_code = opt.get("subject_code")
+                opt_name = opt.get("subject_name")
+                if opt_code and not (isinstance(opt_name, str) and opt_name.strip()):
+                    resolved = catalog.name_for(opt_code)
+                    if resolved:
+                        opt["subject_name"] = resolved
+    return out
+
+
+def _norm_subject(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return " ".join(value.strip().upper().split())
+
+
+def _normalize_classes_for_write(classes: list[Any], catalog: Any) -> list[Any]:
+    """Strip ``subject`` (and elective ``subject_name``) when it equals the
+    catalog default for the entry's code. Keeps overrides intact. Pure
+    function — returns a new list, leaves the caller's data alone.
+
+    Catalog == ``None`` is a no-op so callers (or tests) without a cache
+    behave like before.
+    """
+    if catalog is None:
+        return classes
+    out: list[Any] = []
+    for raw in classes:
+        if hasattr(raw, "model_dump"):
+            entry = raw.model_dump(exclude_none=False)
+        elif isinstance(raw, dict):
+            entry = dict(raw)
+        else:
+            out.append(raw)
+            continue
+        code = entry.get("code")
+        default = catalog.name_for(code) if code else None
+        if default and _norm_subject(entry.get("subject")) == _norm_subject(default):
+            entry["subject"] = None
+        opts = entry.get("options")
+        if isinstance(opts, list):
+            new_opts = []
+            for opt in opts:
+                if not isinstance(opt, dict):
+                    new_opts.append(opt)
+                    continue
+                opt = dict(opt)
+                opt_code = opt.get("subject_code")
+                opt_default = catalog.name_for(opt_code) if opt_code else None
+                if opt_default and _norm_subject(opt.get("subject_name")) == _norm_subject(opt_default):
+                    opt["subject_name"] = None
+                new_opts.append(opt)
+            entry["options"] = new_opts
+        out.append(entry)
+    return out
 
 
 def _safe_batch(batch: str) -> str:
@@ -911,8 +1011,8 @@ async def delete_admin_email(email: str) -> bool:
 
 
 # ── Upload attempts (audit log + dashboard fuel) ─────────────────────────
-def _serialize_upload_attempt(doc: UploadAttemptDoc, *, include_errors: bool = True) -> dict[str, Any]:
-    payload: dict[str, Any] = {
+def _serialize_upload_attempt(doc: UploadAttemptDoc) -> dict[str, Any]:
+    return {
         "id": str(doc.id),
         "started_at": doc.started_at.isoformat() if doc.started_at else None,
         "finished_at": doc.finished_at.isoformat() if doc.finished_at else None,
@@ -928,28 +1028,14 @@ def _serialize_upload_attempt(doc: UploadAttemptDoc, *, include_errors: bool = T
         "multi_sheet_batches": list(doc.multi_sheet_batches or []),
         "total_blocks": doc.total_blocks,
         "confidence_summary": dict(doc.confidence_summary or {}),
-        "error_count": doc.error_count,
         "doctor": doc.doctor,
         "failure_message": doc.failure_message,
     }
-    if include_errors:
-        payload["errors"] = [
-            row.model_dump(exclude_none=False) if hasattr(row, "model_dump") else dict(row)
-            for row in (doc.errors or [])
-        ]
-    return payload
 
 
 async def record_upload_attempt(payload: dict[str, Any]) -> dict[str, Any]:
     """Persist a single UploadAttemptDoc. Best-effort — never raises."""
     try:
-        errors_raw = payload.get("errors") or []
-        errors_models = []
-        for row in errors_raw:
-            if isinstance(row, UploadErrorRow):
-                errors_models.append(row)
-            elif isinstance(row, dict):
-                errors_models.append(UploadErrorRow(**row))
         doc = UploadAttemptDoc(
             started_at=payload.get("started_at") or datetime.now(timezone.utc),
             finished_at=payload.get("finished_at") or datetime.now(timezone.utc),
@@ -965,13 +1051,11 @@ async def record_upload_attempt(payload: dict[str, Any]) -> dict[str, Any]:
             multi_sheet_batches=list(payload.get("multi_sheet_batches") or []),
             total_blocks=int(payload.get("total_blocks") or 0),
             confidence_summary=dict(payload.get("confidence_summary") or {}),
-            error_count=int(payload.get("error_count") or len(errors_models)),
-            errors=errors_models,
             doctor=payload.get("doctor"),
             failure_message=payload.get("failure_message"),
         )
         await doc.insert()
-        return _serialize_upload_attempt(doc, include_errors=False)
+        return _serialize_upload_attempt(doc)
     except Exception:
         logger.exception("failed to persist UploadAttemptDoc")
         return {}
@@ -990,9 +1074,56 @@ async def list_upload_attempts(
         query = UploadAttemptDoc.find_all().sort(-UploadAttemptDoc.started_at)
     out: list[dict[str, Any]] = []
     async for doc in query:
-        out.append(_serialize_upload_attempt(doc, include_errors=False))
+        out.append(_serialize_upload_attempt(doc))
         if len(out) >= limit:
             break
+
+    # Enrich each upload with live error stats (open/resolved/ignored + top
+    # error types). Two aggregations regardless of N so this stays O(1) round
+    # trips even when the caller asks for 500 uploads.
+    upload_ids = [row["id"] for row in out if row.get("id")]
+    if upload_ids:
+        coll = ParsingErrorDoc.get_pymongo_collection()
+
+        stats_by_status: dict[str, dict[str, int]] = {}
+        status_cursor = coll.aggregate([
+            {"$match": {"upload_id": {"$in": upload_ids}}},
+            {"$group": {
+                "_id": {"upload_id": "$upload_id", "status": "$status"},
+                "count": {"$sum": 1},
+            }},
+        ])
+        async for row in status_cursor:
+            uid = row["_id"]["upload_id"]
+            st = row["_id"]["status"]
+            bucket = stats_by_status.setdefault(uid, {"open": 0, "resolved": 0, "ignored": 0})
+            bucket[st] = int(row.get("count") or 0)
+
+        top_types_by_upload: dict[str, list[dict[str, Any]]] = {}
+        type_cursor = coll.aggregate([
+            {"$match": {"upload_id": {"$in": upload_ids}, "status": "open"}},
+            {"$group": {
+                "_id": {"upload_id": "$upload_id", "type": "$error_type"},
+                "count": {"$sum": 1},
+            }},
+            {"$sort": {"count": -1}},
+        ])
+        async for row in type_cursor:
+            uid = row["_id"]["upload_id"]
+            top_types_by_upload.setdefault(uid, []).append({
+                "error_type": row["_id"]["type"],
+                "count": int(row.get("count") or 0),
+            })
+
+        for row in out:
+            uid = row.get("id")
+            buckets = stats_by_status.get(uid, {"open": 0, "resolved": 0, "ignored": 0})
+            row["errors_open"] = buckets.get("open", 0)
+            row["errors_resolved"] = buckets.get("resolved", 0)
+            row["errors_ignored"] = buckets.get("ignored", 0)
+            row["errors_total"] = sum(buckets.values())
+            row["errors_top_types"] = top_types_by_upload.get(uid, [])[:4]
+
     return out
 
 
@@ -1006,14 +1137,7 @@ async def get_upload_attempt(attempt_id: str) -> dict[str, Any] | None:
     doc = await UploadAttemptDoc.get(oid)
     if doc is None:
         return None
-    return _serialize_upload_attempt(doc, include_errors=True)
-
-
-async def get_latest_upload_attempt() -> dict[str, Any] | None:
-    doc = await UploadAttemptDoc.find_all().sort(-UploadAttemptDoc.started_at).first_or_none()
-    if doc is None:
-        return None
-    return _serialize_upload_attempt(doc, include_errors=True)
+    return _serialize_upload_attempt(doc)
 
 
 async def compute_admin_stats() -> dict[str, Any]:
@@ -1028,11 +1152,13 @@ async def compute_admin_stats() -> dict[str, Any]:
         {"status": {"$in": ["partial", "failed"]}}
     ).count()
 
-    total_errors = 0
+    # Total open errors comes from the live ParsingErrorDoc collection so it
+    # reflects triage state (fixed rows drop out of the count).
+    total_errors = await ParsingErrorDoc.find(ParsingErrorDoc.status == "open").count()
+
     total_blocks = 0
     high = medium = low = unreliable = 0
     async for doc in UploadAttemptDoc.find_all():
-        total_errors += int(doc.error_count or 0)
         total_blocks += int(doc.total_blocks or 0)
         summary = dict(doc.confidence_summary or {})
         high += int(summary.get("HIGH", 0))
@@ -1059,6 +1185,676 @@ async def compute_admin_stats() -> dict[str, Any]:
             "TOTAL": total_blocks,
         },
     }
+
+
+# ── Ingest cooldown + snapshot/rollback ──────────────────────────────────
+# A successful or partial ingest takes a single snapshot of the live data
+# (batches + timetables + semester label) so an admin can roll the most
+# recent run back. The snapshot self-destructs after
+# INGEST_SNAPSHOT_TTL_HOURS via a Mongo TTL index. Cooldown is enforced
+# against the most recent ``UploadAttemptDoc.started_at`` to prevent
+# accidental double-runs.
+
+
+async def last_ingest_started_at() -> datetime | None:
+    doc = await UploadAttemptDoc.find_one(sort=[("started_at", -1)])
+    return doc.started_at if doc else None
+
+
+async def check_ingest_cooldown(
+    settings: Settings | None = None,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Return ``{"ok": True}`` if a fresh ingest is allowed, otherwise a
+    payload describing how long the caller must wait. Pass ``force=True`` to
+    bypass the gate (the route enforces admin-only access on top of this).
+    """
+    settings = settings or get_settings()
+    cooldown_h = max(0.0, float(settings.ingest_cooldown_hours))
+    if force or cooldown_h <= 0:
+        return {"ok": True}
+    last = await last_ingest_started_at()
+    if last is None:
+        return {"ok": True}
+    if last.tzinfo is None:
+        last = last.replace(tzinfo=timezone.utc)
+    elapsed = datetime.now(timezone.utc) - last
+    cooldown = timedelta(hours=cooldown_h)
+    if elapsed >= cooldown:
+        return {"ok": True}
+    retry_after = cooldown - elapsed
+    return {
+        "ok": False,
+        "last_ingest_at": last.isoformat(),
+        "cooldown_hours": cooldown_h,
+        "retry_after_seconds": int(retry_after.total_seconds()),
+    }
+
+
+def _strip_object_id(doc: dict[str, Any]) -> dict[str, Any]:
+    """Remove the Mongo _id so a snapshot row can be re-inserted cleanly."""
+    if not isinstance(doc, dict):
+        return doc
+    out = dict(doc)
+    out.pop("_id", None)
+    return out
+
+
+async def save_ingest_snapshot(settings: Settings | None = None) -> dict[str, Any]:
+    """Replace any existing snapshot with one of the current state.
+
+    Returns a small summary used by the caller for logging. Only ever stores
+    one document — older snapshots are removed so rollback always undoes the
+    most recent run.
+    """
+    settings = settings or get_settings()
+    ttl_h = max(1.0, float(settings.ingest_snapshot_ttl_hours))
+    now = datetime.now(timezone.utc)
+    expires_at = now + timedelta(hours=ttl_h)
+
+    batches_raw = await BatchDoc.find_all().to_list()
+    timetables_raw = await TimetableDoc.find_all().to_list()
+    current_doc = await SemesterDoc.find_one()
+
+    batches = [_strip_object_id(b.model_dump(mode="json")) for b in batches_raw]
+    timetables = [_strip_object_id(t.model_dump(mode="json")) for t in timetables_raw]
+    current = _strip_object_id(current_doc.model_dump(mode="json")) if current_doc else None
+
+    # Replace: delete all existing snapshots, write a fresh one.
+    await IngestSnapshotDoc.find_all().delete()
+    snap = IngestSnapshotDoc(
+        created_at=now,
+        expires_at=expires_at,
+        semester_label=(current.get("label") if isinstance(current, dict) else None),
+        batch_count=len(batches),
+        timetable_count=len(timetables),
+        batches=batches,
+        timetables=timetables,
+        current=current,
+    )
+    await snap.insert()
+    return {
+        "id": str(snap.id),
+        "created_at": now.isoformat(),
+        "expires_at": expires_at.isoformat(),
+        "batches": len(batches),
+        "timetables": len(timetables),
+    }
+
+
+def _snapshot_meta(snap: IngestSnapshotDoc) -> dict[str, Any]:
+    return {
+        "id": str(snap.id),
+        "created_at": snap.created_at.isoformat() if snap.created_at else None,
+        "expires_at": snap.expires_at.isoformat() if snap.expires_at else None,
+        "semester_label": snap.semester_label,
+        "batches": snap.batch_count,
+        "timetables": snap.timetable_count,
+    }
+
+
+async def get_ingest_snapshot_meta() -> dict[str, Any] | None:
+    snap = await IngestSnapshotDoc.find_one(sort=[("created_at", -1)])
+    if snap is None:
+        return None
+    # Pretend it doesn't exist if the TTL date has already passed but Mongo
+    # hasn't pruned yet (TTL is sweep-based, runs ~every minute).
+    exp = snap.expires_at
+    if exp is not None and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp is not None and exp < datetime.now(timezone.utc):
+        return None
+    return _snapshot_meta(snap)
+
+
+async def restore_ingest_snapshot() -> dict[str, Any]:
+    """Wipe ``batches`` + ``timetables`` and rewrite them from the snapshot.
+
+    Returns counts of what was restored. Raises ``LookupError`` if no
+    snapshot is available. The snapshot is deleted on success — rollback
+    is single-use, mirroring the "only the last run can be undone" promise.
+    """
+    snap = await IngestSnapshotDoc.find_one(sort=[("created_at", -1)])
+    if snap is None:
+        raise LookupError("No ingest snapshot available")
+
+    # Wipe + rebuild batches + timetables.
+    await BatchDoc.find_all().delete()
+    await TimetableDoc.find_all().delete()
+
+    now = datetime.now(timezone.utc)
+    restored_batches = 0
+    for row in snap.batches:
+        try:
+            payload = dict(row)
+            await BatchDoc(**payload).insert()
+            restored_batches += 1
+        except Exception:
+            logger.exception("snapshot: failed to restore batch row %r", row)
+
+    restored_timetables = 0
+    for row in snap.timetables:
+        try:
+            payload = dict(row)
+            await TimetableDoc(**payload).insert()
+            restored_timetables += 1
+        except Exception:
+            logger.exception("snapshot: failed to restore timetable row %r", row)
+
+    # Restore semester label if we have one.
+    if isinstance(snap.current, dict) and snap.current.get("label"):
+        await SemesterDoc.find_all().delete()
+        try:
+            await SemesterDoc(**dict(snap.current)).insert()
+        except Exception:
+            logger.exception("snapshot: failed to restore semester doc")
+
+    # Single-use: drop the snapshot now that we've used it.
+    await snap.delete()
+
+    return {
+        "ok": True,
+        "restored_at": now.isoformat(),
+        "batches": restored_batches,
+        "timetables": restored_timetables,
+        "semester_label": snap.semester_label,
+    }
+
+
+async def replace_timetables(codes_to_keep: list[str]) -> int:
+    """Delete TimetableDoc rows whose ``code`` is not in ``codes_to_keep``.
+
+    Mirrors the prune behaviour of ``replace_batch_directory``. Returns the
+    number of stale rows removed.
+    """
+    keep = {str(c).upper() for c in codes_to_keep}
+    stale_count = 0
+    async for doc in TimetableDoc.find_all():
+        if doc.code.upper() not in keep:
+            try:
+                await doc.delete()
+                stale_count += 1
+            except Exception:
+                logger.exception("replace_timetables: failed to delete %s", doc.code)
+    return stale_count
+
+
+# ── Parsing errors (admin Fix tab) ───────────────────────────────────────
+
+
+def _parsing_error_payload(doc: ParsingErrorDoc) -> dict[str, Any]:
+    return {
+        "id": str(doc.id),
+        "upload_id": doc.upload_id,
+        "batch_code": doc.batch_code,
+        "error_type": doc.error_type,
+        "severity": doc.severity,
+        "day": doc.day,
+        "start_time": doc.start_time,
+        "period": doc.period,
+        "code": doc.code,
+        "message": doc.message,
+        "context": doc.context,
+        "status": doc.status,
+        "resolved_by": doc.resolved_by,
+        "resolved_at": doc.resolved_at.isoformat() if doc.resolved_at else None,
+        "note": doc.note,
+        "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+    }
+
+
+# Mapping that turns the parser's confidence severity into the Fix-tab
+# severity vocabulary. We also use the same map for doctor mismatches.
+_PARSER_SEV_TO_FIX = {
+    "HIGH": "info",
+    "MEDIUM": "warn",
+    "LOW": "warn",
+    "UNRELIABLE": "error",
+}
+
+
+async def save_parsing_errors(
+    *,
+    upload_id: str | None,
+    error_rows: list[dict[str, Any]],
+    doctor: dict[str, Any] | None = None,
+) -> int:
+    """Persist parser warnings + doctor mismatches as ``ParsingErrorDoc`` rows.
+
+    Existing rows for the same ``upload_id`` are wiped first so re-running an
+    ingest doesn't produce duplicates. Returns the number of rows written.
+    """
+    if upload_id:
+        await ParsingErrorDoc.find(ParsingErrorDoc.upload_id == upload_id).delete()
+    now = datetime.now(timezone.utc)
+    written = 0
+
+    for row in error_rows or []:
+        sev = _PARSER_SEV_TO_FIX.get(str(row.get("severity") or "").upper(), "warn")
+        try:
+            await ParsingErrorDoc(
+                upload_id=upload_id,
+                batch_code=row.get("batch"),
+                error_type=str(row.get("code") or "parser_warning"),
+                severity=sev,
+                day=row.get("day"),
+                start_time=row.get("start_time"),
+                code=None,
+                message=str(row.get("message") or ""),
+                context={k: v for k, v in row.items() if k not in {"batch", "day", "start_time", "severity", "code", "message"}},
+                status="open",
+                created_at=now,
+                updated_at=now,
+            ).insert()
+            written += 1
+        except Exception:
+            logger.exception("save_parsing_errors: failed to write row %r", row)
+
+    # Doctor mismatches: one row per outlier batch that deviates from its
+    # admin-curated baseline. Grouped baseline-less streams also surface as an
+    # advisory so the admin knows to define one.
+    if isinstance(doctor, dict):
+        for grp in doctor.get("mismatches", []) or []:
+            group = grp.get("group")
+            baseline_key = grp.get("baseline_key")
+            expected = grp.get("expected") or {}
+            for out in grp.get("outliers") or []:
+                batch = out.get("batch")
+                counts = out.get("counts") or {}
+                deltas = out.get("deltas") or {}
+                delta_pieces = ", ".join(
+                    f"{k} {'+' if v > 0 else ''}{v}"
+                    for k, v in sorted(deltas.items())
+                    if k != "total"
+                )
+                msg = (
+                    f"{batch} deviates from baseline {baseline_key or group}: "
+                    f"{delta_pieces or 'total mismatch'}"
+                )
+                try:
+                    await ParsingErrorDoc(
+                        upload_id=upload_id,
+                        batch_code=batch,
+                        error_type="BASELINE_MISMATCH",
+                        severity="warn",
+                        message=msg,
+                        context={
+                            "group": group,
+                            "baseline_key": baseline_key,
+                            "expected": expected,
+                            "actual": counts,
+                            "deltas": deltas,
+                        },
+                        status="open",
+                        created_at=now,
+                        updated_at=now,
+                    ).insert()
+                    written += 1
+                except Exception:
+                    logger.exception("save_parsing_errors: failed to write mismatch %r", out)
+
+        for grp in doctor.get("no_baseline", []) or []:
+            group = grp.get("group")
+            baseline_key = grp.get("baseline_key")
+            batch_codes = grp.get("batch_codes") or []
+            msg = (
+                f"Group {group} ({len(batch_codes)} batches) has no baseline defined "
+                f"— add baseline {baseline_key or group} to enable consistency checks."
+            )
+            try:
+                await ParsingErrorDoc(
+                    upload_id=upload_id,
+                    batch_code=None,
+                    error_type="BASELINE_MISSING",
+                    severity="info",
+                    message=msg,
+                    context={
+                        "group": group,
+                        "baseline_key": baseline_key,
+                        "batch_codes": batch_codes,
+                    },
+                    status="open",
+                    created_at=now,
+                    updated_at=now,
+                ).insert()
+                written += 1
+            except Exception:
+                logger.exception("save_parsing_errors: failed to write no_baseline %r", grp)
+
+    return written
+
+
+async def backfill_baseline_errors(settings: Settings | None = None) -> dict[str, Any]:
+    """Re-run the doctor against the current live timetables + baselines and
+    replace all orphan (``upload_id=None``) baseline rows with fresh output.
+
+    Use this to populate the Fix page with ``BASELINE_MISMATCH`` /
+    ``BASELINE_MISSING`` rows without re-ingesting the source spreadsheet
+    (e.g. after upgrading from the pre-baseline doctor, or after editing
+    baselines and wanting the Fix page to reflect them immediately).
+    """
+    # Local import to avoid a top-level cycle with server.doctor.
+    from server.doctor import build_doctor_report, count_classes
+
+    try:
+        current = await read_current(settings=settings)
+    except DataMissing:
+        return {"status": "skipped", "reason": "no current semester", "batches": 0, "written": 0, "deleted": 0}
+
+    label = current.get("label")
+    prefix = semester_prefix(label)
+
+    counts_by_batch: dict[str, dict[str, int]] = {}
+    async for doc in TimetableDoc.find_all():
+        raw_classes = getattr(doc, "classes", None) or []
+        classes: list[dict[str, Any]] = []
+        for c in raw_classes:
+            if hasattr(c, "model_dump"):
+                classes.append(c.model_dump())
+            elif isinstance(c, dict):
+                classes.append(c)
+        counts_by_batch[doc.code] = count_classes(classes)
+
+    if not counts_by_batch:
+        return {"status": "skipped", "reason": "no timetables", "batches": 0, "written": 0, "deleted": 0}
+
+    baselines = await read_baselines_for_prefix(prefix, settings=settings)
+    report = build_doctor_report(
+        counts_by_batch,
+        baselines_by_group=baselines,
+        semester_prefix=prefix,
+    )
+
+    # Wipe existing orphan baseline rows so re-runs don't stack up. We only
+    # touch rows with upload_id=None so per-ingest history stays intact.
+    stale_types = ["BASELINE_MISMATCH", "BASELINE_MISSING", "doctor_mismatch"]
+    delete_res = await ParsingErrorDoc.find(
+        {"upload_id": None, "error_type": {"$in": stale_types}}
+    ).delete()
+    deleted = getattr(delete_res, "deleted_count", 0) or 0
+
+    written = await save_parsing_errors(upload_id=None, error_rows=[], doctor=report)
+
+    return {
+        "status": "ok",
+        "semester_label": label,
+        "semester_prefix": prefix,
+        "batches": len(counts_by_batch),
+        "mismatched_groups": report.get("mismatched_groups", 0),
+        "groups_without_baseline": report.get("groups_without_baseline", 0),
+        "written": written,
+        "deleted": deleted,
+    }
+
+
+async def list_parsing_errors(
+    *,
+    status: str | None = None,
+    upload_id: str | None = None,
+    error_type: str | None = None,
+    batch_code: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    query = ParsingErrorDoc.find_all(sort=[("created_at", -1)])
+    if status:
+        query = ParsingErrorDoc.find(ParsingErrorDoc.status == status, sort=[("created_at", -1)])
+    out: list[dict[str, Any]] = []
+    async for doc in query:
+        if upload_id and doc.upload_id != upload_id:
+            continue
+        if error_type and doc.error_type != error_type:
+            continue
+        if batch_code and (doc.batch_code or "").upper() != batch_code.upper():
+            continue
+        out.append(_parsing_error_payload(doc))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def parsing_errors_summary(upload_id: str | None = None) -> dict[str, Any]:
+    """Return aggregate counts grouped by error_type + by status."""
+    by_type: dict[str, dict[str, int]] = {}
+    totals = {"open": 0, "resolved": 0, "ignored": 0}
+    async for doc in ParsingErrorDoc.find_all():
+        if upload_id and doc.upload_id != upload_id:
+            continue
+        bucket = by_type.setdefault(doc.error_type, {"open": 0, "resolved": 0, "ignored": 0})
+        bucket[doc.status] = bucket.get(doc.status, 0) + 1
+        totals[doc.status] = totals.get(doc.status, 0) + 1
+    by_type_list = [
+        {"error_type": k, **v, "total": sum(v.values())}
+        for k, v in sorted(by_type.items(), key=lambda kv: -sum(kv[1].values()))
+    ]
+    return {"by_type": by_type_list, "totals": totals, "grand_total": sum(totals.values())}
+
+
+async def update_parsing_error_status(
+    *,
+    error_id: str,
+    new_status: str,
+    resolved_by: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any] | None:
+    if new_status not in {"open", "resolved", "ignored"}:
+        raise ValueError(f"invalid status: {new_status!r}")
+    try:
+        from beanie import PydanticObjectId
+
+        doc = await ParsingErrorDoc.get(PydanticObjectId(error_id))
+    except Exception:
+        return None
+    if doc is None:
+        return None
+    now = datetime.now(timezone.utc)
+    updates: dict[str, Any] = {
+        "status": new_status,
+        "updated_at": now,
+    }
+    if new_status in {"resolved", "ignored"}:
+        updates["resolved_by"] = resolved_by
+        updates["resolved_at"] = now
+    else:
+        updates["resolved_by"] = None
+        updates["resolved_at"] = None
+    if note is not None:
+        updates["note"] = note or None
+    await doc.set(updates)
+    refreshed = await ParsingErrorDoc.get(doc.id)
+    return _parsing_error_payload(refreshed) if refreshed else None
+
+
+async def bulk_update_parsing_errors(
+    *,
+    error_ids: list[str],
+    new_status: str,
+    resolved_by: str | None = None,
+) -> int:
+    """Apply the same status to multiple errors. Returns count updated."""
+    if new_status not in {"open", "resolved", "ignored"}:
+        raise ValueError(f"invalid status: {new_status!r}")
+    count = 0
+    for eid in error_ids or []:
+        try:
+            res = await update_parsing_error_status(
+                error_id=eid, new_status=new_status, resolved_by=resolved_by
+            )
+            if res is not None:
+                count += 1
+        except Exception:
+            logger.exception("bulk_update_parsing_errors: %s failed", eid)
+    return count
+
+
+# ── Subject catalog (DB-backed, replaces assets/subjects.json) ───────────
+# All admin reads/writes flow through here. After every mutation we
+# ``invalidate_catalog()`` so the next request rebuilds the in-process
+# snapshot used by the parser and the read-side resolver.
+
+def _subject_payload(doc: SubjectDoc) -> dict[str, Any]:
+    return {
+        "id": str(doc.id) if doc.id else None,
+        "code": doc.code,
+        "name": doc.name,
+        "aliases": list(doc.aliases or []),
+        "source": doc.source,
+        "created_by": doc.created_by,
+        "note": doc.note,
+        "created_at": _iso_z(doc.created_at) if hasattr(doc, "created_at") else None,
+        "updated_at": _iso_z(doc.updated_at) if hasattr(doc, "updated_at") else None,
+    }
+
+
+def _normalize_subject_code(code: str) -> str:
+    """Match ``base_subject_code``: upper, alnum, drop trailing L/T/P."""
+    cleaned = "".join(ch for ch in (code or "").strip().upper() if ch.isalnum())
+    if not cleaned:
+        raise ValueError("subject code required")
+    if cleaned[-1] in {"L", "T", "P"} and len(cleaned) > 1:
+        cleaned = cleaned[:-1]
+    return cleaned
+
+
+async def list_subjects(
+    *,
+    q: str | None = None,
+    source: str | None = None,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    qnorm = (q or "").strip().upper()
+    async for doc in SubjectDoc.find_all(sort=[("code", 1)]):
+        if source and doc.source != source:
+            continue
+        if qnorm and qnorm not in (doc.code or "").upper() and qnorm not in (doc.name or "").upper():
+            continue
+        out.append(_subject_payload(doc))
+        if len(out) >= limit:
+            break
+    return out
+
+
+async def upsert_subject(
+    *,
+    code: str,
+    name: str,
+    aliases: list[str] | None = None,
+    source: str = "admin",
+    created_by: str | None = None,
+    note: str | None = None,
+) -> dict[str, Any]:
+    """Insert or update a single subject. Idempotent on ``code``."""
+    from timetable_parser.core.subject_catalog import invalidate_catalog
+
+    norm = _normalize_subject_code(code)
+    clean_name = (name or "").strip()
+    if not clean_name:
+        raise ValueError("subject name required")
+    now = datetime.now(timezone.utc)
+    existing = await SubjectDoc.find_one(SubjectDoc.code == norm)
+    if existing is None:
+        doc = SubjectDoc(
+            code=norm,
+            name=clean_name,
+            aliases=list(aliases or []),
+            source=source,
+            created_by=created_by,
+            note=note,
+        )
+        await doc.insert()
+    else:
+        updates: dict[str, Any] = {"name": clean_name, "updated_at": now}
+        if aliases is not None:
+            updates["aliases"] = list(aliases)
+        if note is not None:
+            updates["note"] = note
+        # ``source`` is never downgraded from "admin" back to "seed"; admin
+        # writes always mark the row as admin-owned.
+        if existing.source != "admin" and source == "admin":
+            updates["source"] = "admin"
+            updates["created_by"] = created_by or existing.created_by
+        await existing.set(updates)
+        doc = await SubjectDoc.find_one(SubjectDoc.code == norm)
+    invalidate_catalog()
+    return _subject_payload(doc)
+
+
+async def delete_subject(code: str, *, force: bool = False) -> bool:
+    from timetable_parser.core.subject_catalog import invalidate_catalog
+
+    norm = _normalize_subject_code(code)
+    doc = await SubjectDoc.find_one(SubjectDoc.code == norm)
+    if doc is None:
+        return False
+    if doc.source == "seed" and not force:
+        raise PermissionError(
+            f"refusing to delete seed subject {norm!r} without force=True"
+        )
+    await doc.delete()
+    invalidate_catalog()
+    return True
+
+
+async def bulk_upsert_subjects(
+    items: list[dict[str, Any]],
+    *,
+    created_by: str | None = None,
+) -> dict[str, int]:
+    """Best-effort bulk import. Returns ``{added, updated, failed}``."""
+    added = 0
+    updated = 0
+    failed = 0
+    for raw in items or []:
+        if not isinstance(raw, dict):
+            failed += 1
+            continue
+        try:
+            norm = _normalize_subject_code(raw.get("code", ""))
+            existed = await SubjectDoc.find_one(SubjectDoc.code == norm)
+            await upsert_subject(
+                code=norm,
+                name=str(raw.get("name", "")),
+                aliases=raw.get("aliases") if isinstance(raw.get("aliases"), list) else None,
+                source="import",
+                created_by=created_by,
+                note=raw.get("note") if isinstance(raw.get("note"), str) else None,
+            )
+            if existed is None:
+                added += 1
+            else:
+                updated += 1
+        except Exception:
+            logger.exception("bulk_upsert_subjects: row failed: %r", raw)
+            failed += 1
+    return {"added": added, "updated": updated, "failed": failed}
+
+
+async def normalize_all_timetables() -> dict[str, int]:
+    """One-shot pass: walk every TimetableDoc and re-run the catalog-strip
+    rule against ``classes``. Idempotent — running it twice is a no-op.
+
+    Returns counts of timetables scanned vs actually rewritten.
+    """
+    from timetable_parser.core.subject_catalog import ensure_catalog
+
+    catalog = await ensure_catalog()
+    scanned = 0
+    rewritten = 0
+    async for tt in TimetableDoc.find_all():
+        scanned += 1
+        before = [_serialize_class(c) for c in tt.classes]
+        after = _normalize_classes_for_write(before, catalog)
+        # Cheap structural compare — only rewrite when something actually
+        # changed, so we don't bump updated_at on every doc.
+        if before != after:
+            await tt.set({
+                "classes": after,
+                "updated_at": datetime.now(timezone.utc),
+            })
+            rewritten += 1
+    return {"scanned": scanned, "rewritten": rewritten}
 
 
 # ── Announcements + exam dates ───────────────────────────────────────────

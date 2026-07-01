@@ -12,6 +12,7 @@ from typing import Annotated, Literal, Optional
 
 from beanie import Document, Indexed
 from pydantic import BaseModel, ConfigDict, Field
+from pymongo import ASCENDING, IndexModel
 
 
 def _utcnow() -> datetime:
@@ -210,23 +211,13 @@ class AdminEmailDoc(Document):
         name = "admin_emails"
 
 
-class UploadErrorRow(BaseModel):
-    """One parser warning surfaced on the admin dashboard."""
-
-    batch: Optional[str] = None
-    sheet: Optional[str] = None
-    day: Optional[str] = None
-    start_time: Optional[str] = None
-    severity: str = "MEDIUM"  # confidence level (HIGH|MEDIUM|LOW|UNRELIABLE)
-    code: str
-    message: str
-
-
 class UploadAttemptDoc(Document):
     """One historical record of a `/admin/ingest` invocation.
 
     Persisted whether the run succeeded, partially succeeded, or threw. Drives
     the admin dashboard cards, the parsing-error log, and the accuracy donut.
+    Per-error rows live in the ``ParsingErrorDoc`` collection keyed by
+    ``upload_id`` — they are the single source of truth for triage counts.
     """
 
     started_at: datetime = Field(default_factory=_utcnow)
@@ -243,8 +234,6 @@ class UploadAttemptDoc(Document):
     multi_sheet_batches: list[dict] = Field(default_factory=list)
     total_blocks: int = 0
     confidence_summary: dict[str, int] = Field(default_factory=dict)
-    error_count: int = 0
-    errors: list[UploadErrorRow] = Field(default_factory=list)
     doctor: Optional[dict] = None
     failure_message: Optional[str] = None
 
@@ -304,6 +293,100 @@ class ExamDateDoc(Document):
         ]
 
 
+class IngestSnapshotDoc(Document):
+    """Pre-ingest backup of the live data so admins can roll back the most
+    recent ``/admin/ingest`` run.
+
+    We only ever keep **one** snapshot at a time — the next ingest replaces it.
+    A TTL index on ``expires_at`` makes Mongo auto-delete the snapshot after
+    ``INGEST_SNAPSHOT_TTL_HOURS`` (default 24h), so a stale snapshot can't be
+    used to undo a run from days ago.
+    """
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    expires_at: datetime
+    semester_label: Optional[str] = None
+    batch_count: int = 0
+    timetable_count: int = 0
+    # Full row dumps (as plain dicts) keyed under each list. We do NOT use
+    # Document references because the goal is to be self-contained — restoring
+    # works even if the underlying collections were emptied.
+    batches: list[dict] = Field(default_factory=list)
+    timetables: list[dict] = Field(default_factory=list)
+    current: Optional[dict] = None  # semester doc snapshot
+
+    class Settings:
+        name = "ingest_snapshots"
+        # TTL index: Mongo deletes the doc when expires_at < now.
+        indexes = [
+            IndexModel([("expires_at", ASCENDING)], expireAfterSeconds=0),
+            [("created_at", -1)],
+        ]
+
+
+class ParsingErrorDoc(Document):
+    """One persisted parser warning / doctor mismatch.
+
+    Populated by ``/admin/ingest``; surfaced on the admin Fix tab where each
+    row can be opened, navigated to in the timetable editor, and marked as
+    ``resolved`` or ``ignored`` (with an optional admin note).
+    """
+
+    upload_id: Optional[str] = None  # str(UploadAttemptDoc.id)
+    batch_code: Optional[str] = None
+    error_type: Annotated[str, Indexed()]
+    severity: Literal["info", "warn", "error"] = "warn"
+    day: Optional[str] = None
+    start_time: Optional[str] = None
+    period: Optional[int] = None
+    code: Optional[str] = None  # subject code involved (if any)
+    message: str
+    context: dict = Field(default_factory=dict)  # raw extra (sheet, source row, etc.)
+
+    status: Annotated[Literal["open", "resolved", "ignored"], Indexed()] = "open"
+    resolved_by: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    note: Optional[str] = None
+
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "parsing_errors"
+        indexes = [
+            [("upload_id", 1), ("status", 1)],
+            [("batch_code", 1), ("status", 1)],
+            [("created_at", -1)],
+        ]
+
+
+class SubjectDoc(Document):
+    """Subject-code → human-readable name mapping.
+
+    Replaces the on-disk ``assets/subjects.json`` at runtime. The JSON file
+    is still used as a *seed* on first boot (when the collection is empty);
+    after that, every read goes through this collection so admins can add
+    missing codes live from the Fix tab to clear ``SUBJECT_NOT_IN_CATALOG``
+    parser errors without a re-ingest.
+
+    ``code`` is the normalized form: upper-cased with the trailing L/T/P
+    suffix stripped (matches ``base_subject_code()``), so a single row
+    covers ``UPH013L``, ``UPH013T`` and ``UPH013P``.
+    """
+
+    code: Annotated[str, Indexed(unique=True)]
+    name: str
+    aliases: list[str] = Field(default_factory=list)
+    source: Literal["seed", "admin", "import"] = "seed"
+    created_by: Optional[str] = None
+    note: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "subjects"
+
+
 ALL_DOCUMENTS = [
     SemesterDoc,
     BatchDoc,
@@ -317,4 +400,7 @@ ALL_DOCUMENTS = [
     UploadAttemptDoc,
     AnnouncementDoc,
     ExamDateDoc,
+    IngestSnapshotDoc,
+    ParsingErrorDoc,
+    SubjectDoc,
 ]

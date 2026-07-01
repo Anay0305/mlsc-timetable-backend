@@ -1,11 +1,12 @@
 """Cross-batch sanity check.
 
-Every batch within a ``{YEAR}{ALPHA}`` group (e.g. all ``3C**``) should have the
-same per-type class breakdown. The doctor reports:
+Every batch within a ``{YEAR}{ALPHA}`` group (e.g. all ``3C**``) is compared
+against an **admin-curated baseline** for that group. Groups without a baseline
+are surfaced as ``no_baseline`` advisories; nothing is inferred from the data
+itself. The report contains:
 
-* the expected breakdown (from an admin-curated **baseline** when present,
-  otherwise from the per-type mode across the group's batches), and
-* any batches whose actual counts deviate from the expected.
+* the expected per-type breakdown (from the baseline), and
+* any batches whose actual counts deviate from that expected breakdown.
 
 The same report is produced from two contexts:
 
@@ -17,7 +18,7 @@ The same report is produced from two contexts:
 from __future__ import annotations
 
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
@@ -43,14 +44,15 @@ def build_doctor_report(
     baselines_by_group: Mapping[str, Mapping[str, int]] | None = None,
     semester_prefix: str | None = None,
 ) -> dict[str, Any]:
-    """Group `counts_by_batch` by ``code[:2]`` and report per-type consistency.
+    """Group `counts_by_batch` by ``code[:2]`` and compare each batch to its
+    admin baseline.
 
     `counts_by_batch` maps each batch code to a ``{type: count}`` dict
     (plus a derived ``"total"`` entry, see :func:`count_classes`).
 
     `baselines_by_group` maps the bare ``{YEAR}{ALPHA}`` group (e.g. ``"1A"``)
-    to its expected per-type counts. When supplied, the doctor compares against
-    these instead of the per-type mode.
+    to its expected per-type counts. Groups without a baseline are reported
+    under ``no_baseline`` and not compared.
     """
     baselines_by_group = dict(baselines_by_group or {})
 
@@ -63,18 +65,28 @@ def build_doctor_report(
 
     ok: list[dict[str, Any]] = []
     mismatches: list[dict[str, Any]] = []
+    no_baseline: list[dict[str, Any]] = []
 
     for group in sorted(groups):
         codes = sorted(groups[group])
         batch_counts = {c: dict(counts_by_batch[c]) for c in codes}
+        baseline_key = (
+            f"{semester_prefix.upper()}{group}"
+            if semester_prefix and group != "??"
+            else None
+        )
 
         baseline = baselines_by_group.get(group)
-        if baseline:
-            expected = _expand_baseline(baseline)
-            expected_source = "baseline"
-        else:
-            expected = _mode_counts(batch_counts.values())
-            expected_source = "mode"
+        if not baseline:
+            no_baseline.append({
+                "group": group,
+                "baseline_key": baseline_key,
+                "batches": len(codes),
+                "batch_codes": codes,
+            })
+            continue
+
+        expected = _expand_baseline(baseline)
 
         outliers: list[dict[str, Any]] = []
         for code in codes:
@@ -88,13 +100,9 @@ def build_doctor_report(
 
         entry: dict[str, Any] = {
             "group": group,
-            "baseline_key": (
-                f"{semester_prefix.upper()}{group}"
-                if semester_prefix and group != "??"
-                else None
-            ),
+            "baseline_key": baseline_key,
             "expected": expected,
-            "expected_source": expected_source,
+            "expected_source": "baseline",
             "batches": len(codes),
             "matching": len(codes) - len(outliers),
         }
@@ -109,8 +117,10 @@ def build_doctor_report(
         "total_groups": len(groups),
         "consistent_groups": len(ok),
         "mismatched_groups": len(mismatches),
+        "groups_without_baseline": len(no_baseline),
         "ok": ok,
         "mismatches": mismatches,
+        "no_baseline": no_baseline,
     }
 
 
@@ -148,6 +158,14 @@ def format_doctor_report(report: Mapping[str, Any]) -> str:
         for row in ok:
             lines.append(f"  {_group_header(row)}")
 
+    no_baseline = list(report.get("no_baseline") or [])
+    if no_baseline:
+        lines.append("")
+        lines.append(f"NO BASELINE ({len(no_baseline)} groups, skipped):")
+        for row in no_baseline:
+            key = row.get("baseline_key") or row.get("group")
+            lines.append(f"  {row['group']}: {row['batches']} batches (define baseline {key})")
+
     mismatches = list(report.get("mismatches") or [])
     if mismatches:
         lines.append("")
@@ -163,7 +181,7 @@ def format_doctor_report(report: Mapping[str, Any]) -> str:
                 lines.append(
                     f"      {out['batch']}: total={out['counts'].get(TOTAL_KEY, 0)}  [{pieces}]"
                 )
-    else:
+    elif not no_baseline:
         lines.append("")
         lines.append("all groups consistent")
     return "\n".join(lines)
@@ -186,19 +204,6 @@ def _expand_baseline(baseline: Mapping[str, int]) -> dict[str, int]:
     return expected
 
 
-def _mode_counts(batches: Iterable[Mapping[str, int]]) -> dict[str, int]:
-    """Per-type mode across every batch in the group."""
-    batch_list = list(batches)
-    types: set[str] = set()
-    for counts in batch_list:
-        types.update(counts.keys())
-    result: dict[str, int] = {}
-    for t in sorted(types):
-        tally = Counter(int(c.get(t, 0)) for c in batch_list)
-        result[t] = tally.most_common(1)[0][0]
-    return result
-
-
 def _diff_counts(actual: Mapping[str, int], expected: Mapping[str, int]) -> dict[str, int]:
     types = set(actual) | set(expected)
     out: dict[str, int] = {}
@@ -215,12 +220,8 @@ def _group_header(row: Mapping[str, Any]) -> str:
     parts = [f"{v} {k}" for k, v in sorted(expected.items()) if k != TOTAL_KEY]
     breakdown = " / ".join(parts) if parts else "(empty)"
     total = expected.get(TOTAL_KEY, sum(v for k, v in expected.items() if k != TOTAL_KEY))
-    source = row.get("expected_source") or "?"
-    baseline_key = row.get("baseline_key")
-    tag = (
-        f"baseline {baseline_key}" if (source == "baseline" and baseline_key) else source
-    )
-    return f"{row['group']}: {breakdown} = {total} ({tag})  · {row['batches']} batches"
+    baseline_key = row.get("baseline_key") or "?"
+    return f"{row['group']}: {breakdown} = {total} (baseline {baseline_key})  · {row['batches']} batches"
 
 
 def _sign(value: int) -> str:

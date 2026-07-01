@@ -36,6 +36,22 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
     await init_db()
+    # First-boot seed: lift assets/subjects.json into the `subjects`
+    # collection if it's empty. Idempotent — does nothing if any rows exist.
+    try:
+        from timetable_parser.core.subject_catalog import (
+            ensure_catalog,
+            seed_subjects_from_file_if_empty,
+        )
+
+        seeded = await seed_subjects_from_file_if_empty()
+        if seeded:
+            logging.getLogger("server.app").info(
+                "Seeded %d subject(s) from assets/subjects.json", seeded
+            )
+        await ensure_catalog()
+    except Exception:
+        logging.getLogger("server.app").exception("Subject catalog bootstrap failed")
     try:
         yield
     finally:

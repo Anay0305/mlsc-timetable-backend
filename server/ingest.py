@@ -25,7 +25,7 @@ from openpyxl.worksheet.worksheet import Worksheet
 
 from server import storage
 from server.config import Settings, get_settings
-from server.doctor import build_doctor_report, count_classes
+from server.doctor import build_doctor_report, codes_in, count_classes
 from timetable_parser.core.models import ClassBlock
 from timetable_parser.core.subject_catalog import load_default_subject_catalog
 from timetable_parser.extractors.class_blocks import ClassBlockExtractor
@@ -197,10 +197,13 @@ async def parse_workbook(
 
         prefix = storage.semester_prefix(semester_label)
         baselines = await storage.read_baselines_for_prefix(prefix, settings=settings)
+        baseline_courses = await storage.read_baseline_courses_for_prefix(prefix, settings=settings)
         doctor = build_doctor_report(
             {code: count_classes(payload["classes"]) for code, payload in payloads.items()},
             baselines_by_group=baselines,
             semester_prefix=prefix,
+            codes_by_batch={code: codes_in(payload["classes"]) for code, payload in payloads.items()},
+            courses_by_group=baseline_courses,
         )
 
         total_blocks = sum(confidence_summary.values())

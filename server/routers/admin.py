@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from server import storage
 from server.auth import AdminPrincipal, require_admin
 from server.ingest import parse_workbook
+from server.scheme_parser import baseline_key_for, parse_scheme_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -244,7 +245,12 @@ async def get_upload(attempt_id: str) -> dict[str, object]:
 async def post_baseline(key: str, payload: dict) -> dict[str, object]:
     """Create or replace the baseline for `key` (e.g. ``E1A``).
 
-    Body: ``{"counts": {"Lecture": 12, "Tutorial": 4, "Practical": 3}}``
+    Body: ``{"counts": {"Lecture": 12, "Tutorial": 4, "Practical": 3},
+             "courses": [ {code, title, category, L, T, P, Cr}, ... ]}``
+
+    ``courses`` is optional. When supplied it fully replaces the existing
+    roster for the baseline (use ``POST /admin/scheme/apply`` for the
+    merge-per-semester flow driven by a course-scheme PDF).
     """
     counts = payload.get("counts") if isinstance(payload, dict) else None
     if not isinstance(counts, dict):
@@ -252,8 +258,15 @@ async def post_baseline(key: str, payload: dict) -> dict[str, object]:
             "error": "Body must include a 'counts' object mapping type → int",
             "code": "invalid_payload",
         })
+    courses = payload.get("courses") if isinstance(payload, dict) else None
+    scheme_source = payload.get("scheme_source") if isinstance(payload, dict) else None
     try:
-        doc = await storage.write_baseline(key, counts)
+        doc = await storage.write_baseline(
+            key,
+            counts,
+            courses=courses,
+            scheme_source=scheme_source if isinstance(scheme_source, str) else None,
+        )
     except ValueError as exc:
         raise HTTPException(
             status_code=400,
@@ -277,6 +290,169 @@ async def delete_baseline(key: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "key": key.upper()}
+
+
+# ── Course-scheme PDF upload (populates baseline `courses`) ─────────────
+_SCHEME_MAX_BYTES = 15 * 1024 * 1024  # 15 MB safety cap
+
+
+async def _load_scheme_upload(file: UploadFile) -> Path:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail={
+            "error": "Upload must be a .pdf file",
+            "code": "invalid_file",
+        })
+    blob = await file.read()
+    if len(blob) > _SCHEME_MAX_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": f"PDF exceeds {_SCHEME_MAX_BYTES // (1024 * 1024)} MB limit",
+            "code": "file_too_large",
+        })
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(blob)
+        return Path(tmp.name)
+
+
+def _validate_branch(branch: str) -> str:
+    cleaned = (branch or "").strip().upper()
+    if len(cleaned) != 1 or not cleaned.isalpha():
+        raise HTTPException(status_code=400, detail={
+            "error": "'branch' must be a single letter A–Z",
+            "code": "invalid_branch",
+        })
+    return cleaned
+
+
+async def _build_scheme_plan(
+    result: dict,
+    branch: str,
+    pool_swap_year1: bool,
+) -> list[dict]:
+    """Turn the parser output into a per-semester apply plan, cross-referenced
+    against existing baselines so the UI can show would-overwrite counts.
+    """
+    plan: list[dict] = []
+    existing_by_key: dict[str, dict] = {}
+    for row in await storage.list_baselines():
+        existing_by_key[row["key"]] = row
+
+    for sem in result.get("semesters") or []:
+        sem_num = int(sem["number"])
+        try:
+            key = baseline_key_for(sem_num, branch, pool_swap_year1=pool_swap_year1)
+        except ValueError:
+            continue
+        # Pool A/B branches expose two curricula per calendar semester (each
+        # student sees one of them). For the multi-option "OR" semesters (Sem 8),
+        # we flatten every option's courses into the same baseline so the check
+        # accepts any code from any option.
+        flat_courses: list[dict] = []
+        for opt in sem.get("options") or []:
+            flat_courses.extend(opt.get("courses") or [])
+        existing = existing_by_key.get(key)
+        plan.append({
+            "semester": sem_num,
+            "keyline": sem["keyline"],
+            "baseline_key": key,
+            "year": sem["year"],
+            "courses": flat_courses,
+            "course_count": len(flat_courses),
+            "option_count": len(sem.get("options") or []),
+            "totals": [opt.get("totals") for opt in sem.get("options") or []],
+            "existing_course_count": existing["course_count"] if existing else 0,
+            "existing_counts": (existing or {}).get("counts") or {},
+            "would_create": existing is None,
+        })
+    return plan
+
+
+@router.post("/scheme/preview")
+async def post_scheme_preview(
+    branch: str = Form(...),
+    pool_swap_year1: bool = Form(False),
+    file: UploadFile = File(...),
+) -> dict[str, object]:
+    """Parse a course-scheme PDF and preview the baselines that would be
+    written. Does not mutate any data.
+    """
+    branch = _validate_branch(branch)
+    tmp_path = await _load_scheme_upload(file)
+    try:
+        result = parse_scheme_pdf(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    plan = await _build_scheme_plan(result, branch, pool_swap_year1)
+    return {
+        "ok": True,
+        "source": file.filename,
+        "branch": branch,
+        "pool_swap_year1": bool(pool_swap_year1),
+        "semester_count": result.get("semester_count", 0),
+        "plan": plan,
+        "keyline_convention": result.get("keyline_convention", {}),
+    }
+
+
+@router.post("/scheme/apply")
+async def post_scheme_apply(
+    branch: str = Form(...),
+    pool_swap_year1: bool = Form(False),
+    merge: bool = Form(False),
+    file: UploadFile = File(...),
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Apply the parsed scheme to the baseline collection.
+
+    For each detected semester, upserts a baseline keyed
+    ``<E|O><year><branch>`` and writes its ``courses`` roster. Existing
+    per-type ``counts`` on those baselines are preserved.
+
+    ``merge=false`` (default) fully replaces the courses list per baseline;
+    ``merge=true`` unions by course code with what's already stored (useful
+    when a scheme is split across multiple PDFs).
+    """
+    branch = _validate_branch(branch)
+    tmp_path = await _load_scheme_upload(file)
+    try:
+        result = parse_scheme_pdf(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+
+    plan = await _build_scheme_plan(result, branch, pool_swap_year1)
+    written: list[dict] = []
+    errors: list[dict] = []
+    for entry in plan:
+        key = entry["baseline_key"]
+        try:
+            doc = await storage.upsert_baseline_courses(
+                key,
+                entry["courses"],
+                scheme_source=file.filename,
+                merge=bool(merge),
+            )
+            written.append({
+                "baseline_key": key,
+                "semester": entry["semester"],
+                "course_count": doc.get("course_count", 0),
+                "created": entry["would_create"],
+            })
+        except ValueError as exc:
+            errors.append({"baseline_key": key, "error": str(exc)})
+
+    logger.info(
+        "Scheme apply by %s: branch=%s pool_swap=%s wrote=%d errors=%d",
+        principal.label, branch, pool_swap_year1, len(written), len(errors),
+    )
+    return {
+        "ok": True,
+        "source": file.filename,
+        "branch": branch,
+        "pool_swap_year1": bool(pool_swap_year1),
+        "merge": bool(merge),
+        "written": written,
+        "errors": errors,
+    }
 
 
 @router.post("/contributors")

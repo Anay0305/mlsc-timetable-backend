@@ -38,11 +38,27 @@ def count_classes(classes: Iterable[Any]) -> dict[str, int]:
     return counts
 
 
+def codes_in(classes: Iterable[Any]) -> set[str]:
+    """Return the set of subject codes present in a batch's class entries."""
+    out: set[str] = set()
+    for c in classes:
+        code = _entry_code(c)
+        if code:
+            out.add(code.strip().upper())
+        for opt in _entry_options(c):
+            opt_code = _entry_code(opt)
+            if opt_code:
+                out.add(opt_code.strip().upper())
+    return out
+
+
 def build_doctor_report(
     counts_by_batch: Mapping[str, Mapping[str, int]],
     *,
     baselines_by_group: Mapping[str, Mapping[str, int]] | None = None,
     semester_prefix: str | None = None,
+    codes_by_batch: Mapping[str, Iterable[str]] | None = None,
+    courses_by_group: Mapping[str, Iterable[str]] | None = None,
 ) -> dict[str, Any]:
     """Group `counts_by_batch` by ``code[:2]`` and compare each batch to its
     admin baseline.
@@ -53,8 +69,22 @@ def build_doctor_report(
     `baselines_by_group` maps the bare ``{YEAR}{ALPHA}`` group (e.g. ``"1A"``)
     to its expected per-type counts. Groups without a baseline are reported
     under ``no_baseline`` and not compared.
+
+    When ``codes_by_batch`` and ``courses_by_group`` are supplied each group
+    entry (both ``ok`` and ``mismatches``) additionally carries a
+    ``course_check`` field listing per-batch missing/extra course codes. A
+    group with only course-code drift is promoted from ``ok`` to
+    ``mismatches``.
     """
     baselines_by_group = dict(baselines_by_group or {})
+    codes_by_batch_norm: dict[str, set[str]] = {
+        b: {c.strip().upper() for c in codes if c}
+        for b, codes in (codes_by_batch or {}).items()
+    }
+    courses_by_group_norm: dict[str, list[str]] = {
+        g: [c.strip().upper() for c in codes if c]
+        for g, codes in (courses_by_group or {}).items()
+    }
 
     groups: dict[str, list[str]] = defaultdict(list)
     for code in counts_by_batch:
@@ -106,8 +136,22 @@ def build_doctor_report(
             "batches": len(codes),
             "matching": len(codes) - len(outliers),
         }
-        if outliers:
+
+        course_check = _build_course_check(
+            group,
+            codes,
+            codes_by_batch_norm,
+            courses_by_group_norm,
+        )
+        if course_check is not None:
+            entry["course_check"] = course_check
+
+        has_count_drift = bool(outliers)
+        has_course_drift = bool(course_check and course_check.get("has_drift"))
+
+        if has_count_drift:
             entry["outliers"] = outliers
+        if has_count_drift or has_course_drift:
             mismatches.append(entry)
         else:
             ok.append(entry)
@@ -196,6 +240,57 @@ def _entry_type(entry: Any) -> str:
     if not isinstance(value, str) or not value.strip():
         return "Unknown"
     return value.strip()
+
+
+def _entry_code(entry: Any) -> str | None:
+    if isinstance(entry, Mapping):
+        value = entry.get("code") or entry.get("subject_code")
+    else:
+        value = getattr(entry, "code", None) or getattr(entry, "subject_code", None)
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _entry_options(entry: Any) -> Iterable[Any]:
+    if isinstance(entry, Mapping):
+        opts = entry.get("options") or []
+    else:
+        opts = getattr(entry, "options", None) or []
+    return opts if isinstance(opts, Iterable) else []
+
+
+def _build_course_check(
+    group: str,
+    batches: list[str],
+    codes_by_batch: Mapping[str, set[str]],
+    courses_by_group: Mapping[str, list[str]],
+) -> dict[str, Any] | None:
+    """Compare each batch's observed subject codes against the group's expected
+    course roster. Returns None when no roster exists for the group.
+    """
+    expected = courses_by_group.get(group)
+    if not expected:
+        return None
+    expected_set = set(expected)
+    per_batch: dict[str, dict[str, list[str]]] = {}
+    matching = 0
+    for batch in batches:
+        observed = codes_by_batch.get(batch, set())
+        missing = sorted(expected_set - observed)
+        # "extra" = present in timetable but not in the expected roster. We
+        # intentionally do NOT flag electives here because their codes vary
+        # per student; the admin can still spot them in the extra list.
+        extra = sorted(observed - expected_set)
+        per_batch[batch] = {"missing": missing, "extra": extra}
+        if not missing:
+            matching += 1
+    return {
+        "expected_codes": sorted(expected_set),
+        "expected_count": len(expected_set),
+        "per_batch": per_batch,
+        "matching": matching,
+        "batches": len(batches),
+        "has_drift": any(v["missing"] for v in per_batch.values()),
+    }
 
 
 def _expand_baseline(baseline: Mapping[str, int]) -> dict[str, int]:

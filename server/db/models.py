@@ -124,6 +124,27 @@ class OverrideDoc(Document):
         ]
 
 
+class BaselineCourseCheck(BaseModel):
+    """One expected course entry under a baseline.
+
+    Sourced from the SUGC/SPGC course-scheme PDF via the ``POST /admin/scheme``
+    flow. ``code`` may be ``None`` for placeholder rows (e.g. ``ELECTIVE-II``)
+    where the specific code is chosen per student. L/T/P/Cr are kept as strings
+    so alternate-week markers like ``"1*"`` and combined counts like ``"14+1*"``
+    survive the round-trip from the PDF.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    code: Optional[str] = None
+    title: Optional[str] = None
+    category: Optional[str] = None
+    L: Optional[str] = None
+    T: Optional[str] = None
+    P: Optional[str] = None
+    Cr: Optional[str] = None
+
+
 class BaselineDoc(Document):
     """Expected per-type class count for a `{semester_prefix}{YEAR}{ALPHA}` group.
 
@@ -132,12 +153,19 @@ class BaselineDoc(Document):
     (``"Lecture"``, ``"Tutorial"``, ``"Practical"``, etc.) to the expected
     occurrences per batch in that group. The doctor compares observed
     counts against this and flags any deviating batch.
+
+    ``courses`` optionally holds the roster of courses expected for that
+    baseline, sourced from a SUGC/SPGC course-scheme PDF. When present the
+    doctor also verifies that each expected course code appears at least once
+    in every batch's ingested timetable.
     """
 
     key: Annotated[str, Indexed(unique=True)]
     semester_prefix: str  # "E" or "O"
     group: str            # "1A", "3C", ...
     counts: dict[str, int] = Field(default_factory=dict)
+    courses: list[BaselineCourseCheck] = Field(default_factory=list)
+    scheme_source: Optional[str] = None  # filename of the PDF that supplied the courses
     updated_at: datetime = Field(default_factory=_utcnow)
 
     class Settings:

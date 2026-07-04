@@ -25,6 +25,7 @@ from server.config import Settings, get_settings
 from server.db.models import (
     AdminEmailDoc,
     AnnouncementDoc,
+    BaselineCourseCheck,
     BaselineDoc,
     BatchDoc,
     ChangeRequestDoc,
@@ -248,12 +249,19 @@ def _safe_baseline_key(key: str) -> str:
 def _baseline_payload(doc: BaselineDoc) -> dict[str, Any]:
     counts = dict(doc.counts)
     total = sum(int(v) for v in counts.values() if isinstance(v, int))
+    courses = [
+        (c.model_dump() if isinstance(c, BaselineCourseCheck) else dict(c))
+        for c in (doc.courses or [])
+    ]
     return {
         "key": doc.key,
         "semester_prefix": doc.semester_prefix,
         "group": doc.group,
         "counts": counts,
         "total": total,
+        "courses": courses,
+        "course_count": len(courses),
+        "scheme_source": doc.scheme_source,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
     }
 
@@ -270,10 +278,50 @@ async def read_baseline(key: str, settings: Settings | None = None) -> dict[str,
     return _baseline_payload(doc)
 
 
+def _clean_courses(courses: Any) -> list[BaselineCourseCheck]:
+    """Coerce a client-provided list of course dicts into `BaselineCourseCheck`s.
+
+    Silently trims empty rows, but raises ValueError on anything malformed
+    (non-list input, non-string fields).
+    """
+    if courses is None:
+        return []
+    if not isinstance(courses, list):
+        raise ValueError("courses must be a list of objects")
+    cleaned: list[BaselineCourseCheck] = []
+    seen_codes: set[str] = set()
+    for i, raw in enumerate(courses):
+        if isinstance(raw, BaselineCourseCheck):
+            course = raw
+        elif isinstance(raw, dict):
+            allowed = {"code", "title", "category", "L", "T", "P", "Cr"}
+            picked = {k: raw.get(k) for k in allowed if raw.get(k) not in (None, "")}
+            if not picked:
+                continue  # skip completely blank rows
+            for field_name, value in list(picked.items()):
+                if not isinstance(value, str):
+                    picked[field_name] = str(value)
+            course = BaselineCourseCheck(**picked)
+        else:
+            raise ValueError(f"courses[{i}] must be an object, got {type(raw).__name__}")
+        # de-dupe by code (case-insensitive); keep first occurrence
+        code_key = (course.code or "").strip().upper()
+        if code_key and code_key in seen_codes:
+            continue
+        if code_key:
+            seen_codes.add(code_key)
+        cleaned.append(course)
+    return cleaned
+
+
 async def write_baseline(
     key: str,
     counts: dict[str, int],
     settings: Settings | None = None,
+    *,
+    courses: Any = None,
+    scheme_source: str | None = None,
+    merge_courses: bool = False,
 ) -> dict[str, Any]:
     cleaned_key = _safe_baseline_key(key)
     if not isinstance(counts, dict) or not counts:
@@ -290,6 +338,8 @@ async def write_baseline(
     if "total" in cleaned_counts:
         raise ValueError("'total' is reserved; it is derived from the sum of the other counts")
 
+    parsed_courses = _clean_courses(courses) if courses is not None else None
+
     prefix = cleaned_key[0]
     group = cleaned_key[1:]
     now = datetime.now(timezone.utc)
@@ -300,10 +350,28 @@ async def write_baseline(
             semester_prefix=prefix,
             group=group,
             counts=cleaned_counts,
+            courses=parsed_courses or [],
+            scheme_source=scheme_source,
         )
         await doc.insert()
     else:
-        await doc.set({"counts": cleaned_counts, "updated_at": now})
+        update: dict[str, Any] = {"counts": cleaned_counts, "updated_at": now}
+        if parsed_courses is not None:
+            if merge_courses and doc.courses:
+                by_code: dict[str, BaselineCourseCheck] = {}
+                for existing in doc.courses:
+                    key_ = (existing.code or existing.title or "").strip().upper()
+                    if key_:
+                        by_code[key_] = existing
+                for incoming in parsed_courses:
+                    key_ = (incoming.code or incoming.title or "").strip().upper()
+                    by_code[key_ or str(len(by_code))] = incoming
+                update["courses"] = list(by_code.values())
+            else:
+                update["courses"] = parsed_courses
+        if scheme_source is not None:
+            update["scheme_source"] = scheme_source
+        await doc.set(update)
         doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
     return _baseline_payload(doc)
 
@@ -317,6 +385,56 @@ async def delete_baseline(key: str, settings: Settings | None = None) -> bool:
     return True
 
 
+async def upsert_baseline_courses(
+    key: str,
+    courses: Any,
+    *,
+    scheme_source: str | None = None,
+    merge: bool = False,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Set only the ``courses`` roster for a baseline, preserving existing
+    counts (or seeding empty counts on create). Used by the scheme-PDF apply
+    flow so an admin can attach course rosters before configuring per-type
+    counts.
+    """
+    cleaned_key = _safe_baseline_key(key)
+    prefix = cleaned_key[0]
+    group = cleaned_key[1:]
+    parsed_courses = _clean_courses(courses)
+    now = datetime.now(timezone.utc)
+    doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
+    if doc is None:
+        doc = BaselineDoc(
+            key=cleaned_key,
+            semester_prefix=prefix,
+            group=group,
+            counts={},
+            courses=parsed_courses,
+            scheme_source=scheme_source,
+        )
+        await doc.insert()
+    else:
+        update: dict[str, Any] = {"updated_at": now}
+        if merge and doc.courses:
+            by_code: dict[str, BaselineCourseCheck] = {}
+            for existing in doc.courses:
+                key_ = (existing.code or existing.title or "").strip().upper()
+                if key_:
+                    by_code[key_] = existing
+            for incoming in parsed_courses:
+                key_ = (incoming.code or incoming.title or "").strip().upper()
+                by_code[key_ or str(len(by_code))] = incoming
+            update["courses"] = list(by_code.values())
+        else:
+            update["courses"] = parsed_courses
+        if scheme_source is not None:
+            update["scheme_source"] = scheme_source
+        await doc.set(update)
+        doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
+    return _baseline_payload(doc)
+
+
 async def read_baselines_for_prefix(
     prefix: str,
     settings: Settings | None = None,
@@ -328,6 +446,34 @@ async def read_baselines_for_prefix(
     out: dict[str, dict[str, int]] = {}
     async for doc in BaselineDoc.find(BaselineDoc.semester_prefix == prefix):
         out[doc.group] = dict(doc.counts)
+    return out
+
+
+async def read_baseline_courses_for_prefix(
+    prefix: str,
+    settings: Settings | None = None,
+) -> dict[str, list[str]]:
+    """Return ``{group: [expected_course_code, …]}`` for a semester prefix.
+
+    Codes are uppercased and de-duplicated; placeholder rows without a code
+    (e.g. ``ELECTIVE-II``) are skipped so the doctor doesn't complain about
+    them missing from the timetable.
+    """
+    prefix = (prefix or "").strip().upper()[:1]
+    if not prefix:
+        return {}
+    out: dict[str, list[str]] = {}
+    async for doc in BaselineDoc.find(BaselineDoc.semester_prefix == prefix):
+        codes: list[str] = []
+        seen: set[str] = set()
+        for c in (doc.courses or []):
+            code = (c.code or "").strip().upper()
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            codes.append(code)
+        if codes:
+            out[doc.group] = codes
     return out
 
 
@@ -1423,11 +1569,28 @@ async def save_parsing_errors(
 ) -> int:
     """Persist parser warnings + doctor mismatches as ``ParsingErrorDoc`` rows.
 
-    Existing rows for the same ``upload_id`` are wiped first so re-running an
-    ingest doesn't produce duplicates. Returns the number of rows written.
+    Called from two contexts:
+
+    * **After an ingest** (``upload_id`` is the new UploadAttemptDoc id) —
+      every prior *open* row is cleared first, because the canonical
+      timetables those errors describe have just been replaced. Rows that
+      an admin already marked ``resolved`` / ``ignored`` are preserved as
+      audit history.
+    * **From ``backfill_baseline_errors``** (``upload_id`` is ``None``) —
+      only the orphan (``upload_id=None``) rows are refreshed; per-ingest
+      history is left untouched.
     """
     if upload_id:
-        await ParsingErrorDoc.find(ParsingErrorDoc.upload_id == upload_id).delete()
+        # Fresh ingest: nuke open rows from every prior upload so the Fix
+        # tab reflects the current timetable, not stale ones.
+        await ParsingErrorDoc.find(
+            ParsingErrorDoc.status == "open",
+        ).delete()
+    else:
+        # Backfill path: only touch the orphan rows we own.
+        await ParsingErrorDoc.find(
+            {"upload_id": None, "status": "open"},
+        ).delete()
     now = datetime.now(timezone.utc)
     written = 0
 
@@ -1536,7 +1699,7 @@ async def backfill_baseline_errors(settings: Settings | None = None) -> dict[str
     baselines and wanting the Fix page to reflect them immediately).
     """
     # Local import to avoid a top-level cycle with server.doctor.
-    from server.doctor import build_doctor_report, count_classes
+    from server.doctor import build_doctor_report, codes_in, count_classes
 
     try:
         current = await read_current(settings=settings)
@@ -1547,6 +1710,7 @@ async def backfill_baseline_errors(settings: Settings | None = None) -> dict[str
     prefix = semester_prefix(label)
 
     counts_by_batch: dict[str, dict[str, int]] = {}
+    codes_by_batch: dict[str, set[str]] = {}
     async for doc in TimetableDoc.find_all():
         raw_classes = getattr(doc, "classes", None) or []
         classes: list[dict[str, Any]] = []
@@ -1556,15 +1720,19 @@ async def backfill_baseline_errors(settings: Settings | None = None) -> dict[str
             elif isinstance(c, dict):
                 classes.append(c)
         counts_by_batch[doc.code] = count_classes(classes)
+        codes_by_batch[doc.code] = codes_in(classes)
 
     if not counts_by_batch:
         return {"status": "skipped", "reason": "no timetables", "batches": 0, "written": 0, "deleted": 0}
 
     baselines = await read_baselines_for_prefix(prefix, settings=settings)
+    baseline_courses = await read_baseline_courses_for_prefix(prefix, settings=settings)
     report = build_doctor_report(
         counts_by_batch,
         baselines_by_group=baselines,
         semester_prefix=prefix,
+        codes_by_batch=codes_by_batch,
+        courses_by_group=baseline_courses,
     )
 
     # Wipe existing orphan baseline rows so re-runs don't stack up. We only

@@ -14,3 +14,15 @@ test-frontend/
 .github/
 .nojekyll
 index.html
+
+# Opt-in JSON mirror of the Mongo store (enabled via JSON_MIRROR=1). Local
+# only — MongoDB is the canonical source of truth.
+data/
+.env
+.env.local
+
+# Office app lock files (LibreOffice / Excel) created when a workbook is open.
+.~lock.*#
+
+# CLI parser output
+scheme.json

@@ -1,14 +1,26 @@
 [project]
-name = "mlsc-timetable-backend"
+name = "timetable-parser"
 version = "0.1.0"
-description = "REST API for MLSC timetable data."
+description = "Utilities for parsing spreadsheet-based college timetables."
 requires-python = ">=3.11"
 dependencies = [
-    "fastapi>=0.115,<1.0",
     "openpyxl>=3.1",
-    "python-multipart>=0.0.20,<1.0",
-    "uvicorn[standard]>=0.34,<1.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "python-multipart>=0.0.9",
+    "beanie>=1.27",
+    "motor>=3.5",
+    "httpx>=0.27",
+    "slowapi>=0.1.9",
+    "pyjwt[crypto]>=2.8",
 ]
 
-[tool.setuptools.packages.find]
-include = ["timetable_api*"]
+[project.scripts]
+mlsc-timetable = "timetable_parser.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["timetable_parser", "server"]

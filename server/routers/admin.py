@@ -719,6 +719,14 @@ async def delete_announcement(announcement_id: str) -> dict[str, object]:
     return {"ok": True, "id": announcement_id}
 
 
+@router.post("/announcements/reset",
+             dependencies=[Depends(require_admin)])
+async def reset_announcements() -> dict[str, object]:
+    """Delete all announcements and re-seed from the bundled defaults."""
+    result = await storage.reset_announcements()
+    return {"ok": True, **result}
+
+
 # ── Exam dates ───────────────────────────────────────────────────────────
 @router.post("/exam-dates")
 async def post_exam_date(payload: dict) -> dict[str, object]:
@@ -751,6 +759,14 @@ async def delete_exam_date(exam_id: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "id": exam_id}
+
+
+@router.post("/exam-dates/reset",
+             dependencies=[Depends(require_admin)])
+async def reset_exam_dates() -> dict[str, object]:
+    """Delete all exam dates and re-seed from the bundled defaults."""
+    result = await storage.reset_exam_dates()
+    return {"ok": True, **result}
 
 
 # ── Calendar overrides ──────────────────────────────────────────────────
@@ -813,6 +829,14 @@ async def delete_calendar_override(override_id: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "id": override_id}
+
+
+@router.post("/calendar-overrides/reset",
+             dependencies=[Depends(require_admin)])
+async def reset_calendar_overrides() -> dict[str, object]:
+    """Delete all calendar overrides and re-seed from the bundled defaults."""
+    result = await storage.reset_calendar_overrides()
+    return {"ok": True, **result}
 
 
 # ── Calendar PDF parser ─────────────────────────────────────────────────

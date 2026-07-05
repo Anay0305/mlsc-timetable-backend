@@ -2412,6 +2412,15 @@ async def delete_announcement(announcement_id: str) -> bool:
     return True
 
 
+async def reset_announcements() -> dict[str, int]:
+    """Delete every AnnouncementDoc then re-seed from the bundled JSON."""
+    deleted = await AnnouncementDoc.find_all().delete()
+    deleted_count = getattr(deleted, "deleted_count", 0) or 0
+    await _seed_announcements_if_empty()
+    seeded = await AnnouncementDoc.find_all().count()
+    return {"deleted": deleted_count, "seeded": seeded}
+
+
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
@@ -2535,6 +2544,15 @@ async def delete_exam_date(exam_id: str) -> bool:
         return False
     await doc.delete()
     return True
+
+
+async def reset_exam_dates() -> dict[str, int]:
+    """Delete every ExamDateDoc then re-seed from the bundled JSON."""
+    deleted = await ExamDateDoc.find_all().delete()
+    deleted_count = getattr(deleted, "deleted_count", 0) or 0
+    await _seed_exam_dates_if_empty()
+    seeded = await ExamDateDoc.find_all().count()
+    return {"deleted": deleted_count, "seeded": seeded}
 
 
 # ── Calendar overrides ──────────────────────────────────────────────────
@@ -2745,6 +2763,15 @@ async def delete_calendar_override(override_id: str) -> bool:
         return False
     await doc.delete()
     return True
+
+
+async def reset_calendar_overrides() -> dict[str, int]:
+    """Delete every CalendarOverrideDoc then re-seed from the bundled JSON."""
+    deleted = await CalendarOverrideDoc.find_all().delete()
+    deleted_count = getattr(deleted, "deleted_count", 0) or 0
+    await _seed_calendar_overrides_if_empty()
+    seeded = await CalendarOverrideDoc.find_all().count()
+    return {"deleted": deleted_count, "seeded": seeded}
 
 
 async def delete_calendar_overrides_in_range(

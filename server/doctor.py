@@ -107,7 +107,7 @@ def build_doctor_report(
         )
 
         baseline = baselines_by_group.get(group)
-        if not baseline:
+        if baseline is None:
             no_baseline.append({
                 "group": group,
                 "baseline_key": baseline_key,
@@ -116,23 +116,28 @@ def build_doctor_report(
             })
             continue
 
-        expected = _expand_baseline(baseline)
+        # A baseline may exist with no per-type counts yet (e.g. only a course
+        # roster was uploaded via the scheme-PDF flow). In that case skip the
+        # count comparison entirely — no false MISMATCH, no false MISSING.
+        has_counts = bool(baseline)
+        expected = _expand_baseline(baseline) if has_counts else {}
 
         outliers: list[dict[str, Any]] = []
-        for code in codes:
-            deltas = _diff_counts(batch_counts[code], expected)
-            if deltas:
-                outliers.append({
-                    "batch": code,
-                    "counts": batch_counts[code],
-                    "deltas": deltas,
-                })
+        if has_counts:
+            for code in codes:
+                deltas = _diff_counts(batch_counts[code], expected)
+                if deltas:
+                    outliers.append({
+                        "batch": code,
+                        "counts": batch_counts[code],
+                        "deltas": deltas,
+                    })
 
         entry: dict[str, Any] = {
             "group": group,
             "baseline_key": baseline_key,
             "expected": expected,
-            "expected_source": "baseline",
+            "expected_source": "baseline" if has_counts else "none",
             "batches": len(codes),
             "matching": len(codes) - len(outliers),
         }

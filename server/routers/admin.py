@@ -242,6 +242,21 @@ async def get_upload(attempt_id: str) -> dict[str, object]:
     return doc
 
 
+@router.post("/baselines/sync-counts")
+async def sync_baseline_counts(
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Derive and back-fill ``counts`` for every baseline whose counts field
+    is empty, using the stored course L / T / P columns.
+
+    Safe to call repeatedly — baselines that already have explicit counts
+    are not touched. Use this after a scheme-PDF upload on an older install
+    where counts were seeded as ``{}`` before this endpoint existed.
+    """
+    result = await storage.backfill_baseline_counts()
+    return {"ok": True, **result}
+
+
 @router.post("/baselines/{key}")
 async def post_baseline(key: str, payload: dict) -> dict[str, object]:
     """Create or replace the baseline for `key` (e.g. ``E1A``).
@@ -291,6 +306,30 @@ async def delete_baseline(key: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "key": key.upper()}
+
+
+@router.post("/baselines/{key}/check")
+async def check_baseline(
+    key: str,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Run the doctor for a single baseline group against live timetables.
+
+    Clears any existing open ``BASELINE_MISMATCH`` / ``BASELINE_MISSING``
+    rows for the group and writes fresh ones. Returns a compact summary so
+    the UI can show the result inline without a full page reload.
+    """
+    try:
+        result = await storage.check_baseline_group(key)
+    except storage.DataMissing as exc:
+        raise HTTPException(status_code=404, detail={
+            "error": str(exc), "code": "not_found",
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_key",
+        }) from exc
+    return {"ok": True, **result}
 
 
 # ── Course-scheme PDF upload (populates baseline `courses`) ─────────────

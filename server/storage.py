@@ -386,6 +386,65 @@ async def delete_baseline(key: str, settings: Settings | None = None) -> bool:
     return True
 
 
+async def backfill_baseline_counts(settings: Settings | None = None) -> dict[str, Any]:
+    """For every baseline whose ``counts`` dict is empty, derive counts from
+    the stored course L/T/P columns and write them back.
+
+    Safe to run multiple times — docs that already have explicit counts are
+    left untouched.  Returns ``{updated: N, skipped: M}`` where *skipped* is
+    the number of docs that already had counts or had no courses to derive from.
+    """
+    updated = 0
+    skipped = 0
+    now = datetime.now(timezone.utc)
+    async for doc in BaselineDoc.find_all():
+        if doc.counts:          # already has explicit counts — leave it alone
+            skipped += 1
+            continue
+        if not doc.courses:     # nothing to derive from
+            skipped += 1
+            continue
+        derived = _counts_from_courses(doc.courses)
+        if not derived:         # all L/T/P were blank / zero
+            skipped += 1
+            continue
+        await doc.set({"counts": derived, "updated_at": now})
+        updated += 1
+    return {"updated": updated, "skipped": skipped}
+
+
+def _numeric_str(value: str | None) -> int:
+    """Parse a credit-hour string like '3' or '1.5' to an int (rounds down)."""
+    if not value:
+        return 0
+    try:
+        return int(float(str(value).strip()))
+    except (ValueError, TypeError):
+        return 0
+
+
+def _counts_from_courses(courses: list[BaselineCourseCheck]) -> dict[str, int]:
+    """Derive {Lecture, Tutorial, Practical} weekly-count totals by summing the
+    L/T/P credit-hour columns across all courses in the roster.
+
+    Used both here (when a scheme PDF creates a baseline) and mirrored in
+    ``BaselinesPage.jsx::countsFromCourses`` for the UI fallback display.
+    """
+    lecture = tutorial = practical = 0
+    for c in courses:
+        lecture += _numeric_str(c.L)
+        tutorial += _numeric_str(c.T)
+        practical += _numeric_str(c.P)
+    out: dict[str, int] = {}
+    if lecture:
+        out["Lecture"] = lecture
+    if tutorial:
+        out["Tutorial"] = tutorial
+    if practical:
+        out["Practical"] = practical
+    return out
+
+
 async def upsert_baseline_courses(
     key: str,
     courses: Any,
@@ -394,15 +453,20 @@ async def upsert_baseline_courses(
     merge: bool = False,
     settings: Settings | None = None,
 ) -> dict[str, Any]:
-    """Set only the ``courses`` roster for a baseline, preserving existing
-    counts (or seeding empty counts on create). Used by the scheme-PDF apply
-    flow so an admin can attach course rosters before configuring per-type
-    counts.
+    """Set the ``courses`` roster for a baseline, deriving ``counts`` from the
+    course L/T/P columns when none are configured yet.
+
+    Both the manual form and the scheme-PDF flow now produce the same schema:
+    ``counts`` always holds the per-type expected class counts, sourced from
+    either the admin's explicit input or the summed course contact hours.
     """
     cleaned_key = _safe_baseline_key(key)
     prefix = cleaned_key[0]
     group = cleaned_key[1:]
     parsed_courses = _clean_courses(courses)
+    # Derive counts from the course L/T/P columns so the schema is uniform
+    # regardless of whether the admin used the manual form or a PDF upload.
+    derived_counts = _counts_from_courses(parsed_courses)
     now = datetime.now(timezone.utc)
     doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
     if doc is None:
@@ -410,7 +474,7 @@ async def upsert_baseline_courses(
             key=cleaned_key,
             semester_prefix=prefix,
             group=group,
-            counts={},
+            counts=derived_counts,  # populated, not empty
             courses=parsed_courses,
             scheme_source=scheme_source,
         )
@@ -429,11 +493,111 @@ async def upsert_baseline_courses(
             update["courses"] = list(by_code.values())
         else:
             update["courses"] = parsed_courses
+        # If the baseline has no explicit counts yet, derive them from the
+        # incoming courses so the schema stays uniform (same as on create).
+        if not doc.counts:
+            update["counts"] = _counts_from_courses(parsed_courses)
         if scheme_source is not None:
             update["scheme_source"] = scheme_source
         await doc.set(update)
         doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
     return _baseline_payload(doc)
+
+
+async def check_baseline_group(
+    key: str,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Run the doctor for a single baseline group, refresh its error rows, and
+    return a summary.
+
+    Finds every ``TimetableDoc`` whose batch code belongs to the group (first
+    two chars of the code equal the baseline's ``group`` field), compares
+    against the baseline's counts, writes the results as ``ParsingErrorDoc``
+    rows (clearing any existing open rows for that group first), and returns
+    a compact result dict.
+    """
+    from server.doctor import build_doctor_report, codes_in, count_classes
+
+    cleaned_key = _safe_baseline_key(key)
+    doc = await BaselineDoc.find_one(BaselineDoc.key == cleaned_key)
+    if doc is None:
+        raise DataMissing(f"no baseline for {cleaned_key}")
+
+    group = doc.group   # e.g. "1A"
+    prefix = doc.semester_prefix
+
+    # Collect all timetables belonging to this group.
+    counts_by_batch: dict[str, dict[str, int]] = {}
+    codes_by_batch: dict[str, set[str]] = {}
+    async for tt in TimetableDoc.find_all():
+        code = tt.code
+        if len(code) >= 2 and code[:2].upper() == group.upper():
+            raw = getattr(tt, "classes", None) or []
+            classes: list[dict[str, Any]] = [
+                c.model_dump() if hasattr(c, "model_dump") else c
+                for c in raw
+                if isinstance(c, dict) or hasattr(c, "model_dump")
+            ]
+            counts_by_batch[code] = count_classes(classes)
+            codes_by_batch[code] = codes_in(classes)
+
+    if not counts_by_batch:
+        return {
+            "status": "no_timetables",
+            "group": group,
+            "baseline_key": cleaned_key,
+            "batches": 0,
+            "written": 0,
+            "deleted": 0,
+        }
+
+    baselines_map = {group: dict(doc.counts)}
+    course_codes = [c.code for c in (doc.courses or []) if (c.code or "").strip()]
+    courses_map = {group: course_codes} if course_codes else {}
+
+    report = build_doctor_report(
+        counts_by_batch,
+        baselines_by_group=baselines_map,
+        semester_prefix=prefix,
+        codes_by_batch=codes_by_batch,
+        courses_by_group=courses_map,
+    )
+
+    # Wipe open error rows that belong to this group so a re-check is
+    # idempotent — stale rows from a previous ingest or check are cleared.
+    stale_types = ["BASELINE_MISMATCH", "BASELINE_MISSING", "doctor_mismatch"]
+    batch_codes = list(counts_by_batch.keys())
+    coll = ParsingErrorDoc.get_pymongo_collection()
+    del_res = await coll.delete_many({
+        "error_type": {"$in": stale_types},
+        "status": "open",
+        "$or": [
+            {"batch_code": {"$in": batch_codes}},
+            {"context.group": group},
+        ],
+    })
+    deleted = del_res.deleted_count
+
+    written = await save_parsing_errors(upload_id=None, error_rows=[], doctor=report)
+
+    # Pull out the result for this specific group.
+    all_entries = (report.get("ok") or []) + (report.get("mismatches") or [])
+    group_entry = next((g for g in all_entries if g.get("group") == group), None)
+
+    has_mismatch = bool(report.get("mismatches"))
+    has_no_baseline = bool(report.get("no_baseline"))
+
+    return {
+        "status": "no_baseline" if has_no_baseline else ("mismatch" if has_mismatch else "ok"),
+        "group": group,
+        "baseline_key": cleaned_key,
+        "batches": len(counts_by_batch),
+        "mismatched_groups": report.get("mismatched_groups", 0),
+        "written": written,
+        "deleted": deleted,
+        "result": group_entry,
+    }
 
 
 async def read_baselines_for_prefix(
@@ -1271,6 +1435,41 @@ async def list_upload_attempts(
             row["errors_total"] = sum(buckets.values())
             row["errors_top_types"] = top_types_by_upload.get(uid, [])[:4]
 
+        # BASELINE_MISSING / BASELINE_MISMATCH rows written by the doctor
+        # backfill have upload_id=None — they aren't tied to a specific
+        # ingest but describe the current state of the most recent one.
+        # Merge them into the most recent upload's stats so the uploads
+        # page reflects the full error picture.
+        if out:
+            orphan_status_cursor = coll.aggregate([
+                {"$match": {"upload_id": None}},
+                {"$group": {"_id": "$status", "count": {"$sum": 1}}},
+            ])
+            orphan_buckets: dict[str, int] = {}
+            async for row in orphan_status_cursor:
+                if row["_id"] in ("open", "resolved", "ignored"):
+                    orphan_buckets[row["_id"]] = int(row.get("count") or 0)
+
+            if orphan_buckets:
+                top = out[0]
+                for st in ("open", "resolved", "ignored"):
+                    top[f"errors_{st}"] = (top.get(f"errors_{st}") or 0) + orphan_buckets.get(st, 0)
+                top["errors_total"] = top["errors_open"] + top["errors_resolved"] + top["errors_ignored"]
+
+                orphan_type_cursor = coll.aggregate([
+                    {"$match": {"upload_id": None, "status": "open"}},
+                    {"$group": {"_id": "$error_type", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                ])
+                type_map = {t["error_type"]: t["count"] for t in top.get("errors_top_types") or []}
+                async for row in orphan_type_cursor:
+                    et = row["_id"]
+                    type_map[et] = type_map.get(et, 0) + int(row.get("count") or 0)
+                top["errors_top_types"] = sorted(
+                    [{"error_type": k, "count": v} for k, v in type_map.items()],
+                    key=lambda x: -x["count"],
+                )[:4]
+
     return out
 
 
@@ -1736,11 +1935,13 @@ async def backfill_baseline_errors(settings: Settings | None = None) -> dict[str
         courses_by_group=baseline_courses,
     )
 
-    # Wipe existing orphan baseline rows so re-runs don't stack up. We only
-    # touch rows with upload_id=None so per-ingest history stays intact.
+    # Wipe all open baseline rows (orphan or ingest-associated) so stale
+    # BASELINE_MISSING entries from a pre-baseline ingest are cleared when the
+    # admin adds baselines and triggers a backfill.  The fresh doctor output
+    # written below supersedes them; resolved/ignored rows are untouched.
     stale_types = ["BASELINE_MISMATCH", "BASELINE_MISSING", "doctor_mismatch"]
     delete_res = await ParsingErrorDoc.find(
-        {"upload_id": None, "error_type": {"$in": stale_types}}
+        {"error_type": {"$in": stale_types}, "status": "open"}
     ).delete()
     deleted = getattr(delete_res, "deleted_count", 0) or 0
 
@@ -1769,10 +1970,14 @@ async def list_parsing_errors(
     query = ParsingErrorDoc.find_all(sort=[("created_at", -1)])
     if status:
         query = ParsingErrorDoc.find(ParsingErrorDoc.status == status, sort=[("created_at", -1)])
+    _ORPHAN_DOCTOR_TYPES = {"BASELINE_MISSING", "BASELINE_MISMATCH", "doctor_mismatch"}
     out: list[dict[str, Any]] = []
     async for doc in query:
         if upload_id and doc.upload_id != upload_id:
-            continue
+            # Also surface orphan doctor rows so upload detail pages show
+            # BASELINE_MISSING / BASELINE_MISMATCH written by the backfill.
+            if not (doc.upload_id is None and doc.error_type in _ORPHAN_DOCTOR_TYPES):
+                continue
         if error_type and doc.error_type != error_type:
             continue
         if batch_code and (doc.batch_code or "").upper() != batch_code.upper():
@@ -1785,11 +1990,13 @@ async def list_parsing_errors(
 
 async def parsing_errors_summary(upload_id: str | None = None) -> dict[str, Any]:
     """Return aggregate counts grouped by error_type + by status."""
+    _ORPHAN_DOCTOR_TYPES = {"BASELINE_MISSING", "BASELINE_MISMATCH", "doctor_mismatch"}
     by_type: dict[str, dict[str, int]] = {}
     totals = {"open": 0, "resolved": 0, "ignored": 0}
     async for doc in ParsingErrorDoc.find_all():
         if upload_id and doc.upload_id != upload_id:
-            continue
+            if not (doc.upload_id is None and doc.error_type in _ORPHAN_DOCTOR_TYPES):
+                continue
         bucket = by_type.setdefault(doc.error_type, {"open": 0, "resolved": 0, "ignored": 0})
         bucket[doc.status] = bucket.get(doc.status, 0) + 1
         totals[doc.status] = totals.get(doc.status, 0) + 1

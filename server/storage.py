@@ -2455,6 +2455,9 @@ async def _collect_batch_subject_codes(batch: str) -> set[str]:
     """Return the upper-cased subject codes present in ``batch``'s timetable.
 
     Includes both canonical cell codes and any elective ``options[*].subject_code``.
+    Also adds the base code for entries that carry a trailing class-type suffix
+    (L / T / P for Lecture / Tutorial / Practical) so that an exam date stored
+    as "UPH013" matches timetable cells recorded as "UPH013L", "UPH013T", "UPH013P".
     Empty set on miss (or no timetable).
     """
     doc = await TimetableDoc.find_one(TimetableDoc.code == batch)
@@ -2465,10 +2468,14 @@ async def _collect_batch_subject_codes(batch: str) -> set[str]:
         code = (klass.code or "").strip().upper()
         if code:
             codes.add(code)
+            if len(code) >= 5 and code[-1] in ('L', 'T', 'P'):
+                codes.add(code[:-1])
         for opt in klass.options or []:
             opt_code = (opt.subject_code or "").strip().upper()
             if opt_code:
                 codes.add(opt_code)
+                if len(opt_code) >= 5 and opt_code[-1] in ('L', 'T', 'P'):
+                    codes.add(opt_code[:-1])
     return codes
 
 

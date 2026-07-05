@@ -2769,13 +2769,13 @@ async def delete_calendar_overrides_in_range(
     # Beanie's find() accepts a Motor filter dict via `find({"$and":[...]})`
     # or via find_all with `.aggregate([{"$match": ...}])`. Simplest: use
     # the raw Motor collection.
-    cursor = CalendarOverrideDoc.get_motor_collection().find(query)
+    cursor = CalendarOverrideDoc.get_pymongo_collection().find(query)
     ids: list[Any] = []
     async for doc in cursor:
         ids.append(doc["_id"])
     if not ids:
         return 0
-    result = await CalendarOverrideDoc.get_motor_collection().delete_many(
+    result = await CalendarOverrideDoc.get_pymongo_collection().delete_many(
         {"_id": {"$in": ids}},
     )
     return int(result.deleted_count or 0)

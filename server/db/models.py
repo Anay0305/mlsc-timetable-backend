@@ -340,7 +340,7 @@ class CalendarOverrideDoc(Document):
     """
 
     date: str  # yyyy-mm-dd
-    kind: Literal["holiday", "follow_day"]
+    kind: Literal["holiday", "follow_day", "mst", "est", "assessment", "frosh"]
     reason: Optional[str] = None
     follows_day: Optional[int] = None  # 0..4 (Mon..Fri); required when kind=follow_day
     scope: Literal["global", "year", "branch"] = "global"

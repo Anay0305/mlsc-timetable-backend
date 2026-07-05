@@ -28,6 +28,7 @@ from server.db.models import (
     BaselineCourseCheck,
     BaselineDoc,
     BatchDoc,
+    CalendarOverrideDoc,
     ChangeRequestDoc,
     ContributorDoc,
     ExamDateDoc,
@@ -2320,3 +2321,254 @@ async def delete_exam_date(exam_id: str) -> bool:
         return False
     await doc.delete()
     return True
+
+
+# ── Calendar overrides ──────────────────────────────────────────────────
+_ALLOWED_OVERRIDE_KIND = {"holiday", "follow_day", "mst", "est", "assessment"}
+_ALLOWED_OVERRIDE_SCOPE = {"global", "year", "branch"}
+_YEAR_STR_RE = re.compile(r"^[1-9]$")
+_BRANCH_STR_RE = re.compile(r"^[1-9][A-Z]$")
+
+
+def _override_payload(doc: CalendarOverrideDoc) -> dict[str, Any]:
+    return {
+        "id": str(doc.id),
+        "date": doc.date,
+        "kind": doc.kind,
+        "reason": doc.reason,
+        "follows_day": doc.follows_day,
+        "scope": doc.scope,
+        "scope_values": list(doc.scope_values or []),
+    }
+
+
+async def _seed_calendar_overrides_if_empty() -> None:
+    if await CalendarOverrideDoc.find_all().count() > 0:
+        return
+    path = _ASSETS_DIR / "calendar_overrides.json"
+    if not path.exists():
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("calendar-overrides seed skipped: %s", exc)
+        return
+    if not isinstance(data, list):
+        return
+    docs: list[CalendarOverrideDoc] = []
+    for raw in data:
+        if not isinstance(raw, dict):
+            continue
+        date = str(raw.get("date") or "").strip()
+        kind = str(raw.get("kind") or "").strip().lower()
+        if not _DATE_RE.match(date) or kind not in _ALLOWED_OVERRIDE_KIND:
+            continue
+        follows_day = raw.get("follows_day")
+        if kind == "follow_day":
+            if not isinstance(follows_day, int) or not (0 <= follows_day <= 4):
+                continue
+        else:
+            follows_day = None
+        scope = str(raw.get("scope") or "global").strip().lower()
+        if scope not in _ALLOWED_OVERRIDE_SCOPE:
+            scope = "global"
+        scope_values = raw.get("scope_values") or []
+        if not isinstance(scope_values, list):
+            scope_values = []
+        docs.append(
+            CalendarOverrideDoc(
+                date=date,
+                kind=kind,
+                reason=(raw.get("reason") or None) or None,
+                follows_day=follows_day,
+                scope=scope,
+                scope_values=[str(v) for v in scope_values],
+            )
+        )
+    if docs:
+        await CalendarOverrideDoc.insert_many(docs)
+
+
+def _override_matches_batch(doc: CalendarOverrideDoc, year: int | None, branch: str | None) -> bool:
+    """Return True if the override applies to a batch with the given year+branch."""
+    if doc.scope == "global":
+        return True
+    values = [str(v).upper() for v in (doc.scope_values or [])]
+    if doc.scope == "year":
+        if year is None:
+            return False
+        return str(year) in values
+    if doc.scope == "branch":
+        if not branch:
+            return False
+        return branch.upper() in values
+    return False
+
+
+async def list_calendar_overrides(batch: str | None = None) -> list[dict[str, Any]]:
+    """Return calendar overrides, filtered by ``batch`` when supplied.
+
+    When ``batch`` is provided we compute the batch's year (1..5) and
+    branch prefix (e.g. "2A" from "2A11") and return only overrides whose
+    scope matches. When ``batch`` is missing all overrides are returned
+    (used by the admin listing).
+    """
+    await _seed_calendar_overrides_if_empty()
+
+    year: int | None = None
+    branch: str | None = None
+    if batch:
+        try:
+            code = _safe_batch(batch)
+        except BatchNotFound:
+            code = None
+        if code:
+            meta = _derive_batch_meta(code)
+            year = meta.get("year")
+            section = meta.get("section")
+            if year is not None and section:
+                branch = f"{year}{section[:1]}"
+
+    out: list[dict[str, Any]] = []
+    async for doc in CalendarOverrideDoc.find_all(sort=[("date", 1)]):
+        if batch:
+            if not _override_matches_batch(doc, year, branch):
+                continue
+        out.append(_override_payload(doc))
+    return out
+
+
+def _validate_override_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a cleaned dict ready to be handed to a CalendarOverrideDoc.
+
+    Raises ``ValueError`` with an actionable message on invalid input.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("body must be a JSON object")
+    date = str(payload.get("date") or "").strip()
+    if not _DATE_RE.match(date):
+        raise ValueError("date must be YYYY-MM-DD")
+    kind = str(payload.get("kind") or "").strip().lower()
+    if kind not in _ALLOWED_OVERRIDE_KIND:
+        raise ValueError(
+            "kind must be one of: holiday, follow_day, mst, est, assessment"
+        )
+    follows_day: int | None = None
+    if kind == "follow_day":
+        raw_fd = payload.get("follows_day")
+        try:
+            follows_day = int(raw_fd)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("follows_day must be an integer 0..4 (Mon..Fri)") from exc
+        if not (0 <= follows_day <= 4):
+            raise ValueError("follows_day must be 0..4 (Mon..Fri)")
+    reason = payload.get("reason")
+    if reason is not None:
+        if not isinstance(reason, str):
+            raise ValueError("reason must be a string when provided")
+        reason = reason.strip() or None
+    scope = str(payload.get("scope") or "global").strip().lower()
+    if scope not in _ALLOWED_OVERRIDE_SCOPE:
+        raise ValueError("scope must be 'global', 'year' or 'branch'")
+    raw_values = payload.get("scope_values") or []
+    if not isinstance(raw_values, list):
+        raise ValueError("scope_values must be a list of strings")
+    scope_values: list[str] = []
+    for v in raw_values:
+        s = str(v).strip().upper()
+        if not s:
+            continue
+        if scope == "year" and not _YEAR_STR_RE.match(s):
+            raise ValueError(f"scope_values[{v!r}] must be a single digit 1..9 for year scope")
+        if scope == "branch" and not _BRANCH_STR_RE.match(s):
+            raise ValueError(f"scope_values[{v!r}] must look like '2A' for branch scope")
+        scope_values.append(s)
+    if scope in {"year", "branch"} and not scope_values:
+        raise ValueError(f"scope_values is required when scope is '{scope}'")
+    if scope == "global":
+        scope_values = []
+    return {
+        "date": date,
+        "kind": kind,
+        "reason": reason,
+        "follows_day": follows_day,
+        "scope": scope,
+        "scope_values": scope_values,
+    }
+
+
+async def add_calendar_override(payload: dict[str, Any]) -> dict[str, Any]:
+    clean = _validate_override_payload(payload)
+    doc = CalendarOverrideDoc(**clean)
+    await doc.insert()
+    return _override_payload(doc)
+
+
+async def update_calendar_override(override_id: str, payload: dict[str, Any]) -> dict[str, Any] | None:
+    from beanie import PydanticObjectId
+    try:
+        oid = PydanticObjectId(override_id)
+    except Exception:
+        return None
+    doc = await CalendarOverrideDoc.get(oid)
+    if doc is None:
+        return None
+    clean = _validate_override_payload(payload)
+    for key, value in clean.items():
+        setattr(doc, key, value)
+    await doc.save()
+    return _override_payload(doc)
+
+
+async def delete_calendar_override(override_id: str) -> bool:
+    from beanie import PydanticObjectId
+    try:
+        oid = PydanticObjectId(override_id)
+    except Exception:
+        return False
+    doc = await CalendarOverrideDoc.get(oid)
+    if doc is None:
+        return False
+    await doc.delete()
+    return True
+
+
+async def delete_calendar_overrides_in_range(
+    start: str,
+    end: str,
+    *,
+    scope: str | None = None,
+    scope_values: list[str] | None = None,
+) -> int:
+    """Delete every calendar override whose date falls in [start, end]
+    (inclusive) AND whose scope matches, then return how many were removed.
+
+    Used by ``POST /admin/calendar/apply-plan`` to make a re-upload of the
+    same PDF idempotent — we wipe the calendar's own date window before
+    inserting the fresh plan.
+
+    When ``scope`` is None, matches any scope. When ``scope_values`` is
+    None, matches any values (scope-only filter).
+    """
+    if not (_DATE_RE.match(start) and _DATE_RE.match(end)):
+        return 0
+    query: dict[str, Any] = {"date": {"$gte": start, "$lte": end}}
+    if scope:
+        query["scope"] = scope
+    if scope_values is not None:
+        # Match documents whose scope_values equals the passed list exactly.
+        # Order doesn't matter for equality on Mongo; sort both sides.
+        query["scope_values"] = sorted(scope_values)
+    # Beanie's find() accepts a Motor filter dict via `find({"$and":[...]})`
+    # or via find_all with `.aggregate([{"$match": ...}])`. Simplest: use
+    # the raw Motor collection.
+    cursor = CalendarOverrideDoc.get_motor_collection().find(query)
+    ids: list[Any] = []
+    async for doc in cursor:
+        ids.append(doc["_id"])
+    if not ids:
+        return 0
+    result = await CalendarOverrideDoc.get_motor_collection().delete_many(
+        {"_id": {"$in": ids}},
+    )
+    return int(result.deleted_count or 0)

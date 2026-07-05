@@ -18,6 +18,7 @@ from server import storage
 from server.auth import AdminPrincipal, require_admin
 from server.ingest import parse_workbook
 from server.scheme_parser import baseline_key_for, parse_scheme_pdf
+from server.calendar_parser import parse_calendar_pdf
 
 logger = logging.getLogger(__name__)
 
@@ -313,11 +314,27 @@ async def _load_scheme_upload(file: UploadFile) -> Path:
         return Path(tmp.name)
 
 
+# Branches whose year-1 curriculum is their own (no pool rotation). The
+# scheme parser writes their year-1 semesters to their own baseline keys
+# (E1X / O1X, E1G / O1G, …) just like it does for year 2+.
+_INDEPENDENT_BRANCHES = {"X", "G", "J", "R"}
+# Pool selector — accepted as "branch" input by the scheme endpoints when
+# the admin is uploading the year-1 pool rotation instead of a real branch.
+# A single ``POOL`` upload writes BOTH Pool A and Pool B baselines in one
+# shot because they share the same course roster — Pool B just sees the
+# semester parity swapped (Sem 1 canonical → E1B for Pool B, Sem 2 → O1B).
+_POOL_SELECTOR = "POOL"
+
+
 def _validate_branch(branch: str) -> str:
+    """Accepts ``POOL`` (year-1 pool A+B upload) or a single-letter branch
+    code A–Z, returning the canonical uppercase form."""
     cleaned = (branch or "").strip().upper()
+    if cleaned == _POOL_SELECTOR:
+        return cleaned
     if len(cleaned) != 1 or not cleaned.isalpha():
         raise HTTPException(status_code=400, detail={
-            "error": "'branch' must be a single letter A–Z",
+            "error": "'branch' must be a single letter A–Z or POOL",
             "code": "invalid_branch",
         })
     return cleaned
@@ -326,50 +343,99 @@ def _validate_branch(branch: str) -> str:
 async def _build_scheme_plan(
     result: dict,
     branch: str,
-    pool_swap_year1: bool,
 ) -> list[dict]:
     """Turn the parser output into a per-semester apply plan, cross-referenced
     against existing baselines so the UI can show would-overwrite counts.
+
+    Semantics by branch cohort:
+      * ``POOL`` → only Sem 1 & 2, writing FOUR baselines: ``O1A`` + ``E1A``
+        for Pool A, plus ``E1B`` + ``O1B`` for Pool B (parity-swapped copy
+        of the same roster since Pool A and B share the year-1 curriculum,
+        just staggered by one semester).
+      * Independent branches (``X, G, J, R``) → all Sem 1–8, keys use the
+        branch letter directly (``E1X``, ``O1X``, ``E2X``, …).
+      * Pool-following branches (every other letter) → only Sem 3–8. The
+        year-1 semesters are skipped because those students share the Pool
+        A / Pool B baselines uploaded separately.
     """
+    is_pool = branch == _POOL_SELECTOR
+    is_independent = branch in _INDEPENDENT_BRANCHES
+
     plan: list[dict] = []
     existing_by_key: dict[str, dict] = {}
     for row in await storage.list_baselines():
         existing_by_key[row["key"]] = row
 
+    # For a POOL upload we emit two baselines per parsed year-1 semester
+    # (one for stream A with no swap, one for stream B with parity swap).
+    # For every other cohort it's just the one branch letter with no swap.
+    if is_pool:
+        cohorts = [("A", False), ("B", True)]
+    else:
+        cohorts = [(branch, False)]
+
     for sem in result.get("semesters") or []:
         sem_num = int(sem["number"])
-        try:
-            key = baseline_key_for(sem_num, branch, pool_swap_year1=pool_swap_year1)
-        except ValueError:
-            continue
-        # Pool A/B branches expose two curricula per calendar semester (each
-        # student sees one of them). For the multi-option "OR" semesters (Sem 8),
-        # we flatten every option's courses into the same baseline so the check
-        # accepts any code from any option.
+
+        # Cohort-specific semester filtering:
+        #   * pool uploads: only sem 1 & 2 (year-1 rotation)
+        #   * pool-following branches: skip sem 1 & 2 (owned by pool uploads)
+        #   * independent branches: all semesters
+        if is_pool:
+            if sem_num not in (1, 2):
+                continue
+        elif not is_independent:
+            if sem_num in (1, 2):
+                continue
+
+        # Flatten "OR" alternatives (e.g. Sem 8 electives) into a single
+        # course roster so the doctor check accepts any code from any option.
         flat_courses: list[dict] = []
         for opt in sem.get("options") or []:
             flat_courses.extend(opt.get("courses") or [])
-        existing = existing_by_key.get(key)
-        plan.append({
-            "semester": sem_num,
-            "keyline": sem["keyline"],
-            "baseline_key": key,
-            "year": sem["year"],
-            "courses": flat_courses,
-            "course_count": len(flat_courses),
-            "option_count": len(sem.get("options") or []),
-            "totals": [opt.get("totals") for opt in sem.get("options") or []],
-            "existing_course_count": existing["course_count"] if existing else 0,
-            "existing_counts": (existing or {}).get("counts") or {},
-            "would_create": existing is None,
-        })
+
+        for key_branch, pool_swap_year1 in cohorts:
+            try:
+                key = baseline_key_for(sem_num, key_branch, pool_swap_year1=pool_swap_year1)
+            except ValueError:
+                continue
+            existing = existing_by_key.get(key)
+            plan.append({
+                "semester": sem_num,
+                "keyline": sem["keyline"],
+                "baseline_key": key,
+                "year": sem["year"],
+                "courses": flat_courses,
+                "course_count": len(flat_courses),
+                "option_count": len(sem.get("options") or []),
+                "totals": [opt.get("totals") for opt in sem.get("options") or []],
+                "existing_course_count": existing["course_count"] if existing else 0,
+                "existing_counts": (existing or {}).get("counts") or {},
+                "would_create": existing is None,
+            })
+    # Sort by branch letter first, then by the *student-facing* semester
+    # (odd → sem 1, even → sem 2 within a year). This means Pool A's tabs
+    # read `O1A`, `E1A` (Sem 1, Sem 2) and Pool B's read `O1B`, `E1B`
+    # (Sem 1, Sem 2 for those students) even though the parser scanned
+    # them in a different order.
+    def _sort_key(row: dict) -> tuple:
+        key = row["baseline_key"]
+        parity = key[0]  # 'E' or 'O'
+        try:
+            year = int(key[1:-1])
+        except ValueError:
+            year = 0
+        branch_letter = key[-1]
+        student_sem = 2 * year - (1 if parity == "O" else 0)
+        return (branch_letter, student_sem)
+
+    plan.sort(key=_sort_key)
     return plan
 
 
 @router.post("/scheme/preview")
 async def post_scheme_preview(
     branch: str = Form(...),
-    pool_swap_year1: bool = Form(False),
     file: UploadFile = File(...),
 ) -> dict[str, object]:
     """Parse a course-scheme PDF and preview the baselines that would be
@@ -382,12 +448,11 @@ async def post_scheme_preview(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    plan = await _build_scheme_plan(result, branch, pool_swap_year1)
+    plan = await _build_scheme_plan(result, branch)
     return {
         "ok": True,
         "source": file.filename,
         "branch": branch,
-        "pool_swap_year1": bool(pool_swap_year1),
         "semester_count": result.get("semester_count", 0),
         "plan": plan,
         "keyline_convention": result.get("keyline_convention", {}),
@@ -397,16 +462,16 @@ async def post_scheme_preview(
 @router.post("/scheme/apply")
 async def post_scheme_apply(
     branch: str = Form(...),
-    pool_swap_year1: bool = Form(False),
     merge: bool = Form(False),
     file: UploadFile = File(...),
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
     """Apply the parsed scheme to the baseline collection.
 
-    For each detected semester, upserts a baseline keyed
-    ``<E|O><year><branch>`` and writes its ``courses`` roster. Existing
-    per-type ``counts`` on those baselines are preserved.
+    For each detected semester (filtered by cohort — see ``_build_scheme_plan``)
+    upserts a baseline keyed ``<E|O><year><branch>`` and writes its
+    ``courses`` roster. Existing per-type ``counts`` on those baselines
+    are preserved.
 
     ``merge=false`` (default) fully replaces the courses list per baseline;
     ``merge=true`` unions by course code with what's already stored (useful
@@ -419,7 +484,7 @@ async def post_scheme_apply(
     finally:
         tmp_path.unlink(missing_ok=True)
 
-    plan = await _build_scheme_plan(result, branch, pool_swap_year1)
+    plan = await _build_scheme_plan(result, branch)
     written: list[dict] = []
     errors: list[dict] = []
     for entry in plan:
@@ -441,15 +506,88 @@ async def post_scheme_apply(
             errors.append({"baseline_key": key, "error": str(exc)})
 
     logger.info(
-        "Scheme apply by %s: branch=%s pool_swap=%s wrote=%d errors=%d",
-        principal.label, branch, pool_swap_year1, len(written), len(errors),
+        "Scheme apply by %s: branch=%s wrote=%d errors=%d",
+        principal.label, branch, len(written), len(errors),
     )
     return {
         "ok": True,
         "source": file.filename,
         "branch": branch,
-        "pool_swap_year1": bool(pool_swap_year1),
         "merge": bool(merge),
+        "written": written,
+        "errors": errors,
+    }
+
+
+@router.post("/scheme/apply-plan")
+async def post_scheme_apply_plan(
+    payload: dict,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Apply a hand-edited scheme plan (JSON, no PDF re-parse).
+
+    Body:
+      ``{ plan: [{baseline_key, courses:[{code,title,category,L,T,P,Cr}], semester?}, ...],
+          merge?: bool, source?: str }``
+
+    Each entry's ``courses`` fully replaces the baseline's roster (or unions
+    when ``merge=true``). Existing per-type counts on the baselines are
+    preserved. Companion to ``POST /admin/scheme/apply`` which does the
+    same thing but re-parses the source PDF.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={
+            "error": "Body must be a JSON object",
+            "code": "invalid_payload",
+        })
+    plan = payload.get("plan")
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(status_code=400, detail={
+            "error": "'plan' must be a non-empty list",
+            "code": "invalid_payload",
+        })
+    merge = bool(payload.get("merge"))
+    source = payload.get("source")
+    if source is not None and not isinstance(source, str):
+        source = None
+
+    written: list[dict] = []
+    errors: list[dict] = []
+    for idx, entry in enumerate(plan):
+        if not isinstance(entry, dict):
+            errors.append({"index": idx, "error": "entry must be an object"})
+            continue
+        key = str(entry.get("baseline_key") or "").strip().upper()
+        if not key:
+            errors.append({"index": idx, "error": "missing baseline_key"})
+            continue
+        courses = entry.get("courses") or []
+        if not isinstance(courses, list):
+            errors.append({"baseline_key": key, "error": "'courses' must be a list"})
+            continue
+        try:
+            doc = await storage.upsert_baseline_courses(
+                key,
+                courses,
+                scheme_source=source,
+                merge=merge,
+            )
+            written.append({
+                "baseline_key": key,
+                "semester": entry.get("semester"),
+                "course_count": doc.get("course_count", 0),
+            })
+        except ValueError as exc:
+            errors.append({"baseline_key": key, "error": str(exc)})
+
+    logger.info(
+        "Scheme apply-plan by %s: entries=%d wrote=%d errors=%d",
+        principal.label, len(plan), len(written), len(errors),
+    )
+    return {
+        "ok": True,
+        "source": source,
+        "merge": merge,
         "written": written,
         "errors": errors,
     }
@@ -574,6 +712,211 @@ async def delete_exam_date(exam_id: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "id": exam_id}
+
+
+# ── Calendar overrides ──────────────────────────────────────────────────
+@router.post("/calendar-overrides")
+async def post_calendar_override(payload: dict) -> dict[str, object]:
+    """Create a calendar override.
+
+    Body:
+      ``{date, kind, reason?, follows_day?, scope, scope_values}``
+    See ``CalendarOverrideDoc`` for the semantics.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={
+            "error": "Body must be a JSON object",
+            "code": "invalid_payload",
+        })
+    try:
+        doc = await storage.add_calendar_override(payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": str(exc), "code": "invalid_payload"},
+        ) from exc
+    return {"ok": True, **doc}
+
+
+@router.put("/calendar-overrides/{override_id}")
+async def put_calendar_override(override_id: str, payload: dict) -> dict[str, object]:
+    """Replace an existing calendar override.
+
+    All fields are re-validated as if the row were being created fresh —
+    this keeps the update path simple and consistent with the create path.
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={
+            "error": "Body must be a JSON object",
+            "code": "invalid_payload",
+        })
+    try:
+        updated = await storage.update_calendar_override(override_id, payload)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": str(exc), "code": "invalid_payload"},
+        ) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no calendar override {override_id!r}",
+            "code": "not_found",
+        })
+    return {"ok": True, **updated}
+
+
+@router.delete("/calendar-overrides/{override_id}")
+async def delete_calendar_override(override_id: str) -> dict[str, object]:
+    deleted = await storage.delete_calendar_override(override_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no calendar override {override_id!r}",
+            "code": "not_found",
+        })
+    return {"ok": True, "id": override_id}
+
+
+# ── Calendar PDF parser ─────────────────────────────────────────────────
+# Mirrors the course-scheme PDF flow: preview parses the PDF into a JSON
+# preview (holidays, follow-day mappings, and any ambiguous cells the
+# admin should double-check), and apply-plan writes the edited plan to
+# the calendar_overrides collection.
+_CALENDAR_MAX_BYTES = 8 * 1024 * 1024  # 8 MB safety cap
+
+
+async def _load_calendar_upload(file: UploadFile) -> Path:
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail={
+            "error": "Upload must be a .pdf file",
+            "code": "invalid_file",
+        })
+    blob = await file.read()
+    if len(blob) > _CALENDAR_MAX_BYTES:
+        raise HTTPException(status_code=413, detail={
+            "error": f"PDF exceeds {_CALENDAR_MAX_BYTES // (1024 * 1024)} MB limit",
+            "code": "file_too_large",
+        })
+    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+        tmp.write(blob)
+        return Path(tmp.name)
+
+
+def _apply_scope_to_overrides(
+    overrides: list[dict[str, Any]],
+    scope: str,
+    scope_values: list[str],
+) -> list[dict[str, Any]]:
+    """Stamp every override with the resolved scope so downstream storage
+    validation doesn't need to backfill defaults."""
+    out: list[dict[str, Any]] = []
+    for o in overrides:
+        merged = dict(o)
+        merged["scope"] = scope
+        merged["scope_values"] = scope_values if scope != "global" else []
+        out.append(merged)
+    return out
+
+
+@router.post("/calendar/preview")
+async def post_calendar_preview(
+    file: UploadFile = File(...),
+) -> dict[str, object]:
+    """Parse an academic-calendar PDF and preview the calendar overrides
+    that would be written. Does not mutate any data.
+
+    Returns:
+      { source, year_start, year_end, sem_kind,
+        overrides: [ {date, kind, reason?, follows_day?}, ... ],
+        warnings: [ {kind, date?, hint, ...}, ... ],
+        holiday_legend, non_teaching, lieu_mappings, weeks }
+    """
+    tmp_path = await _load_calendar_upload(file)
+    try:
+        parsed = parse_calendar_pdf(tmp_path)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": str(exc), "code": "invalid_pdf"},
+        ) from exc
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    return {"ok": True, **parsed}
+
+
+@router.post("/calendar/apply-plan")
+async def post_calendar_apply_plan(
+    payload: dict,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Apply a hand-edited calendar plan (JSON, no PDF re-parse).
+
+    Body:
+      { plan: [{date, kind, reason?, follows_day?}, ...],
+        scope: "global" | "year" | "branch",
+        scope_values: [str, ...],   # required when scope != "global"
+        replace_range?: {start: "YYYY-MM-DD", end: "YYYY-MM-DD"},
+        source?: str }
+
+    When ``replace_range`` is present, every existing override whose date
+    falls in that inclusive range AND matches the same scope+scope_values
+    is deleted before the plan is applied — this keeps re-uploads
+    idempotent (upload same calendar twice = same result, not doubled).
+    """
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail={
+            "error": "Body must be a JSON object",
+            "code": "invalid_payload",
+        })
+    plan = payload.get("plan")
+    if not isinstance(plan, list):
+        raise HTTPException(status_code=400, detail={
+            "error": "'plan' must be a list",
+            "code": "invalid_payload",
+        })
+    scope = str(payload.get("scope") or "global").strip().lower()
+    scope_values_raw = payload.get("scope_values") or []
+    if not isinstance(scope_values_raw, list):
+        raise HTTPException(status_code=400, detail={
+            "error": "'scope_values' must be a list of strings",
+            "code": "invalid_payload",
+        })
+    scope_values = [str(v).strip().upper() for v in scope_values_raw if str(v).strip()]
+
+    # Optional idempotency window: wipe existing overrides in the calendar's
+    # date range so a re-upload replaces rather than doubles.
+    replace_range = payload.get("replace_range") or None
+    deleted_count = 0
+    if isinstance(replace_range, dict):
+        start = str(replace_range.get("start") or "").strip()
+        end = str(replace_range.get("end") or "").strip()
+        if start and end:
+            deleted_count = await storage.delete_calendar_overrides_in_range(
+                start, end, scope=scope, scope_values=scope_values,
+            )
+
+    written: list[dict[str, Any]] = []
+    errors: list[dict[str, Any]] = []
+    stamped = _apply_scope_to_overrides(plan, scope, scope_values)
+    for idx, entry in enumerate(stamped):
+        try:
+            doc = await storage.add_calendar_override(entry)
+            written.append(doc)
+        except ValueError as exc:
+            errors.append({"index": idx, "error": str(exc), "row": entry})
+
+    logger.info(
+        "Calendar apply-plan by %s: entries=%d wrote=%d deleted=%d errors=%d",
+        principal.label, len(plan), len(written), deleted_count, len(errors),
+    )
+    return {
+        "ok": True,
+        "source": payload.get("source"),
+        "scope": scope,
+        "scope_values": scope_values,
+        "deleted": deleted_count,
+        "written": written,
+        "errors": errors,
+    }
 
 
 def _validate_timetable_payload(payload: dict) -> None:

@@ -37,3 +37,20 @@ async def get_exam_dates(
 ) -> list[dict[str, Any]]:
     """Upcoming exam dates, earliest first. Filtered by `batch` when supplied."""
     return await storage.list_exam_dates(batch=batch)
+
+
+@router.get("/calendar-overrides")
+async def get_calendar_overrides(
+    batch: Optional[str] = Query(
+        default=None,
+        description="Optional batch code; filters overrides to global + matching year/branch scopes.",
+    ),
+) -> list[dict[str, Any]]:
+    """Calendar overrides (holidays + follow-day rules) for the mini-calendar.
+
+    When ``batch`` is supplied, only overrides whose scope applies to the
+    batch's year (e.g. "2") or branch (e.g. "2A"), plus all global-scope
+    overrides, are returned. Without ``batch`` the endpoint returns every
+    override — useful for admin/list contexts.
+    """
+    return await storage.list_calendar_overrides(batch=batch)

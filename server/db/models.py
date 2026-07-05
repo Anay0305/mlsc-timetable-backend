@@ -321,6 +321,40 @@ class ExamDateDoc(Document):
         ]
 
 
+class CalendarOverrideDoc(Document):
+    """Semester-calendar override for a single date on the mini-calendar.
+
+    Two kinds:
+      * ``holiday``     — the date is a declared holiday (no class);
+                          ``reason`` is optional (e.g. "Diwali", "Rain day").
+      * ``follow_day``  — the date runs another weekday's timetable
+                          (``follows_day`` is 0..4 = Mon..Fri).
+                          Typical use: "this Saturday follows Monday's schedule".
+
+    Scope determines who sees the override:
+      * ``global``      — everyone (default)
+      * ``year``        — only batches whose year (1..5) is in ``scope_values``
+                          (values are stringified ints, e.g. ["1", "2"]).
+      * ``branch``      — only batches whose "year+stream" prefix
+                          (e.g. "2A", "1E") is in ``scope_values``.
+    """
+
+    date: str  # yyyy-mm-dd
+    kind: Literal["holiday", "follow_day"]
+    reason: Optional[str] = None
+    follows_day: Optional[int] = None  # 0..4 (Mon..Fri); required when kind=follow_day
+    scope: Literal["global", "year", "branch"] = "global"
+    scope_values: list[str] = Field(default_factory=list)
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "calendar_overrides"
+        indexes = [
+            [("date", 1)],
+            "scope",
+        ]
+
+
 class IngestSnapshotDoc(Document):
     """Pre-ingest backup of the live data so admins can roll back the most
     recent ``/admin/ingest`` run.
@@ -428,6 +462,7 @@ ALL_DOCUMENTS = [
     UploadAttemptDoc,
     AnnouncementDoc,
     ExamDateDoc,
+    CalendarOverrideDoc,
     IngestSnapshotDoc,
     ParsingErrorDoc,
     SubjectDoc,

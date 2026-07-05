@@ -64,18 +64,29 @@ LIEU_RE = re.compile(
     r"(?:\s+with\s+([A-Za-z]+)(?:'s|\u2019s)?\s+Timetable)?",
     re.I,
 )
+# Alternate form seen on shorter calendars:
+#   "18 April (in lieu of April 13) :Monday Time table"
+# Groups: on_day, on_month_name, replaces_month_name, replaces_day, follows_name
+LIEU_PAREN_RE = re.compile(
+    r"(\d{1,2})\s+([A-Za-z]+)\s*\(\s*in\s+lieu\s+of\s+([A-Za-z]+)\s+(\d{1,2})\s*\)"
+    r"\s*:?\s*([A-Za-z]+)?\s*Time\s*table",
+    re.I,
+)
 
 PHASE_TEACHING = "teaching"
 PHASE_MST = "mst"
 PHASE_EST = "est"
 PHASE_ASSESSMENT = "assessment"
 PHASE_DIWALI = "diwali"
+PHASE_NT_WEEK = "nt_week"
 
 
 def _classify_phase(raw: str) -> str:
     s = (raw or "").strip().lower()
     if not s or s.startswith("teach"):
         return PHASE_TEACHING
+    if "non-teaching" in s or "non teaching" in s or "(nt)" in s:
+        return PHASE_NT_WEEK
     if "diwali" in s:
         return PHASE_DIWALI
     if "mst" in s:
@@ -437,6 +448,42 @@ def _parse_lieu_mappings(text: str, year_start: int,
             "follows_day_name": follows_name.title(),
             "raw": m.group(0),
         })
+
+    # Alternate parenthesised form (short calendar).
+    for m in LIEU_PAREN_RE.finditer(text):
+        on_day = int(m.group(1))
+        on_month_name = m.group(2)
+        replaces_month_name = m.group(3)
+        replaces_day = int(m.group(4))
+        follows_name = (m.group(5) or "").strip().lower()
+
+        on_month = MONTH_ABBR.get(on_month_name.lower())
+        replaces_month = MONTH_ABBR.get(replaces_month_name.lower())
+        if not on_month:
+            continue
+        on_year = year_start if on_month >= 7 else year_end
+        on_iso = f"{on_year:04d}-{on_month:02d}-{on_day:02d}"
+        if on_iso in seen:
+            continue
+        seen.add(on_iso)
+
+        follows_idx = FOLLOWS_DAY_INDEX.get(follows_name)
+        if follows_idx is None:
+            unresolved.append(m.group(0))
+            continue
+
+        replaces_year = year_start if (replaces_month or 1) >= 7 else year_end
+        rep_iso = (
+            f"{replaces_year:04d}-{replaces_month:02d}-{replaces_day:02d}"
+            if replaces_month else None
+        )
+        mappings.append({
+            "on_date": on_iso,
+            "replaces_date": rep_iso,
+            "follows_day": follows_idx,
+            "follows_day_name": follows_name.title(),
+            "raw": m.group(0),
+        })
     return mappings, unresolved
 
 
@@ -497,6 +544,12 @@ def parse_calendar_pdf(pdf_path: str | Path) -> dict[str, Any]:
              reason=reason, follows_day=l["follows_day"])
 
     for w in weeks:
+        if w.phase == PHASE_NT_WEEK:
+            # Every date in a "NON-TEACHING (NT) WEEK" block is off.
+            for c in w.cells:
+                if c.date:
+                    _add(c.date, "holiday", reason="Non-teaching week")
+            continue
         if w.phase not in (PHASE_DIWALI, PHASE_MST, PHASE_EST, PHASE_ASSESSMENT):
             continue
         for c in w.cells:
@@ -508,8 +561,8 @@ def parse_calendar_pdf(pdf_path: str | Path) -> dict[str, Any]:
                 continue
             # Diwali only covers Mon..Fri (Sat is a default off day
             # already). MST / EST / Assessment weeks DO affect Saturdays
-            # too \u2014 mock/end-sem tests and evaluation sessions run on
-            # Sat \u2014 so we mark whichever Sat cell the PDF filled with
+            # too — mock/end-sem tests and evaluation sessions run on
+            # Sat — so we mark whichever Sat cell the PDF filled with
             # a real date (not 'X').
             if w.phase == PHASE_DIWALI:
                 if d.weekday() >= 5:
@@ -522,6 +575,18 @@ def parse_calendar_pdf(pdf_path: str | Path) -> dict[str, Any]:
             elif w.phase == PHASE_ASSESSMENT:
                 _add(c.date, "assessment",
                      reason="Assessment / Evaluation week")
+
+    # Grid-cell suffix fallback: cells like "26-H" or "13-NT" that aren't
+    # named in the legend still deserve an override. Runs LAST so legend
+    # names + phase-week kinds take priority via the (date, kind) dedup.
+    for w in weeks:
+        for c in w.cells:
+            if not c.date or not c.suffix:
+                continue
+            if c.suffix == "H":
+                _add(c.date, "holiday", reason="Holiday")
+            elif c.suffix == "NT":
+                _add(c.date, "holiday", reason="Non-teaching day")
 
     for raw in unresolved_lieu:
         warnings.append({

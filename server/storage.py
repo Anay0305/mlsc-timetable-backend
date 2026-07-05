@@ -2324,7 +2324,7 @@ async def delete_exam_date(exam_id: str) -> bool:
 
 
 # ── Calendar overrides ──────────────────────────────────────────────────
-_ALLOWED_OVERRIDE_KIND = {"holiday", "follow_day", "mst", "est", "assessment"}
+_ALLOWED_OVERRIDE_KIND = {"holiday", "follow_day", "mst", "est", "assessment", "frosh"}
 _ALLOWED_OVERRIDE_SCOPE = {"global", "year", "branch"}
 _YEAR_STR_RE = re.compile(r"^[1-9]$")
 _BRANCH_STR_RE = re.compile(r"^[1-9][A-Z]$")
@@ -2451,7 +2451,7 @@ def _validate_override_payload(payload: dict[str, Any]) -> dict[str, Any]:
     kind = str(payload.get("kind") or "").strip().lower()
     if kind not in _ALLOWED_OVERRIDE_KIND:
         raise ValueError(
-            "kind must be one of: holiday, follow_day, mst, est, assessment"
+            "kind must be one of: holiday, follow_day, mst, est, assessment, frosh"
         )
     follows_day: int | None = None
     if kind == "follow_day":

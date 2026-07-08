@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
 
 _GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-_SCOPES = "https://www.googleapis.com/auth/calendar"
+_SCOPES = "https://www.googleapis.com/auth/calendar email openid"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -165,8 +165,19 @@ async def oauth_callback(
     expires_in = int(token_data.get("expires_in", 3600))
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
 
-    # Get the user's Google email from the token info
-    google_email = token_data.get("email", "")
+    # Extract email: try id_token JWT payload first (no extra API call),
+    # fall back to userinfo endpoint, then "unknown".
+    google_email = ""
+    id_token = token_data.get("id_token", "")
+    if id_token:
+        try:
+            import base64, json as _json
+            payload_b64 = id_token.split(".")[1]
+            payload_b64 += "=" * (4 - len(payload_b64) % 4)
+            claims = _json.loads(base64.urlsafe_b64decode(payload_b64))
+            google_email = claims.get("email", "")
+        except Exception:
+            pass
     if not google_email:
         try:
             import httpx
@@ -176,10 +187,12 @@ async def oauth_callback(
                     headers={"Authorization": f"Bearer {access_token}"},
                     timeout=10,
                 )
-                info.raise_for_status()
-                google_email = info.json().get("email", "")
+                if info.status_code == 200:
+                    google_email = info.json().get("email", "")
         except Exception:
-            google_email = "unknown"
+            pass
+    if not google_email:
+        google_email = "unknown"
 
     await calendar_storage.create_or_replace_connection(
         user_id,

@@ -325,8 +325,6 @@ def _build_base_event(
     if room:
         summary_parts.append(f"({room})")
     summary = " ".join(summary_parts)
-    if class_type and class_type not in ("Lecture", "Unknown", ""):
-        summary = f"[{class_type[:3]}] {summary}"
 
     recurrence = [f"RRULE:FREQ=WEEKLY;BYDAY={byday};UNTIL={until}"]
     for exdate in exdates_by_byday.get(byday, []):
@@ -374,8 +372,6 @@ def _build_oneoff_event(
     if room:
         summary_parts.append(f"({room})")
     summary = " ".join(summary_parts)
-    if class_type and class_type not in ("Lecture", "Unknown", ""):
-        summary = f"[{class_type[:3]}] {summary}"
 
     slot_id = compute_slot_id(
         batch, f"shift:{override_date}", start_time_str, code, room
@@ -554,8 +550,17 @@ async def full_sync_user(user_id: str) -> None:
                     exdates_by_byday.setdefault(byday, []).append(ov_date)
             except ValueError:
                 pass
-        elif kind in ("mst", "est", "assessment"):
+        elif kind in ("mst", "est", "assessment", "frosh"):
             allday_overrides.append(ov)
+            # Skip regular classes on these days too
+            try:
+                d = date.fromisoformat(ov_date)
+                wd = d.weekday()
+                if wd <= 4:  # Mon-Fri only
+                    byday = ["MO", "TU", "WE", "TH", "FR"][wd]
+                    exdates_by_byday.setdefault(byday, []).append(ov_date)
+            except ValueError:
+                pass
 
     # ── Pass 2: Build base recurring events ────────────────────────────
     events_to_create: list[dict] = []

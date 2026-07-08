@@ -24,6 +24,12 @@ class Settings:
     json_mirror: bool
     ingest_cooldown_hours: float
     ingest_snapshot_ttl_hours: float
+    # Google Calendar integration
+    google_oauth_client_id: str | None
+    google_oauth_client_secret: str | None
+    google_oauth_redirect_uri: str | None
+    calendar_token_key: str | None  # Fernet key for encrypting OAuth tokens
+    calendar_term_end_date: str | None  # yyyy-mm-dd e.g. "2026-04-30"
 
 
 @lru_cache(maxsize=1)
@@ -54,6 +60,11 @@ def get_settings() -> Settings:
         ingest_snapshot_ttl_hours = float(os.environ.get("INGEST_SNAPSHOT_TTL_HOURS", "24"))
     except ValueError:
         ingest_snapshot_ttl_hours = 24.0
+    google_oauth_client_id = (os.environ.get("GOOGLE_OAUTH_CLIENT_ID") or "").strip() or None
+    google_oauth_client_secret = (os.environ.get("GOOGLE_OAUTH_CLIENT_SECRET") or "").strip() or None
+    google_oauth_redirect_uri = (os.environ.get("GOOGLE_OAUTH_REDIRECT_URI") or "").strip() or None
+    calendar_token_key = (os.environ.get("CALENDAR_TOKEN_KEY") or "").strip() or None
+    calendar_term_end_date = (os.environ.get("CALENDAR_TERM_END_DATE") or "").strip() or None
     return Settings(
         data_dir=data_dir,
         cors_origins=cors_origins,
@@ -67,6 +78,11 @@ def get_settings() -> Settings:
         json_mirror=json_mirror,
         ingest_cooldown_hours=ingest_cooldown_hours,
         ingest_snapshot_ttl_hours=ingest_snapshot_ttl_hours,
+        google_oauth_client_id=google_oauth_client_id,
+        google_oauth_client_secret=google_oauth_client_secret,
+        google_oauth_redirect_uri=google_oauth_redirect_uri,
+        calendar_token_key=calendar_token_key,
+        calendar_term_end_date=calendar_term_end_date,
     )
 
 

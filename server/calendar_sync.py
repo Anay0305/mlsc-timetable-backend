@@ -446,6 +446,31 @@ async def _ensure_calendar(conn: CalendarConnectionDoc, access_token: str) -> st
     return cal_id
 
 
+import re as _re
+_LABEL_YEAR_RE = _re.compile(r"(\d{2,4})-(\d{2,4})")
+
+def _semester_fallback_date(label: str) -> str:
+    """Derive a sensible RRULE UNTIL from the semester label.
+
+    ``"ODD 25-26"``  → odd sem ends Dec → ``2025-12-31``
+    ``"EVEN 25-26"`` → even sem ends May → ``2026-05-31``
+    Falls back to current year Dec 31 if the label can't be parsed.
+    """
+    label = (label or "").upper()
+    is_even = label.startswith("EVEN")
+    m = _LABEL_YEAR_RE.search(label)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 < 100:
+            y1 += 2000
+        if y2 < 100:
+            y2 += 2000
+        sem_year = y2 if is_even else y1
+        return f"{sem_year}-05-31" if is_even else f"{sem_year}-12-31"
+    today = date.today()
+    return f"{today.year}-05-31" if is_even else f"{today.year}-12-31"
+
+
 async def full_sync_user(user_id: str) -> None:
     """Full re-sync: wipe all events in the MLSC calendar, recreate from timetable + overrides."""
     from server.db.models import TimetableDoc
@@ -456,16 +481,21 @@ async def full_sync_user(user_id: str) -> None:
         return
 
     settings = get_settings()
-    # Resolve term end date: DB year-keyed dict → env var → year-end fallback.
+    # Resolve term end date: DB year-keyed dict → env var → semester-aware fallback.
     try:
         current_doc = await main_storage.read_current()
         term_end_dates = current_doc.get("term_end_dates") or {}
         # Batch code like "1B14" → year "1"; PG codes that start with letters → "1"
         batch_year = str((conn.batch_code or "1")[0]) if (conn.batch_code or "1")[0].isdigit() else "1"
+        # Smart fallback: parse semester label → derive the actual semester year + parity.
+        #   "ODD 25-26"  → odd,  semester year 2025 → fallback 2025-12-31
+        #   "EVEN 25-26" → even, semester year 2026 → fallback 2026-05-31
+        label = (current_doc.get("label") or "").upper()
+        sem_fallback = _semester_fallback_date(label)
         term_end = (
             term_end_dates.get(batch_year)
             or settings.calendar_term_end_date
-            or f"{date.today().year}-12-31"
+            or sem_fallback
         )
     except Exception:
         term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"

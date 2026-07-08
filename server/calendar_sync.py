@@ -467,13 +467,18 @@ def _semester_fallback_date(label: str) -> str:
     return f"{today.year}-05-31" if is_even else f"{today.year}-12-31"
 
 
-async def full_sync_user(user_id: str) -> None:
-    """Full re-sync: wipe all events in the MLSC calendar, recreate from timetable + overrides."""
+async def full_sync_user(user_id: str, *, force: bool = False) -> None:
+    """Full re-sync: wipe all events in the MLSC calendar, recreate from timetable + overrides.
+
+    When ``force=True`` (manual trigger), runs even if auto-sync is disabled.
+    """
     from server.db.models import TimetableDoc
     from server import storage as main_storage
 
     conn = await calendar_storage.get_connection(user_id)
-    if conn is None or not conn.enabled:
+    if conn is None:
+        return
+    if not conn.enabled and not force:
         return
 
     settings = get_settings()
@@ -640,7 +645,10 @@ async def _run_sync_job(job_doc: dict) -> None:
     )
 
     try:
-        await full_sync_user(user_id)
+        # Manual triggers bypass the enabled check so users can sync on demand
+        # even when auto-sync is paused.
+        force = job_doc.get("trigger") in ("manual", "initial")
+        await full_sync_user(user_id, force=force)
         await coll.update_one(
             {"_id": job_doc["_id"]},
             {"$set": {"status": "done", "updated_at": datetime.now(timezone.utc)}},

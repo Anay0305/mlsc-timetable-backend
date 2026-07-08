@@ -106,20 +106,14 @@ async def put_current(payload: dict) -> dict[str, object]:
             "code": "invalid_payload",
         })
     try:
-        await storage.write_current({
-            "label": payload["label"],
-            "term_end_date": payload.get("term_end_date"),
-        })
+        await storage.write_current({"label": payload["label"]})
     except ValueError as e:
         raise HTTPException(status_code=400, detail={
             "error": str(e),
             "code": "invalid_semester_label",
         })
     storage.maybe_git_commit(f"admin: update semester label to {payload['label']!r}")
-    result: dict[str, object] = {"ok": True, "label": payload["label"]}
-    if payload.get("term_end_date"):
-        result["term_end_date"] = payload["term_end_date"]
-    return result
+    return {"ok": True, "label": payload["label"]}
 
 
 @router.post("/ingest")
@@ -996,6 +990,21 @@ async def post_calendar_apply_plan(
         "Calendar apply-plan by %s: entries=%d wrote=%d deleted=%d errors=%d",
         principal.label, len(plan), len(written), deleted_count, len(errors),
     )
+
+    # Persist year-wise term end dates if the client sent them.
+    term_end_dates = payload.get("term_end_dates")
+    if isinstance(term_end_dates, dict) and term_end_dates:
+        cleaned_dates = {
+            str(k): str(v).strip()
+            for k, v in term_end_dates.items()
+            if str(v).strip()
+        }
+        if cleaned_dates:
+            try:
+                await storage.write_term_end_dates(cleaned_dates)
+            except Exception:
+                logger.exception("apply-plan: failed to write term_end_dates")
+
     return {
         "ok": True,
         "source": payload.get("source"),

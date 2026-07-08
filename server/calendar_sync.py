@@ -456,10 +456,17 @@ async def full_sync_user(user_id: str) -> None:
         return
 
     settings = get_settings()
-    # Prefer the DB-stored value (set via admin panel), fall back to env var, then year-end.
+    # Resolve term end date: DB year-keyed dict → env var → year-end fallback.
     try:
         current_doc = await main_storage.read_current()
-        term_end = current_doc.get("term_end_date") or settings.calendar_term_end_date or f"{date.today().year}-12-31"
+        term_end_dates = current_doc.get("term_end_dates") or {}
+        # Batch code like "1B14" → year "1"; PG codes that start with letters → "1"
+        batch_year = str((conn.batch_code or "1")[0]) if (conn.batch_code or "1")[0].isdigit() else "1"
+        term_end = (
+            term_end_dates.get(batch_year)
+            or settings.calendar_term_end_date
+            or f"{date.today().year}-12-31"
+        )
     except Exception:
         term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"
 

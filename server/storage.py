@@ -68,8 +68,8 @@ async def read_current(settings: Settings | None = None) -> dict[str, Any]:
     if doc is None:
         raise DataMissing("no current semester set (PUT /admin/current)")
     result: dict[str, Any] = {"label": doc.label}
-    if doc.term_end_date:
-        result["term_end_date"] = doc.term_end_date
+    if doc.term_end_dates:
+        result["term_end_dates"] = doc.term_end_dates
     return result
 
 
@@ -145,27 +145,27 @@ async def write_current(payload: dict[str, Any], settings: Settings | None = Non
             f"invalid semester label {label!r}: must start with 'EVEN' or 'ODD' "
             "(e.g. 'EVEN 25-26', 'ODD 2025')"
         )
-    term_end_date = payload.get("term_end_date")
-    if term_end_date is not None:
-        if not isinstance(term_end_date, str) or not term_end_date.strip():
-            term_end_date = None
-        else:
-            term_end_date = term_end_date.strip()
-
     doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
     updates: dict[str, Any] = {"label": label, "updated_at": datetime.now(timezone.utc)}
-    if term_end_date is not None:
-        updates["term_end_date"] = term_end_date
     if doc is None:
-        await SemesterDoc(key="current", label=label, term_end_date=term_end_date).insert()
+        await SemesterDoc(key="current", label=label).insert()
     else:
         await doc.set(updates)
 
-    mirror_payload: dict[str, Any] = {"label": label}
-    if term_end_date:
-        mirror_payload["term_end_date"] = term_end_date
     if settings.json_mirror:
-        _mirror_json(settings.data_dir / "current.json", mirror_payload)
+        _mirror_json(settings.data_dir / "current.json", {"label": label})
+
+
+async def write_term_end_dates(dates: dict[str, str]) -> None:
+    """Patch only the ``term_end_dates`` field on the current SemesterDoc.
+
+    ``dates`` is a dict keyed by UG year string (``"1"``..``"4"``).
+    Silently no-ops if no semester doc exists yet.
+    """
+    doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
+    if doc is None:
+        return
+    await doc.set({"term_end_dates": dates, "updated_at": datetime.now(timezone.utc)})
 
 
 async def write_timetable(

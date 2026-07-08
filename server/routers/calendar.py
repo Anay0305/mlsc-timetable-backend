@@ -95,6 +95,15 @@ window.close();
 
 # ── Routes ────────────────────────────────────────────────────────────
 
+@router.get("/configured")
+async def get_configured() -> dict:
+    """Public endpoint — returns whether Google Calendar integration is configured.
+    No auth required so the frontend can decide whether to show the button
+    before the user is signed in.
+    """
+    return {"configured": _is_configured()}
+
+
 @router.get("/status")
 async def get_status(user_id: str = Depends(require_clerk_user)) -> dict:
     """Return connection + sync status for the authenticated user."""

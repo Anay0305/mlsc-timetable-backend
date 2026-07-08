@@ -67,7 +67,10 @@ async def read_current(settings: Settings | None = None) -> dict[str, Any]:
     doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
     if doc is None:
         raise DataMissing("no current semester set (PUT /admin/current)")
-    return {"label": doc.label}
+    result: dict[str, Any] = {"label": doc.label}
+    if doc.term_end_date:
+        result["term_end_date"] = doc.term_end_date
+    return result
 
 
 async def read_timetable(batch: str, settings: Settings | None = None) -> dict[str, Any]:
@@ -142,14 +145,27 @@ async def write_current(payload: dict[str, Any], settings: Settings | None = Non
             f"invalid semester label {label!r}: must start with 'EVEN' or 'ODD' "
             "(e.g. 'EVEN 25-26', 'ODD 2025')"
         )
-    doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
-    if doc is None:
-        await SemesterDoc(key="current", label=label).insert()
-    else:
-        await doc.set({"label": label, "updated_at": datetime.now(timezone.utc)})
+    term_end_date = payload.get("term_end_date")
+    if term_end_date is not None:
+        if not isinstance(term_end_date, str) or not term_end_date.strip():
+            term_end_date = None
+        else:
+            term_end_date = term_end_date.strip()
 
+    doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
+    updates: dict[str, Any] = {"label": label, "updated_at": datetime.now(timezone.utc)}
+    if term_end_date is not None:
+        updates["term_end_date"] = term_end_date
+    if doc is None:
+        await SemesterDoc(key="current", label=label, term_end_date=term_end_date).insert()
+    else:
+        await doc.set(updates)
+
+    mirror_payload: dict[str, Any] = {"label": label}
+    if term_end_date:
+        mirror_payload["term_end_date"] = term_end_date
     if settings.json_mirror:
-        _mirror_json(settings.data_dir / "current.json", {"label": label})
+        _mirror_json(settings.data_dir / "current.json", mirror_payload)
 
 
 async def write_timetable(

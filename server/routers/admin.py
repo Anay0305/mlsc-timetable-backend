@@ -106,14 +106,20 @@ async def put_current(payload: dict) -> dict[str, object]:
             "code": "invalid_payload",
         })
     try:
-        await storage.write_current({"label": payload["label"]})
+        await storage.write_current({
+            "label": payload["label"],
+            "term_end_date": payload.get("term_end_date"),
+        })
     except ValueError as e:
         raise HTTPException(status_code=400, detail={
             "error": str(e),
             "code": "invalid_semester_label",
         })
     storage.maybe_git_commit(f"admin: update semester label to {payload['label']!r}")
-    return {"ok": True, "label": payload["label"]}
+    result: dict[str, object] = {"ok": True, "label": payload["label"]}
+    if payload.get("term_end_date"):
+        result["term_end_date"] = payload["term_end_date"]
+    return result
 
 
 @router.post("/ingest")

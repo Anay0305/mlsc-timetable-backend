@@ -456,7 +456,12 @@ async def full_sync_user(user_id: str) -> None:
         return
 
     settings = get_settings()
-    term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"
+    # Prefer the DB-stored value (set via admin panel), fall back to env var, then year-end.
+    try:
+        current_doc = await main_storage.read_current()
+        term_end = current_doc.get("term_end_date") or settings.calendar_term_end_date or f"{date.today().year}-12-31"
+    except Exception:
+        term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"
 
     try:
         access_token = await get_valid_access_token(conn)

@@ -53,6 +53,7 @@ class SemesterDoc(Document):
 
     key: Annotated[str, Indexed(unique=True)] = "current"
     label: str
+    term_end_date: Optional[str] = None  # yyyy-mm-dd, used as RRULE UNTIL for calendar sync
     updated_at: datetime = Field(default_factory=_utcnow)
 
     class Settings:

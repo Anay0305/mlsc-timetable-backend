@@ -127,6 +127,7 @@ class ParsedCalendar:
     holiday_legend: list[dict[str, str]]
     non_teaching: list[str]
     lieu_mappings: list[dict[str, Any]]
+    suggested_term_end: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +135,7 @@ class ParsedCalendar:
             "year_start": self.year_start,
             "year_end": self.year_end,
             "sem_kind": self.sem_kind,
+            "suggested_term_end": self.suggested_term_end,
             "weeks": [
                 {
                     "number": w.number,
@@ -599,6 +601,14 @@ def parse_calendar_pdf(pdf_path: str | Path) -> dict[str, Any]:
 
     overrides.sort(key=lambda r: (r["date"], r["kind"]))
 
+    # Detect the last calendar date in the PDF as a suggested RRULE UNTIL.
+    all_dates = [r["date"] for r in overrides if r.get("date")]
+    for w in weeks:
+        for c in w.cells:
+            if c.date:
+                all_dates.append(c.date)
+    suggested_term_end = max(all_dates) if all_dates else None
+
     parsed = ParsedCalendar(
         source=path.name,
         year_start=year_start,
@@ -610,5 +620,6 @@ def parse_calendar_pdf(pdf_path: str | Path) -> dict[str, Any]:
         holiday_legend=[{"date": d, "name": n} for d, n in holidays],
         non_teaching=nt_dates,
         lieu_mappings=lieu,
+        suggested_term_end=suggested_term_end,
     )
     return parsed.to_dict()

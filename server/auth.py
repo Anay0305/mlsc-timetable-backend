@@ -152,3 +152,47 @@ def require_user_id(x_user_id: str | None = Header(default=None, alias="X-User-I
             },
         )
     return x_user_id
+
+
+# ── Clerk user identity (for calendar endpoints) ──────────────────────────
+async def require_clerk_user(
+    authorization: str | None = Header(default=None),
+) -> str:
+    """FastAPI dependency: return the Clerk user ID (``sub`` claim).
+
+    Used by calendar endpoints that need a real authenticated identity.
+    Unlike ``require_admin``, this only checks the JWT signature and ``sub``;
+    it does NOT require the email to be in the admin allowlist.
+    """
+    from server import clerk_jwt
+
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Missing bearer token", "code": "missing_credentials"},
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    token = authorization.removeprefix("Bearer ").strip()
+
+    if not clerk_jwt.is_clerk_configured():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": "Clerk auth is not configured on this server", "code": "auth_disabled"},
+        )
+
+    try:
+        claims = clerk_jwt.verify_clerk_jwt(token)
+    except clerk_jwt.ClerkJWTError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": str(exc), "code": "invalid_token"},
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+
+    sub = claims.get("sub")
+    if not sub:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Token has no sub claim", "code": "missing_sub_claim"},
+        )
+    return sub

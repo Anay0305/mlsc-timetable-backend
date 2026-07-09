@@ -23,6 +23,7 @@ from server.routers import (
     announcements,
     baselines,
     batch,
+    calendar,
     change_requests,
     contributors,
     current,
@@ -52,9 +53,17 @@ async def _lifespan(app: FastAPI):
         await ensure_catalog()
     except Exception:
         logging.getLogger("server.app").exception("Subject catalog bootstrap failed")
+    # Start the Google Calendar background worker (no-op if not configured)
+    try:
+        from server.calendar_sync import start_worker
+        start_worker()
+    except Exception:
+        logging.getLogger("server.app").exception("Calendar worker failed to start")
     try:
         yield
     finally:
+        from server.calendar_sync import stop_worker
+        stop_worker()
         await close_db()
 
 
@@ -111,6 +120,7 @@ def create_app() -> FastAPI:
     app.include_router(change_requests.router)
     app.include_router(change_requests.admin_router)
     app.include_router(admin.router)
+    app.include_router(calendar.router)
 
     return app
 

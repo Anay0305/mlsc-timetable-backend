@@ -790,6 +790,12 @@ async def post_calendar_override(payload: dict) -> dict[str, object]:
             status_code=400,
             detail={"error": str(exc), "code": "invalid_payload"},
         ) from exc
+    # Fan out to opted-in users asynchronously (best-effort)
+    try:
+        from server import calendar_storage
+        await calendar_storage.enqueue_jobs_for_override(doc)
+    except Exception:
+        logger.exception("calendar fan-out failed for new override %s", doc.get("id"))
     return {"ok": True, **doc}
 
 
@@ -817,6 +823,12 @@ async def put_calendar_override(override_id: str, payload: dict) -> dict[str, ob
             "error": f"no calendar override {override_id!r}",
             "code": "not_found",
         })
+    # Fan out to opted-in users asynchronously (best-effort)
+    try:
+        from server import calendar_storage
+        await calendar_storage.enqueue_jobs_for_override(updated)
+    except Exception:
+        logger.exception("calendar fan-out failed for updated override %s", override_id)
     return {"ok": True, **updated}
 
 
@@ -828,6 +840,13 @@ async def delete_calendar_override(override_id: str) -> dict[str, object]:
             "error": f"no calendar override {override_id!r}",
             "code": "not_found",
         })
+    # Fan out: deleted override means timetable slots are restored;
+    # trigger a resync for all opted-in users (best-effort)
+    try:
+        from server import calendar_storage
+        await calendar_storage.enqueue_jobs_for_override({"id": override_id, "scope": "global"})
+    except Exception:
+        logger.exception("calendar fan-out failed for deleted override %s", override_id)
     return {"ok": True, "id": override_id}
 
 
@@ -971,6 +990,21 @@ async def post_calendar_apply_plan(
         "Calendar apply-plan by %s: entries=%d wrote=%d deleted=%d errors=%d",
         principal.label, len(plan), len(written), deleted_count, len(errors),
     )
+
+    # Persist year-wise term end dates if the client sent them.
+    term_end_dates = payload.get("term_end_dates")
+    if isinstance(term_end_dates, dict) and term_end_dates:
+        cleaned_dates = {
+            str(k): str(v).strip()
+            for k, v in term_end_dates.items()
+            if str(v).strip()
+        }
+        if cleaned_dates:
+            try:
+                await storage.write_term_end_dates(cleaned_dates)
+            except Exception:
+                logger.exception("apply-plan: failed to write term_end_dates")
+
     return {
         "ok": True,
         "source": payload.get("source"),

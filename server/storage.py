@@ -67,7 +67,10 @@ async def read_current(settings: Settings | None = None) -> dict[str, Any]:
     doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
     if doc is None:
         raise DataMissing("no current semester set (PUT /admin/current)")
-    return {"label": doc.label}
+    result: dict[str, Any] = {"label": doc.label}
+    if doc.term_end_dates:
+        result["term_end_dates"] = doc.term_end_dates
+    return result
 
 
 async def read_timetable(batch: str, settings: Settings | None = None) -> dict[str, Any]:
@@ -143,13 +146,26 @@ async def write_current(payload: dict[str, Any], settings: Settings | None = Non
             "(e.g. 'EVEN 25-26', 'ODD 2025')"
         )
     doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
+    updates: dict[str, Any] = {"label": label, "updated_at": datetime.now(timezone.utc)}
     if doc is None:
         await SemesterDoc(key="current", label=label).insert()
     else:
-        await doc.set({"label": label, "updated_at": datetime.now(timezone.utc)})
+        await doc.set(updates)
 
     if settings.json_mirror:
         _mirror_json(settings.data_dir / "current.json", {"label": label})
+
+
+async def write_term_end_dates(dates: dict[str, str]) -> None:
+    """Patch only the ``term_end_dates`` field on the current SemesterDoc.
+
+    ``dates`` is a dict keyed by UG year string (``"1"``..``"4"``).
+    Silently no-ops if no semester doc exists yet.
+    """
+    doc = await SemesterDoc.find_one(SemesterDoc.key == "current")
+    if doc is None:
+        return
+    await doc.set({"term_end_dates": dates, "updated_at": datetime.now(timezone.utc)})
 
 
 async def write_timetable(

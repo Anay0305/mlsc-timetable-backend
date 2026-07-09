@@ -53,6 +53,7 @@ class SemesterDoc(Document):
 
     key: Annotated[str, Indexed(unique=True)] = "current"
     label: str
+    term_end_dates: Optional[dict] = None  # {"1": "2026-11-15", "2": "2026-11-30", ...} per UG year
     updated_at: datetime = Field(default_factory=_utcnow)
 
     class Settings:
@@ -355,6 +356,74 @@ class CalendarOverrideDoc(Document):
         ]
 
 
+class CalendarConnectionDoc(Document):
+    """Stores a user's Google Calendar OAuth tokens + sync state.
+
+    Tokens are Fernet-encrypted. ``calendar_id`` is the id of the dedicated
+    'MLSC Timetable' calendar we created in the user's Google account.
+    ``batch_code`` is the batch whose timetable is currently synced.
+    """
+
+    user_id: Annotated[str, Indexed(unique=True)]  # Clerk sub claim
+    refresh_token: str       # Fernet-encrypted
+    access_token: str        # Fernet-encrypted, short-lived cache
+    access_expires_at: datetime
+    google_email: str
+    calendar_id: Optional[str] = None
+    batch_code: Optional[str] = None
+    enabled: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
+    last_synced_at: Optional[datetime] = None
+    last_error: Optional[str] = None
+
+    class Settings:
+        name = "calendar_connections"
+
+
+class CalendarSyncJobDoc(Document):
+    """One queued sync task for a user.
+
+    The background worker polls ``status='pending'`` rows. Retries use
+    exponential backoff up to ``_MAX_ATTEMPTS`` (5). ``updated_at`` doubles
+    as the 'not before' timestamp for retries.
+    """
+
+    user_id: str
+    trigger: Literal["initial", "override_changed", "batch_changed", "manual", "retry"]
+    override_id: Optional[str] = None
+    status: Literal["pending", "running", "done", "failed"] = "pending"
+    attempts: int = 0
+    last_error: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "calendar_sync_jobs"
+        indexes = [
+            [("status", 1), ("updated_at", 1)],
+            [("user_id", 1), ("status", 1)],
+        ]
+
+
+class CalendarEventMapDoc(Document):
+    """Maps a stable slot_id to the Google Calendar event we created for it.
+
+    Used as a fast lookup cache; the true source of identity is the
+    ``extendedProperties.private.mlscSlotId`` on the Google event itself.
+    """
+
+    user_id: str
+    slot_id: str
+    google_event_id: str
+    rrule_hash: str
+
+    class Settings:
+        name = "calendar_event_maps"
+        indexes = [
+            [("user_id", 1), ("slot_id", 1)],
+        ]
+
+
 class IngestSnapshotDoc(Document):
     """Pre-ingest backup of the live data so admins can roll back the most
     recent ``/admin/ingest`` run.
@@ -463,6 +532,9 @@ ALL_DOCUMENTS = [
     AnnouncementDoc,
     ExamDateDoc,
     CalendarOverrideDoc,
+    CalendarConnectionDoc,
+    CalendarSyncJobDoc,
+    CalendarEventMapDoc,
     IngestSnapshotDoc,
     ParsingErrorDoc,
     SubjectDoc,

@@ -1005,6 +1005,20 @@ async def post_calendar_apply_plan(
             except Exception:
                 logger.exception("apply-plan: failed to write term_end_dates")
 
+    # Persist year-wise term start dates if the client sent them.
+    term_start_dates = payload.get("term_start_dates")
+    if isinstance(term_start_dates, dict) and term_start_dates:
+        cleaned_start_dates = {
+            str(k): str(v).strip()
+            for k, v in term_start_dates.items()
+            if str(v).strip()
+        }
+        if cleaned_start_dates:
+            try:
+                await storage.write_term_start_dates(cleaned_start_dates)
+            except Exception:
+                logger.exception("apply-plan: failed to write term_start_dates")
+
     return {
         "ok": True,
         "source": payload.get("source"),

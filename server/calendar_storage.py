@@ -80,11 +80,23 @@ async def create_or_replace_connection(
     access_expires_at: datetime,
     google_email: str,
 ) -> CalendarConnectionDoc:
-    """Upsert connection. Wipes event maps on replace."""
+    """Upsert connection.
+
+    On re-connect (existing connection found), only the tokens and google_email
+    are updated — ``calendar_id``, ``enabled``, and ``batch_code`` are preserved
+    so a second OAuth flow doesn't orphan the existing calendar or reset sync.
+    """
     existing = await get_connection(user_id)
     if existing is not None:
-        await existing.delete()
-        await CalendarEventMapDoc.find(CalendarEventMapDoc.user_id == user_id).delete()
+        # Preserve calendar state; only rotate tokens + email.
+        await existing.set({
+            "refresh_token": encrypt_token(refresh_token_plain),
+            "access_token": encrypt_token(access_token_plain),
+            "access_expires_at": access_expires_at,
+            "google_email": google_email,
+            "last_error": None,
+        })
+        return existing
 
     doc = CalendarConnectionDoc(
         user_id=user_id,

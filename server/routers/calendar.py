@@ -227,7 +227,14 @@ async def enable_sync(
             detail={"error": "Google Calendar not connected. Connect first.", "code": "not_connected"},
         )
 
-    await calendar_storage.enqueue_job(user_id, "initial")
+    # Dedup: skip if a pending/running sync job already exists for this user.
+    from server.db.models import CalendarSyncJobDoc
+    existing_job = await CalendarSyncJobDoc.find_one(
+        CalendarSyncJobDoc.user_id == user_id,
+        CalendarSyncJobDoc.status.in_(["pending", "running"]),
+    )
+    if existing_job is None:
+        await calendar_storage.enqueue_job(user_id, "initial")
     return {"ok": True}
 
 
@@ -259,8 +266,16 @@ async def resync(
 
 
 @router.delete("/disconnect")
-async def disconnect(user_id: str = Depends(require_clerk_user)) -> dict:
-    """Revoke Google token, delete the MLSC calendar, wipe all DB rows."""
+async def disconnect(
+    clear: bool = Query(default=True),
+    user_id: str = Depends(require_clerk_user),
+) -> dict:
+    """Revoke Google token and wipe all DB rows.
+
+    If ``clear=true`` (default), also deletes the dedicated MLSC calendar and
+    all its events from Google. Pass ``clear=false`` to only revoke the token
+    and remove the connection, leaving the calendar intact.
+    """
     conn = await calendar_storage.get_connection(user_id)
     if conn is None:
         raise HTTPException(status_code=404, detail={"error": "Not connected", "code": "not_connected"})
@@ -272,8 +287,8 @@ async def disconnect(user_id: str = Depends(require_clerk_user)) -> dict:
     except Exception:
         pass  # Best-effort
 
-    # Try to delete the Google calendar
-    if conn.calendar_id:
+    # Optionally delete the Google calendar
+    if clear and conn.calendar_id:
         try:
             access_token = await calendar_sync.get_valid_access_token(conn)
             await calendar_sync.delete_calendar(conn.calendar_id, access_token)

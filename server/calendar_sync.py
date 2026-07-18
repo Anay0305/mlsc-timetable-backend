@@ -295,11 +295,33 @@ def _next_occurrence_of_weekday(weekday_idx: int) -> date:
     return today + timedelta(days=days_ahead)
 
 
+def _first_occurrence_on_or_after(weekday_idx: int, from_date: date) -> date:
+    """Return the first date >= from_date that falls on weekday_idx (0=Mon)."""
+    days_ahead = weekday_idx - from_date.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    return from_date + timedelta(days=days_ahead)
+
+
+# Google Calendar colorId by class type.
+_TYPE_COLOR: dict[str, str] = {
+    "lecture":   "7",  # Peacock (teal)
+    "tutorial":  "2",  # Sage (green)
+    "practical": "6",  # Tangerine (orange)
+}
+
+
+def _color_for_type(class_type: str) -> str | None:
+    return _TYPE_COLOR.get((class_type or "").lower())
+
+
 def _build_base_event(
     batch: str,
     entry: dict,
     term_end_date: str,
     exdates_by_byday: dict[str, list[str]],
+    *,
+    term_start_date: str | None = None,
 ) -> dict | None:
     day = entry.get("day", "")
     byday = _day_to_byday(day)
@@ -312,8 +334,16 @@ def _build_base_event(
     start_hms = _parse_time(start_time_str)
     end_hms = _parse_time(end_time_str)
 
-    event_date = _next_occurrence_of_weekday(weekday_idx)
-    event_date_str = event_date.strftime("%Y-%m-%d")
+    # Use term start date so the recurring event covers the full semester,
+    # not just "next week onwards".
+    if term_start_date:
+        try:
+            anchor = _first_occurrence_on_or_after(weekday_idx, date.fromisoformat(term_start_date))
+        except ValueError:
+            anchor = _next_occurrence_of_weekday(weekday_idx)
+    else:
+        anchor = _next_occurrence_of_weekday(weekday_idx)
+    event_date_str = anchor.strftime("%Y-%m-%d")
     until = term_end_date.replace("-", "") + "T000000Z"
 
     subject = entry.get("subject") or entry.get("code") or "Class"
@@ -334,7 +364,7 @@ def _build_base_event(
         )
 
     slot_id = compute_slot_id(batch, day, start_time_str, code, room)
-    return {
+    event: dict = {
         "summary": summary,
         "start": {"dateTime": f"{event_date_str}T{start_hms}", "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": f"{event_date_str}T{end_hms}", "timeZone": "Asia/Kolkata"},
@@ -349,6 +379,10 @@ def _build_base_event(
         },
         "_slot_id": slot_id,
     }
+    color = _color_for_type(class_type)
+    if color:
+        event["colorId"] = color
+    return event
 
 
 def _build_oneoff_event(
@@ -376,7 +410,7 @@ def _build_oneoff_event(
     slot_id = compute_slot_id(
         batch, f"shift:{override_date}", start_time_str, code, room
     )
-    return {
+    event: dict = {
         "summary": f"[Rescheduled] {summary}",
         "start": {"dateTime": f"{override_date}T{start_hms}", "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": f"{override_date}T{end_hms}", "timeZone": "Asia/Kolkata"},
@@ -391,6 +425,10 @@ def _build_oneoff_event(
         },
         "_slot_id": slot_id,
     }
+    color = _color_for_type(class_type)
+    if color:
+        event["colorId"] = color
+    return event
 
 
 def _build_allday_event(
@@ -422,7 +460,13 @@ def _build_allday_event(
 # ── Core sync algorithm ───────────────────────────────────────────────
 
 async def _ensure_calendar(conn: CalendarConnectionDoc, access_token: str) -> str:
-    """Return calendar_id, creating a new one if it doesn't exist or was deleted."""
+    """Return calendar_id, reusing an existing 'MLSC Timetable' calendar if found.
+
+    Lookup priority:
+    1. Stored ``calendar_id`` — verify it still exists on Google.
+    2. Scan the user's calendar list for a calendar named 'MLSC Timetable'.
+    3. Create a fresh calendar.
+    """
     if conn.calendar_id:
         try:
             result = await _gcal(
@@ -435,7 +479,20 @@ async def _ensure_calendar(conn: CalendarConnectionDoc, access_token: str) -> st
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code != 404:
                 raise
-        # 404 — calendar was deleted externally; fall through to create
+        # 404 — calendar was deleted externally; fall through
+
+    # Scan the user's calendar list to reuse any existing 'MLSC Timetable'
+    # calendar (prevents duplicates if the user reconnects or the stored ID
+    # was wiped without the underlying Google calendar being deleted).
+    try:
+        cal_list = await _gcal("GET", "/users/me/calendarList", access_token=access_token)
+        for cal in (cal_list or {}).get("items", []):
+            if cal.get("summary") == "MLSC Timetable":
+                cal_id = cal["id"]
+                await calendar_storage.update_after_sync(conn.user_id, calendar_id=cal_id)
+                return cal_id
+    except Exception:
+        pass  # Best-effort scan; fall through to create
 
     cal_id = await create_calendar(access_token)
     await calendar_storage.update_after_sync(conn.user_id, calendar_id=cal_id)
@@ -467,6 +524,29 @@ def _semester_fallback_date(label: str) -> str:
     return f"{today.year}-05-31" if is_even else f"{today.year}-12-31"
 
 
+def _semester_start_fallback(label: str) -> str:
+    """Derive a sensible RRULE DTSTART from the semester label.
+
+    ``"ODD 25-26"``  → odd sem starts ~Aug → ``2025-08-01``
+    ``"EVEN 25-26"`` → even sem starts ~Jan → ``2026-01-01``
+    Falls back to a date six months ago if the label can't be parsed.
+    """
+    label = (label or "").upper()
+    is_even = label.startswith("EVEN")
+    m = _LABEL_YEAR_RE.search(label)
+    if m:
+        y1, y2 = int(m.group(1)), int(m.group(2))
+        if y1 < 100:
+            y1 += 2000
+        if y2 < 100:
+            y2 += 2000
+        sem_year = y2 if is_even else y1
+        return f"{sem_year}-01-01" if is_even else f"{sem_year}-08-01"
+    today = date.today()
+    fallback = today - timedelta(days=180)
+    return fallback.strftime("%Y-%m-%d")
+
+
 async def full_sync_user(user_id: str, *, force: bool = False) -> None:
     """Full re-sync: wipe all events in the MLSC calendar, recreate from timetable + overrides.
 
@@ -483,23 +563,28 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
 
     settings = get_settings()
     # Resolve term end date: DB year-keyed dict → env var → semester-aware fallback.
+    # Resolve term start date: DB year-keyed dict → semester-aware fallback.
     try:
         current_doc = await main_storage.read_current()
         term_end_dates = current_doc.get("term_end_dates") or {}
+        term_start_dates = current_doc.get("term_start_dates") or {}
         # Batch code like "1B14" → year "1"; PG codes that start with letters → "1"
         batch_year = str((conn.batch_code or "1")[0]) if (conn.batch_code or "1")[0].isdigit() else "1"
         # Smart fallback: parse semester label → derive the actual semester year + parity.
-        #   "ODD 25-26"  → odd,  semester year 2025 → fallback 2025-12-31
-        #   "EVEN 25-26" → even, semester year 2026 → fallback 2026-05-31
+        #   "ODD 25-26"  → odd,  semester year 2025 → fallback 2025-12-31 / 2025-08-01
+        #   "EVEN 25-26" → even, semester year 2026 → fallback 2026-05-31 / 2026-01-01
         label = (current_doc.get("label") or "").upper()
-        sem_fallback = _semester_fallback_date(label)
+        sem_fallback_end = _semester_fallback_date(label)
+        sem_fallback_start = _semester_start_fallback(label)
         term_end = (
             term_end_dates.get(batch_year)
             or settings.calendar_term_end_date
-            or sem_fallback
+            or sem_fallback_end
         )
+        term_start = term_start_dates.get(batch_year) or sem_fallback_start
     except Exception:
         term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"
+        term_start = None
 
     try:
         access_token = await get_valid_access_token(conn)
@@ -570,7 +655,7 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
     # ── Pass 2: Build base recurring events ────────────────────────────
     events_to_create: list[dict] = []
     for entry in classes:
-        event = _build_base_event(batch, entry, term_end, exdates_by_byday)
+        event = _build_base_event(batch, entry, term_end, exdates_by_byday, term_start_date=term_start)
         if event is not None:
             events_to_create.append(event)
 

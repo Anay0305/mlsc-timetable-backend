@@ -10,3 +10,4 @@ pyjwt[crypto]>=2.8
 cryptography>=42
 google-auth-oauthlib>=1.2
 pymongo>=4.8
+pdfplumber>=0.11

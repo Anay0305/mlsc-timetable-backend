@@ -16,6 +16,7 @@ dependencies = [
     "cryptography>=42",
     "google-auth-oauthlib>=1.2",
     "pymongo>=4.8",
+    "pdfplumber>=0.11",
 ]
 
 [project.scripts]

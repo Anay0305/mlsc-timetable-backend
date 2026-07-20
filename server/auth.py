@@ -130,20 +130,33 @@ async def require_admin(
     )
 
 
-# ── User identity (v1: client-managed opaque id via X-User-Id) ──────────────
-def require_user_id(x_user_id: str | None = Header(default=None, alias="X-User-Id")) -> str:
-    """Return the caller's opaque user id from the `X-User-Id` header.
+# ── User identity (v1: Clerk JWT when available, fallback to X-User-Id) ─────
+async def require_user_id(
+    authorization: str | None = Header(default=None),
+    x_user_id: str | None = Header(default=None, alias="X-User-Id"),
+) -> str:
+    """Return the user ID from either a Clerk JWT token or the `X-User-Id` header.
 
-    Until real auth lands the client just persists a UUID in localStorage and
-    sends it on every request. The dependency raises 400 if the header is
-    missing or malformed (no auto-mint here — the caller controls identity).
+    If an `Authorization: Bearer <token>` header is present and validly signed
+    by Clerk, the `sub` claim (Clerk User ID) is returned. Otherwise, falls back
+    to the opaque `X-User-Id` header (validating 4–64 chars).
     """
-    if not x_user_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": "Missing X-User-Id header", "code": "missing_user_id"},
-        )
-    if not USER_ID_PATTERN.match(x_user_id):
+    from server import clerk_jwt
+
+    if authorization and authorization.startswith("Bearer "):
+        token = authorization.removeprefix("Bearer ").strip()
+        if clerk_jwt.is_clerk_configured():
+            try:
+                claims = clerk_jwt.verify_clerk_jwt(token)
+                sub = claims.get("sub")
+                if sub:
+                    return str(sub)
+            except clerk_jwt.ClerkJWTError as exc:
+                logger.debug("require_user_id: Clerk JWT verification failed: %s", exc)
+
+    if x_user_id:
+        if USER_ID_PATTERN.match(x_user_id):
+            return x_user_id
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
@@ -151,7 +164,11 @@ def require_user_id(x_user_id: str | None = Header(default=None, alias="X-User-I
                 "code": "invalid_user_id",
             },
         )
-    return x_user_id
+
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail={"error": "Missing authorization token or X-User-Id header", "code": "missing_user_id"},
+    )
 
 
 # ── Clerk user identity (for calendar endpoints) ──────────────────────────

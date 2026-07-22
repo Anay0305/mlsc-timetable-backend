@@ -722,7 +722,7 @@ async def _run_sync_job(job_doc: dict) -> None:
     user_id = job_doc.get("user_id", "")
     job_id = str(job_doc.get("_id", ""))
 
-    coll = CalendarSyncJobDoc.get_pymongo_collection()
+    coll = CalendarSyncJobDoc.get_motor_collection()
 
     await coll.update_one(
         {"_id": job_doc["_id"]},
@@ -783,7 +783,7 @@ async def calendar_worker() -> None:
     Uses find_one_and_update for per-user locking (SKIP LOCKED semantics).
     Started once in app lifespan.
     """
-    coll = CalendarSyncJobDoc.get_pymongo_collection()
+    coll = CalendarSyncJobDoc.get_motor_collection()
     running_users: set[str] = set()
 
     logger.info("calendar_sync: worker started")

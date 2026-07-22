@@ -598,7 +598,7 @@ async def check_baseline_group(
     # idempotent — stale rows from a previous ingest or check are cleared.
     stale_types = ["BASELINE_MISMATCH", "BASELINE_MISSING", "doctor_mismatch"]
     batch_codes = list(counts_by_batch.keys())
-    coll = ParsingErrorDoc.get_pymongo_collection()
+    coll = ParsingErrorDoc.get_motor_collection()
     del_res = await coll.delete_many({
         "error_type": {"$in": stale_types},
         "status": "open",
@@ -1424,7 +1424,7 @@ async def list_upload_attempts(
     # trips even when the caller asks for 500 uploads.
     upload_ids = [row["id"] for row in out if row.get("id")]
     if upload_ids:
-        coll = ParsingErrorDoc.get_pymongo_collection()
+        coll = ParsingErrorDoc.get_motor_collection()
 
         stats_by_status: dict[str, dict[str, int]] = {}
         status_cursor = coll.aggregate([
@@ -2833,13 +2833,13 @@ async def delete_calendar_overrides_in_range(
     # Beanie's find() accepts a Motor filter dict via `find({"$and":[...]})`
     # or via find_all with `.aggregate([{"$match": ...}])`. Simplest: use
     # the raw Motor collection.
-    cursor = CalendarOverrideDoc.get_pymongo_collection().find(query)
+    cursor = CalendarOverrideDoc.get_motor_collection().find(query)
     ids: list[Any] = []
     async for doc in cursor:
         ids.append(doc["_id"])
     if not ids:
         return 0
-    result = await CalendarOverrideDoc.get_pymongo_collection().delete_many(
+    result = await CalendarOverrideDoc.get_motor_collection().delete_many(
         {"_id": {"$in": ids}},
     )
     return int(result.deleted_count or 0)

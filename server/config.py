@@ -7,7 +7,14 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+
+# Load the backend-local `.env` for direct `uvicorn server.app:app` runs.
+# Existing process environment variables still win, which keeps deployment
+# configuration and `uvicorn --env-file` behavior unchanged.
+load_dotenv(_REPO_ROOT / ".env")
 
 
 @dataclass(frozen=True)
@@ -37,7 +44,7 @@ def get_settings() -> Settings:
     data_dir = Path(os.environ.get("DATA_DIR", _REPO_ROOT / "data")).resolve()
     raw_origins = os.environ.get("CORS_ORIGINS", "http://localhost:5173")
     cors_origins = tuple(origin.strip() for origin in raw_origins.split(",") if origin.strip())
-    admin_token = os.environ.get("ADMIN_TOKEN", "ANAY")
+    admin_token = (os.environ.get("ADMIN_TOKEN") or "").strip() or None
     raw_admin_emails = os.environ.get("ADMIN_EMAILS", "")
     admin_emails = frozenset(
         email.strip().lower() for email in raw_admin_emails.split(",") if email.strip()

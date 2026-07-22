@@ -76,6 +76,14 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
+    # Rate limiting (slowapi). The limiter instance lives in server.rate_limit
+    # so individual routers can decorate handlers with @limiter.limit(...).
+    app.state.limiter = limiter
+    app.add_middleware(SlowAPIMiddleware)
+
+    # Keep CORS outside the rate-limit middleware so even error responses from
+    # the API retain CORS headers. Otherwise browsers hide the real 500 and
+    # report it as a misleading cross-origin failure.
     app.add_middleware(
         CORSMiddleware,
         allow_origins=list(settings.cors_origins),
@@ -83,11 +91,6 @@ def create_app() -> FastAPI:
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "X-User-Id"],
     )
-
-    # Rate limiting (slowapi). The limiter instance lives in server.rate_limit
-    # so individual routers can decorate handlers with @limiter.limit(...).
-    app.state.limiter = limiter
-    app.add_middleware(SlowAPIMiddleware)
 
     @app.exception_handler(RateLimitExceeded)
     async def _handle_rate_limit(_: Request, exc: RateLimitExceeded) -> JSONResponse:

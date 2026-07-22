@@ -102,6 +102,20 @@ def create_app() -> FastAPI:
             },
         )
 
+    @app.exception_handler(Exception)
+    async def _handle_unexpected_error(_: Request, exc: Exception) -> JSONResponse:
+        # Convert route-level crashes into normal responses so the outer CORS
+        # middleware can attach headers and clients can see a real 500 instead
+        # of a misleading browser-level CORS error.
+        logging.getLogger("server.app").exception("Unhandled API error", exc_info=exc)
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Internal server error",
+                "code": "internal_error",
+            },
+        )
+
     @app.get("/healthz")
     def healthz() -> dict[str, object]:
         return {"ok": True}

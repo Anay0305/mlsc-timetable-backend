@@ -1,9 +1,7 @@
 """Public reads for announcements and exam dates.
 
-Both endpoints are Mongo-backed (``AnnouncementDoc`` / ``ExamDateDoc``). On
-the first read against an empty collection the storage layer seeds the
-canonical JSON from ``assets/`` so the public sidebar feeds keep working
-during the JSON → Mongo cutover with no manual reimport.
+Both endpoints are Mongo-backed (``AnnouncementDoc`` / ``ExamDateDoc``) and
+return only rows explicitly created through the admin API.
 
 ``GET /exam-dates`` accepts an optional ``?batch=<code>`` query: when set,
 results are filtered to exams whose ``target_year`` matches the batch's

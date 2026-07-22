@@ -2264,9 +2264,8 @@ async def normalize_all_timetables() -> dict[str, int]:
 
 
 # ── Announcements + exam dates ───────────────────────────────────────────
-# Both collections seed once from the curated JSON under ``assets/`` the
-# first time they're read empty, so the public sidebar feeds keep working
-# during the JSON → Mongo cutover without manual reimport.
+# These collections are managed explicitly through the admin API. They are
+# intentionally not seeded from bundled files on startup or first read.
 
 _ASSETS_DIR = Path(__file__).resolve().parents[1] / "assets"
 _ALLOWED_SEVERITY = {"info", "warn", "critical"}
@@ -2313,88 +2312,7 @@ def _exam_payload(doc: ExamDateDoc) -> dict[str, Any]:
     }
 
 
-async def _seed_announcements_if_empty() -> None:
-    if await AnnouncementDoc.find_all().count() > 0:
-        return
-    path = _ASSETS_DIR / "announcements.json"
-    if not path.exists():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("announcement seed skipped: %s", exc)
-        return
-    if not isinstance(data, list):
-        return
-    docs: list[AnnouncementDoc] = []
-    for raw in data:
-        if not isinstance(raw, dict):
-            continue
-        title = str(raw.get("title") or "").strip()
-        body = str(raw.get("body") or "").strip()
-        if not title or not body:
-            continue
-        severity = str(raw.get("severity") or "info").strip().lower()
-        if severity not in _ALLOWED_SEVERITY:
-            severity = "info"
-        try:
-            posted_at = _parse_iso_dt(raw.get("posted_at") or datetime.now(timezone.utc))
-        except ValueError:
-            posted_at = datetime.now(timezone.utc)
-        link = raw.get("link")
-        if link is not None and not isinstance(link, str):
-            link = None
-        docs.append(
-            AnnouncementDoc(
-                title=title,
-                body=body,
-                severity=severity,
-                posted_at=posted_at,
-                link=link or None,
-            )
-        )
-    if docs:
-        await AnnouncementDoc.insert_many(docs)
-
-
-async def _seed_exam_dates_if_empty() -> None:
-    if await ExamDateDoc.find_all().count() > 0:
-        return
-    path = _ASSETS_DIR / "exam_dates.json"
-    if not path.exists():
-        return
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("exam-dates seed skipped: %s", exc)
-        return
-    if not isinstance(data, list):
-        return
-    docs: list[ExamDateDoc] = []
-    for raw in data:
-        if not isinstance(raw, dict):
-            continue
-        subject = str(raw.get("subject") or "").strip()
-        code = str(raw.get("code") or "").strip().upper()
-        date = str(raw.get("date") or "").strip()
-        if not subject or not code or not date:
-            continue
-        docs.append(
-            ExamDateDoc(
-                subject=subject,
-                code=code,
-                date=date,
-                slot=(raw.get("slot") or None),
-                type=(raw.get("type") or None),
-                room=(raw.get("room") or None),
-            )
-        )
-    if docs:
-        await ExamDateDoc.insert_many(docs)
-
-
 async def list_announcements() -> list[dict[str, Any]]:
-    await _seed_announcements_if_empty()
     return [
         _announcement_payload(doc)
         async for doc in AnnouncementDoc.find_all(sort=[("posted_at", -1)])
@@ -2443,12 +2361,10 @@ async def delete_announcement(announcement_id: str) -> bool:
 
 
 async def reset_announcements() -> dict[str, int]:
-    """Delete every AnnouncementDoc then re-seed from the bundled JSON."""
+    """Delete every AnnouncementDoc without reseeding."""
     deleted = await AnnouncementDoc.find_all().delete()
     deleted_count = getattr(deleted, "deleted_count", 0) or 0
-    await _seed_announcements_if_empty()
-    seeded = await AnnouncementDoc.find_all().count()
-    return {"deleted": deleted_count, "seeded": seeded}
+    return {"deleted": deleted_count, "seeded": 0}
 
 
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
@@ -2466,8 +2382,6 @@ async def list_exam_dates(batch: str | None = None) -> list[dict[str, Any]]:
     the user still sees something useful. When no batch is supplied (e.g.
     the home page) every exam row is returned.
     """
-    await _seed_exam_dates_if_empty()
-
     subject_codes: set[str] | None = None
     user_year: int | None = None
     if batch:
@@ -2577,12 +2491,10 @@ async def delete_exam_date(exam_id: str) -> bool:
 
 
 async def reset_exam_dates() -> dict[str, int]:
-    """Delete every ExamDateDoc then re-seed from the bundled JSON."""
+    """Delete every ExamDateDoc without reseeding."""
     deleted = await ExamDateDoc.find_all().delete()
     deleted_count = getattr(deleted, "deleted_count", 0) or 0
-    await _seed_exam_dates_if_empty()
-    seeded = await ExamDateDoc.find_all().count()
-    return {"deleted": deleted_count, "seeded": seeded}
+    return {"deleted": deleted_count, "seeded": 0}
 
 
 # ── Calendar overrides ──────────────────────────────────────────────────

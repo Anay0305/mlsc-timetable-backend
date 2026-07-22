@@ -97,6 +97,10 @@ https://timetable.mlsctiet.com,https://www.timetable.mlsctiet.com
 `PORT` is injected by Cloud Run. Do not hard-code it in the deployment
 configuration.
 
+The production container reads timetable data from MongoDB. The local
+`data/` JSON mirror is intentionally not copied into the image because it is
+not tracked in the repository and Cloud Run's filesystem is ephemeral.
+
 For an existing service, update non-secret environment variables with:
 
 ```bash

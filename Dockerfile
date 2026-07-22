@@ -13,7 +13,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server ./server
 COPY timetable_parser ./timetable_parser
 COPY assets ./assets
-COPY data ./data
 
 EXPOSE 8080
 

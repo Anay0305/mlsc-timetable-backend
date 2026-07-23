@@ -8,7 +8,7 @@ support the per-user override flow without changing canonical reads.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Annotated, Literal, Optional
+from typing import Annotated, Any, Literal, Optional
 
 from beanie import Document, Indexed
 from pydantic import BaseModel, ConfigDict, Field

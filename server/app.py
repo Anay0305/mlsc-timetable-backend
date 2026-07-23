@@ -87,10 +87,10 @@ def create_app() -> FastAPI:
     # report it as a misleading cross-origin failure.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=list(settings.cors_origins),
+        allow_origins=["*"],
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-User-Id", "X-User-Email", "*"],
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
 
     @app.exception_handler(RateLimitExceeded)

@@ -12,6 +12,23 @@ CLASS_TYPE_BY_SUFFIX = {
     "P": "PRACTICAL",
 }
 
+# Free-text capstone cells ("CAPSTONE PROJECT", "CAPSTONE LECTURE", "CAPSTONE L")
+# carry no subject code; detect them so they parse as capstone blocks instead of
+# SUBJECT_CODE_NOT_DETECTED errors.
+CAPSTONE_PATTERN = re.compile(r"^CAPSTONE(PROJECT|LECTURE|L)?$")
+CAPSTONE_CODE = "CAPSTONE"
+CAPSTONE_NAME = "Capstone Project"
+
+
+def find_capstone_type(raw: list[str]) -> str | None:
+    """Return the class type of a capstone block, or None if not a capstone cell."""
+    for value in raw:
+        candidate = value.strip().upper().replace(" ", "")
+        match = CAPSTONE_PATTERN.fullmatch(candidate)
+        if match:
+            return "LECTURE" if match.group(1) in ("LECTURE", "L") else "UNKNOWN"
+    return None
+
 
 def find_subject_code(raw: list[str]) -> str | None:
     for value in raw:

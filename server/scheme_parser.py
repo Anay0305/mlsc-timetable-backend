@@ -53,6 +53,7 @@ class Course:
     T: str | None
     P: str | None
     Cr: str | None
+    alternate_weeks: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -68,6 +69,20 @@ def _norm(cell: Any) -> str:
     if cell is None:
         return ""
     return str(cell).replace("\n", " ").strip()
+
+
+def _clean_title(value: str) -> str:
+    """Normalize PDF shouting/callout markers without changing acronyms."""
+    value = re.sub(r"\s*\*+\s*", " ", value or "").strip()
+    if not value or value.isupper():
+        words = []
+        for word in value.split():
+            bare = word.strip("()",)
+            normalized = word if bare in {"AI", "API", "C++", "IoT", "UCS"} else word.lower().capitalize()
+            normalized = re.sub(r"-(i|ii|iii|iv|v|vi|vii|viii)$", lambda m: "-" + m.group(1).upper(), normalized, flags=re.I)
+            words.append(normalized)
+        return " ".join(words)
+    return value
 
 
 def _build_column_map(header_rows: list[list[Any]]) -> dict[str, list[int]]:
@@ -184,7 +199,7 @@ def _extract_courses_from_table(
 
         sn = pick_from(raw, "sn")
         code = pick_from(raw, "code")
-        title = pick_from(raw, "title")
+        title = _clean_title(pick_from(raw, "title"))
         category = pick_from(raw, "category")
         L, T, P, Cr = (pick_from(raw, k) for k in ("L", "T", "P", "Cr"))
 
@@ -199,7 +214,7 @@ def _extract_courses_from_table(
 
         if (is_pure_continuation or is_code_repeat) and courses:
             if title:
-                courses[-1].title = (courses[-1].title + " " + title).strip()
+                courses[-1].title = (courses[-1].title + " " + _clean_title(title)).strip()
             continue
 
         if not code:
@@ -212,12 +227,15 @@ def _extract_courses_from_table(
         if not (title or code):
             continue
 
+        alternate_weeks = [k for k, value in (("L", L), ("T", T), ("P", P), ("Cr", Cr))
+                           if value and "*" in value]
         courses.append(Course(
             sn=sn or None,
             code=code or None,
             title=title,
             category=category or None,
             L=L or None, T=T or None, P=P or None, Cr=Cr or None,
+            alternate_weeks=alternate_weeks,
         ))
     return courses, printed_totals
 

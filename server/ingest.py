@@ -153,6 +153,9 @@ async def parse_workbook(
         confidence_summary, error_rows = _summarize_blocks(merged, sheet_by_code)
 
         payloads = class_blocks_to_api(merged, semester_label)
+        auto_alternates = await storage.apply_baseline_alternate_weeks(payloads, semester_label)
+        if auto_alternates:
+            logger.info("Applied %d baseline alternate-week markers", auto_alternates)
         batches = sorted(merged.keys())
 
         # Snapshot the current state BEFORE we mutate anything, so a rollback

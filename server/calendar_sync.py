@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import re
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
@@ -76,8 +77,9 @@ async def _refresh_access_token(refresh_token_plain: str) -> tuple[str, datetime
             body = resp.json()
         except Exception:
             body = {}
-        if body.get("error") == "invalid_grant":
-            raise InvalidGrantError("Refresh token revoked or expired")
+        error = body.get("error") or "oauth_token_refresh_failed"
+        description = body.get("error_description") or "Google rejected the stored refresh token"
+        raise InvalidGrantError(f"{error}: {description}")
     resp.raise_for_status()
     data = resp.json()
     expires_in = int(data.get("expires_in", 3600))
@@ -315,6 +317,134 @@ def _color_for_type(class_type: str) -> str | None:
     return _TYPE_COLOR.get((class_type or "").lower())
 
 
+def _build_description(entry: dict) -> str:
+    """Build the event description carrying the details we don't want in the
+    title — the subject code (so it's still searchable/visible), class type,
+    teacher, and any elective options. The title shows the human-readable
+    course name; this is the "hidden" companion metadata.
+    """
+    lines: list[str] = []
+    code = (entry.get("code") or "").strip()
+    if code:
+        lines.append(f"Code: {code}")
+    ctype = (entry.get("type") or "").strip()
+    if ctype and ctype.lower() != "unknown":
+        lines.append(f"Type: {ctype}")
+    teacher = (entry.get("teacher") or "").strip()
+    if teacher:
+        lines.append(f"Teacher: {teacher}")
+
+    opts = entry.get("options")
+    if isinstance(opts, list) and opts:
+        lines.append("Options:")
+        for o in opts:
+            if not isinstance(o, dict):
+                continue
+            oc = (o.get("subject_code") or "").strip()
+            on = (o.get("subject_name") or "").strip()
+            op = (o.get("place") or "").strip()
+            ot = (o.get("teacher") or "").strip()
+            label = on or oc or "?"
+            extras = [x for x in [oc if (on and oc) else None, op, ot] if x]
+            piece = label + (f" ({', '.join(extras)})" if extras else "")
+            lines.append(f"  • {piece}")
+    return "\n".join(lines)
+
+
+_SUBJECT_CODE_RE = re.compile(r"^U[A-Z]{2,4}\d{3,4}[LTP]?$", re.I)
+
+
+def _course_name(entry: dict, catalog: Any = None) -> str:
+    """Resolve a timetable entry to a name, never treating a code as a name."""
+    code = str(entry.get("code") or "").strip()
+    stored = str(entry.get("subject") or "").strip()
+    if stored and not _SUBJECT_CODE_RE.fullmatch(stored):
+        return stored
+    if code and catalog is not None:
+        name = catalog.name_for(code)
+        if name:
+            return name
+    try:
+        from timetable_parser.core.subject_catalog import SubjectCatalog
+        fallback = SubjectCatalog.load_from_file()
+        name = fallback.name_for(code)
+        if name:
+            return name
+    except Exception:
+        pass
+    return code or stored or "Class"
+
+
+# ── Idempotent-reconcile helpers ──────────────────────────────────────
+# A synced event is uniquely identified by its ``mlscSlotId`` (stored in
+# extendedProperties). To decide whether an already-present event still
+# matches what we would create, we compare a normalized signature of the
+# visible fields. Google echoes start/end dateTimes back *with* a timezone
+# offset (e.g. ``...T09:00:00+05:30``) whereas we send them without one, so
+# we normalize to the first 19 chars (local ``YYYY-MM-DDTHH:MM:SS``).
+
+def _slot_id_of(ev: dict) -> str | None:
+    return (
+        (ev.get("extendedProperties") or {})
+        .get("private", {})
+        .get("mlscSlotId")
+    )
+
+
+def _norm_dt(obj: dict | None) -> tuple:
+    if not obj:
+        return ()
+    if obj.get("date"):
+        return ("date", obj["date"])
+    dt = str(obj.get("dateTime", ""))
+    return ("dateTime", dt[:19], obj.get("timeZone", ""))
+
+
+def _norm_recurrence(rules: list[str] | None) -> tuple:
+    """Normalize a recurrence array for comparison.
+
+    Google may echo an RRULE back with its ``KEY=VALUE`` parts reordered or
+    re-cased relative to what we sent, so we canonicalize each line: uppercase,
+    drop the ``RRULE:``/``EXDATE`` type prefix into a tag, and sort the parts.
+    This keeps unchanged events from being needlessly recreated every sync.
+    """
+    out: list[tuple] = []
+    for raw in rules or []:
+        line = str(raw).strip().upper()
+        if not line:
+            continue
+        tag, _, rest = line.partition(":")
+        # EXDATE lines carry a TZID param in the tag half (EXDATE;TZID=...).
+        parts = tuple(sorted(p for p in rest.replace(";", ",").split(",") if p))
+        out.append((tag, parts))
+    return tuple(sorted(out))
+
+
+def _event_signature(ev: dict) -> tuple:
+    """Order-independent signature of the fields that define an event's
+    visible content. Works for both our desired events and Google's echoed
+    events because both use the same schema.
+    """
+    return (
+        ev.get("summary", "") or "",
+        ev.get("description", "") or "",
+        ev.get("colorId", "") or "",
+        _norm_dt(ev.get("start")),
+        _norm_dt(ev.get("end")),
+        _norm_recurrence(ev.get("recurrence")),
+    )
+
+
+def _event_duplicate_key(ev: dict) -> tuple:
+    """Identify visually duplicated event instances, including legacy events
+    that predate ``mlscSlotId`` or were created during a concurrent sync."""
+    return (
+        ev.get("summary", "") or "",
+        _norm_dt(ev.get("start")),
+        _norm_dt(ev.get("end")),
+    )
+
+
 def _build_base_event(
     batch: str,
     entry: dict,
@@ -322,6 +452,8 @@ def _build_base_event(
     exdates_by_byday: dict[str, list[str]],
     *,
     term_start_date: str | None = None,
+    catalog: Any = None,
+    alternate_week_start: int | None = None,
 ) -> dict | None:
     day = entry.get("day", "")
     byday = _day_to_byday(day)
@@ -346,15 +478,21 @@ def _build_base_event(
     event_date_str = anchor.strftime("%Y-%m-%d")
     until = term_end_date.replace("-", "") + "T000000Z"
 
-    subject = entry.get("subject") or entry.get("code") or "Class"
+    is_elective_group = len(entry.get("options") or []) > 1 and not entry.get("electiveChoice")
     code = entry.get("code") or ""
+    # Prefer the human-readable name: stored ``subject`` → catalog lookup by
+    # code → the raw code as a last resort. Names are stripped on write and
+    # resolved on read elsewhere, so without the catalog fill this path would
+    # otherwise show bare codes.
+    subject = "Elective" if is_elective_group else _course_name(entry, catalog)
     room = entry.get("room") or ""
-    class_type = entry.get("type", "")
+    class_type = "" if is_elective_group else entry.get("type", "")
 
     summary_parts = [subject]
     if room:
         summary_parts.append(f"({room})")
     summary = " ".join(summary_parts)
+    description = _build_description({**entry, "code": code})
 
     recurrence = [f"RRULE:FREQ=WEEKLY;BYDAY={byday};UNTIL={until}"]
     for exdate in exdates_by_byday.get(byday, []):
@@ -362,10 +500,27 @@ def _build_base_event(
         recurrence.append(
             f"EXDATE;TZID=Asia/Kolkata:{exdate.replace('-', '')}T{time_compact}"
         )
+    if alternate_week_start in (1, 2) and term_start_date:
+        try:
+            term_date = date.fromisoformat(term_start_date)
+            first = _first_occurrence_on_or_after(weekday_idx, term_date)
+            cursor = first
+            week_number = 1
+            while cursor <= date.fromisoformat(term_end_date):
+                if week_number % 2 != alternate_week_start % 2:
+                    time_compact = start_hms.replace(":", "")
+                    recurrence.append(
+                        f"EXDATE;TZID=Asia/Kolkata:{cursor.strftime('%Y%m%d')}T{time_compact}"
+                    )
+                cursor += timedelta(days=7)
+                week_number += 1
+        except ValueError:
+            pass
 
     slot_id = compute_slot_id(batch, day, start_time_str, code, room)
     event: dict = {
         "summary": summary,
+        "description": description,
         "start": {"dateTime": f"{event_date_str}T{start_hms}", "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": f"{event_date_str}T{end_hms}", "timeZone": "Asia/Kolkata"},
         "recurrence": recurrence,
@@ -390,6 +545,8 @@ def _build_oneoff_event(
     override_date: str,
     source_entry: dict,
     override_id: str,
+    *,
+    catalog: Any = None,
 ) -> dict:
     """Build a one-off event for a follow_day override (substitute schedule)."""
     start_time_str = source_entry.get("start_time", "")
@@ -397,21 +554,23 @@ def _build_oneoff_event(
     start_hms = _parse_time(start_time_str)
     end_hms = _parse_time(end_time_str)
 
-    subject = source_entry.get("subject") or source_entry.get("code") or "Class"
-    room = source_entry.get("room") or ""
     code = source_entry.get("code") or ""
+    subject = _course_name(source_entry, catalog)
+    room = source_entry.get("room") or ""
     class_type = source_entry.get("type", "")
 
     summary_parts = [subject]
     if room:
         summary_parts.append(f"({room})")
     summary = " ".join(summary_parts)
+    description = _build_description({**source_entry, "code": code})
 
     slot_id = compute_slot_id(
         batch, f"shift:{override_date}", start_time_str, code, room
     )
     event: dict = {
         "summary": f"[Rescheduled] {summary}",
+        "description": description,
         "start": {"dateTime": f"{override_date}T{start_hms}", "timeZone": "Asia/Kolkata"},
         "end": {"dateTime": f"{override_date}T{end_hms}", "timeZone": "Asia/Kolkata"},
         "reminders": {"useDefault": False, "overrides": []},
@@ -552,7 +711,7 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
 
     When ``force=True`` (manual trigger), runs even if auto-sync is disabled.
     """
-    from server.db.models import TimetableDoc
+    from server.db.models import OverrideDoc, TimetableDoc
     from server import storage as main_storage
 
     conn = await calendar_storage.get_connection(user_id)
@@ -607,6 +766,39 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
         c.model_dump() if hasattr(c, "model_dump") else dict(c)
         for c in (tt.classes or [])
     ]
+    user_overrides = await OverrideDoc.find_one(
+        OverrideDoc.user_id == user_id,
+        OverrideDoc.batch == batch,
+    )
+    if user_overrides is not None:
+        by_slot = user_overrides.entries or {}
+        merged_classes: list[dict] = []
+        for entry in classes:
+            override = by_slot.get(f"{entry.get('day', '')}|{entry.get('start_time', '')}")
+            if override is not None:
+                if override.kind == "delete" or override.entry is None:
+                    continue
+                merged_classes.append(override.entry.model_dump(exclude_none=False))
+            else:
+                merged_classes.append(entry)
+        for key, override in by_slot.items():
+            if override.kind == "add" and override.entry is not None:
+                merged_classes.append(override.entry.model_dump(exclude_none=False))
+        classes = merged_classes
+
+    # Subject names are stripped on write and resolved on read; the calendar
+    # path must resolve them too so events show course names, not bare codes.
+    from timetable_parser.core.subject_catalog import ensure_catalog
+    try:
+        catalog = await ensure_catalog()
+    except Exception:
+        catalog = None
+    if catalog is not None and not catalog.subjects:
+        try:
+            from timetable_parser.core.subject_catalog import SubjectCatalog
+            catalog = SubjectCatalog.load_from_file()
+        except Exception:
+            pass
 
     # Get all calendar overrides scoped to this batch
     overrides = await main_storage.list_calendar_overrides(batch=batch)
@@ -616,11 +808,13 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
     exdates_by_byday: dict[str, list[str]] = {}  # "MO" -> ["2026-08-15"]
     follow_day_overrides: list[dict] = []
     allday_overrides: list[dict] = []
+    holiday_dates: set[str] = set()
 
     for ov in overrides:
         kind = ov.get("kind", "")
         ov_date = ov.get("date", "")
         if kind == "holiday":
+            holiday_dates.add(ov_date)
             try:
                 d = date.fromisoformat(ov_date)
                 wd = d.weekday()
@@ -655,7 +849,11 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
     # ── Pass 2: Build base recurring events ────────────────────────────
     events_to_create: list[dict] = []
     for entry in classes:
-        event = _build_base_event(batch, entry, term_end, exdates_by_byday, term_start_date=term_start)
+        event = _build_base_event(
+            batch, entry, term_end, exdates_by_byday,
+            term_start_date=term_start, catalog=catalog,
+            alternate_week_start=entry.get("alternate_week_start"),
+        )
         if event is not None:
             events_to_create.append(event)
 
@@ -669,28 +867,85 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
 
     for ov in follow_day_overrides:
         ov_date = ov.get("date", "")
+        if ov_date in holiday_dates:
+            # A holiday always wins over a compensating/follow-day rule.
+            continue
         follows_day = ov.get("follows_day")
         ov_id = str(ov.get("id", ""))
         if not isinstance(follows_day, int) or not (0 <= follows_day <= 4):
             continue
         for src_entry in classes_by_weekday.get(follows_day, []):
             events_to_create.append(
-                _build_oneoff_event(batch, ov_date, src_entry, ov_id)
+                _build_oneoff_event(batch, ov_date, src_entry, ov_id, catalog=catalog)
             )
 
     # ── Pass 4: All-day exam-period events ────────────────────────────
     for ov in allday_overrides:
         events_to_create.append(_build_allday_event(batch, ov))
 
-    # ── Execute: wipe then repopulate ─────────────────────────────────
+    # ── Execute: reconcile (keep matching, delete stale, create missing) ──
+    # A plain wipe-then-recreate double-books the calendar on re-sync:
+    # deletions are best-effort and Google doesn't reliably remove a recurring
+    # series before the recreate lands, so the old tiles linger next to the new
+    # ones. Instead we diff by the stable ``mlscSlotId`` each event carries and
+    # only touch what actually changed.
     try:
         existing_events = await _list_all_events(calendar_id, access_token)
-        existing_ids = [e["id"] for e in existing_events if e.get("id")]
-        if existing_ids:
-            await _delete_events_batch(calendar_id, access_token, existing_ids)
-        await calendar_storage.clear_event_maps(user_id)
 
-        await _create_events_batch(calendar_id, access_token, events_to_create)
+        # Index existing events by slot_id. If Google somehow holds two events
+        # for the same slot (from a prior buggy wipe-and-recreate), keep the
+        # first and mark the rest for deletion so re-sync self-heals dupes.
+        existing_by_slot: dict[str, dict] = {}
+        stale_ids: list[str] = []
+        existing_by_visual_key: dict[tuple, str] = {}
+        for ev in existing_events:
+            eid = ev.get("id")
+            if not eid:
+                continue
+            slot = _slot_id_of(ev)
+            if not slot:
+                # Not one of ours (or legacy without the marker) — remove it so
+                # the MLSC calendar only ever contains events we manage.
+                stale_ids.append(eid)
+                continue
+            visual_key = _event_duplicate_key(ev)
+            if visual_key in existing_by_visual_key:
+                stale_ids.append(eid)
+                continue
+            existing_by_visual_key[visual_key] = eid
+            if slot in existing_by_slot:
+                stale_ids.append(eid)  # duplicate of a slot we already kept
+            else:
+                existing_by_slot[slot] = ev
+
+        desired_by_slot: dict[str, dict] = {}
+        for ev in events_to_create:
+            slot = ev.get("_slot_id")
+            if slot:
+                desired_by_slot[slot] = ev
+
+        # Delete events whose slot is no longer desired.
+        for slot, ev in existing_by_slot.items():
+            if slot not in desired_by_slot:
+                stale_ids.append(ev["id"])
+
+        # Create events whose slot is new, or whose content changed. When
+        # content changed we delete the old one and recreate (simplest way to
+        # fully replace recurrence/EXDATEs without patch edge-cases).
+        to_create: list[dict] = []
+        for slot, ev in desired_by_slot.items():
+            existing = existing_by_slot.get(slot)
+            if existing is None:
+                to_create.append(ev)
+            elif _event_signature(existing) != _event_signature(ev):
+                stale_ids.append(existing["id"])
+                to_create.append(ev)
+            # else: unchanged — leave the Google event exactly as-is.
+
+        if stale_ids:
+            await _delete_events_batch(calendar_id, access_token, stale_ids)
+        if to_create:
+            await _create_events_batch(calendar_id, access_token, to_create)
 
         await calendar_storage.update_after_sync(
             user_id,
@@ -698,10 +953,14 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
             last_error=None,
         )
         logger.info(
-            "calendar_sync: synced %d events for user %s (batch %s)",
-            len(events_to_create),
-            user_id,
+            "calendar_sync: reconciled batch %s for user %s "
+            "(desired=%d, created=%d, deleted=%d, unchanged=%d)",
             batch,
+            user_id,
+            len(desired_by_slot),
+            len(to_create),
+            len(stale_ids),
+            len(desired_by_slot) - len(to_create),
         )
     except Exception as exc:
         logger.exception("calendar_sync: sync failed for user %s", user_id)

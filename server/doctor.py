@@ -18,6 +18,7 @@ The same report is produced from two contexts:
 from __future__ import annotations
 
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -26,15 +27,21 @@ from typing import Any, Iterable, Mapping
 TOTAL_KEY = "total"
 
 
-def count_classes(classes: Iterable[Any]) -> dict[str, int]:
-    """Count classes by ``type`` plus a derived ``total``."""
+def count_classes(classes: Iterable[Any]) -> dict[str, Any]:
+    """Count classes by type, total, and subject-code/type."""
     counts: dict[str, int] = {}
+    course_counts: dict[str, dict[str, int]] = {}
     n = 0
     for c in classes:
         t = _entry_type(c)
         counts[t] = counts.get(t, 0) + 1
+        code = _base_code(_entry_code(c))
+        if code:
+            per_course = course_counts.setdefault(code, {})
+            per_course[t] = per_course.get(t, 0) + 1
         n += 1
     counts[TOTAL_KEY] = n
+    counts["_course_counts"] = course_counts
     return counts
 
 
@@ -44,11 +51,11 @@ def codes_in(classes: Iterable[Any]) -> set[str]:
     for c in classes:
         code = _entry_code(c)
         if code:
-            out.add(code.strip().upper())
+            out.add(_base_code(code))
         for opt in _entry_options(c):
             opt_code = _entry_code(opt)
             if opt_code:
-                out.add(opt_code.strip().upper())
+                out.add(_base_code(opt_code))
     return out
 
 
@@ -58,7 +65,7 @@ def build_doctor_report(
     baselines_by_group: Mapping[str, Mapping[str, int]] | None = None,
     semester_prefix: str | None = None,
     codes_by_batch: Mapping[str, Iterable[str]] | None = None,
-    courses_by_group: Mapping[str, Iterable[str]] | None = None,
+    courses_by_group: Mapping[str, Iterable[Any]] | None = None,
 ) -> dict[str, Any]:
     """Group `counts_by_batch` by ``code[:2]`` and compare each batch to its
     admin baseline.
@@ -81,9 +88,9 @@ def build_doctor_report(
         b: {c.strip().upper() for c in codes if c}
         for b, codes in (codes_by_batch or {}).items()
     }
-    courses_by_group_norm: dict[str, list[str]] = {
-        g: [c.strip().upper() for c in codes if c]
-        for g, codes in (courses_by_group or {}).items()
+    courses_by_group_norm: dict[str, list[Any]] = {
+        g: list(courses)
+        for g, courses in (courses_by_group or {}).items()
     }
 
     groups: dict[str, list[str]] = defaultdict(list)
@@ -146,6 +153,7 @@ def build_doctor_report(
             group,
             codes,
             codes_by_batch_norm,
+            counts_by_batch,
             courses_by_group_norm,
         )
         if course_check is not None:
@@ -267,45 +275,189 @@ def _build_course_check(
     group: str,
     batches: list[str],
     codes_by_batch: Mapping[str, set[str]],
-    courses_by_group: Mapping[str, list[str]],
+    counts_by_batch: Mapping[str, Mapping[str, int]],
+    courses_by_group: Mapping[str, list[Any]],
 ) -> dict[str, Any] | None:
-    """Compare each batch's observed subject codes against the group's expected
-    course roster. Returns None when no roster exists for the group.
-    """
-    expected = courses_by_group.get(group)
-    if not expected:
+    """Compare course presence and expected L/T/P occurrences per batch."""
+    raw_courses = courses_by_group.get(group)
+    if not raw_courses:
         return None
-    expected_set = set(expected)
+
+    expected_courses = _normalise_expected_courses(raw_courses)
+    if not expected_courses:
+        return None
+    expected_set = set(expected_courses)
     per_batch: dict[str, dict[str, list[str]]] = {}
+    detailed: dict[str, dict[str, Any]] = {}
     matching = 0
     for batch in batches:
         observed = codes_by_batch.get(batch, set())
         missing = sorted(expected_set - observed)
-        # "extra" = present in timetable but not in the expected roster. We
-        # intentionally do NOT flag electives here because their codes vary
-        # per student; the admin can still spot them in the extra list.
         extra = sorted(observed - expected_set)
         per_batch[batch] = {"missing": missing, "extra": extra}
-        if not missing:
+        actual_course_counts = _course_counts_for_batch(batch, counts_by_batch)
+        course_deltas: list[dict[str, Any]] = []
+        for code, course_info in expected_courses.items():
+            expected = course_info["counts"]
+            actual = actual_course_counts.get(code, {})
+            if not expected and not actual:
+                continue  # legacy code-only roster with no count data
+            types = sorted(set(expected) | set(actual))
+            deltas = {
+                type_name: int(actual.get(type_name, 0)) - int(expected.get(type_name, 0))
+                for type_name in types
+                if int(actual.get(type_name, 0)) != int(expected.get(type_name, 0))
+            }
+            if deltas:
+                course_deltas.append({
+                    "code": code,
+                    "title": course_info.get("title"),
+                    "expected": dict(expected),
+                    "actual": dict(actual),
+                    "deltas": deltas,
+                })
+        missing_details = [
+            {
+                "code": code,
+                "title": expected_courses[code].get("title"),
+                "expected": dict(expected_courses[code]["counts"]),
+                "actual": dict(actual_course_counts.get(code, {})),
+            }
+            for code in missing
+        ]
+        extra_details = [
+            {
+                "code": code,
+                "title": None,
+                "expected": {},
+                "actual": dict(actual_course_counts.get(code, {})),
+            }
+            for code in extra
+        ]
+        detailed[batch] = {
+            "missing": missing,
+            "extra": extra,
+            "missing_details": missing_details,
+            "extra_details": extra_details,
+            "actual_course_counts": actual_course_counts,
+            "course_deltas": course_deltas,
+        }
+        if not missing and not extra and not course_deltas:
             matching += 1
+
+    batches_with_missing = [
+        {"batch": batch, "missing": value["missing"], "course_details": value["missing_details"]}
+        for batch, value in detailed.items() if value["missing"]
+    ]
+    batches_with_extra = [
+        {"batch": batch, "extra": value["extra"], "course_details": value["extra_details"]}
+        for batch, value in detailed.items() if value["extra"]
+    ]
+    batches_with_count_drift = [
+        {"batch": batch, "course_deltas": value["course_deltas"]}
+        for batch, value in detailed.items() if value["course_deltas"]
+    ]
     return {
         "expected_codes": sorted(expected_set),
+        "expected_course_details": [
+            {"code": code, "title": info.get("title"), "expected": dict(info["counts"])}
+            for code, info in sorted(expected_courses.items())
+        ],
         "expected_count": len(expected_set),
         "per_batch": per_batch,
+        "per_batch_detail": detailed,
+        "batches_with_missing": batches_with_missing,
+        "batches_with_extra": batches_with_extra,
+        "batches_with_count_drift": batches_with_count_drift,
         "matching": matching,
         "batches": len(batches),
-        "has_drift": any(v["missing"] for v in per_batch.values()),
+        "has_drift": bool(batches_with_missing or batches_with_extra or batches_with_count_drift),
     }
 
 
+def _normalise_expected_courses(courses: Iterable[Any]) -> dict[str, dict[str, Any]]:
+    """Convert baseline course rows into ``base_code -> expected type counts``."""
+    result: dict[str, dict[str, int]] = {}
+    for course in courses:
+        if isinstance(course, str):
+            code = course
+            values = {}
+        elif isinstance(course, Mapping):
+            code = course.get("code")
+            values = course
+        else:
+            code = getattr(course, "code", None)
+            values = {
+                "L": getattr(course, "L", None),
+                "T": getattr(course, "T", None),
+                "P": getattr(course, "P", None),
+            }
+        base = _base_code(code)
+        if not base:
+            continue
+        expected_counts = {
+            type_name: _numeric_value(_course_field(values, letter, type_name))
+            for letter, type_name in (("L", "Lecture"), ("T", "Tutorial"), ("P", "Practical"))
+        }
+        expected_counts = {key: value for key, value in expected_counts.items() if value > 0}
+        result[base] = {
+            "title": values.get("title") if isinstance(values, Mapping) else None,
+            "counts": expected_counts,
+        }
+    return result
+
+
+def _course_counts_for_batch(
+    batch: str,
+    counts_by_batch: Mapping[str, Mapping[str, int]],
+) -> dict[str, dict[str, int]]:
+    """Read per-course counts attached to a batch by ``count_classes``."""
+    raw = counts_by_batch.get(batch, {})
+    value = raw.get("_course_counts", {}) if isinstance(raw, Mapping) else {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _numeric_value(value: Any) -> int:
+    if value is None:
+        return 0
+    numbers = re.findall(r"\d+(?:\.\d+)?", str(value))
+    try:
+        return int(sum(float(number) for number in numbers))
+    except ValueError:
+        return 0
+
+
+def _course_field(values: Mapping[str, Any], letter: str, type_name: str) -> Any:
+    """Read scheme columns despite Mongo/JSON/client casing differences."""
+    aliases = {
+        letter,
+        letter.lower(),
+        type_name,
+        type_name.lower(),
+        f"{type_name.lower()}s",
+    }
+    for key, value in values.items():
+        if str(key).strip().lower() in {alias.lower() for alias in aliases}:
+            return value
+    return None
+def _base_code(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    code = value.strip().upper()
+    return code[:-1] if code and code[-1] in "LTP" else code
+
+
 def _expand_baseline(baseline: Mapping[str, int]) -> dict[str, int]:
-    expected = {k: int(v) for k, v in baseline.items() if k != TOTAL_KEY}
+    expected = {
+        k: int(v) for k, v in baseline.items()
+        if k != TOTAL_KEY and not k.startswith("_")
+    }
     expected[TOTAL_KEY] = sum(expected.values())
     return expected
 
 
 def _diff_counts(actual: Mapping[str, int], expected: Mapping[str, int]) -> dict[str, int]:
-    types = set(actual) | set(expected)
+    types = (set(actual) | set(expected)) - {"_course_counts"}
     out: dict[str, int] = {}
     for t in types:
         a = int(actual.get(t, 0))
@@ -317,9 +469,9 @@ def _diff_counts(actual: Mapping[str, int], expected: Mapping[str, int]) -> dict
 
 def _group_header(row: Mapping[str, Any]) -> str:
     expected = row.get("expected") or {}
-    parts = [f"{v} {k}" for k, v in sorted(expected.items()) if k != TOTAL_KEY]
+    parts = [f"{v} {k}" for k, v in sorted(expected.items()) if k != TOTAL_KEY and not k.startswith("_")]
     breakdown = " / ".join(parts) if parts else "(empty)"
-    total = expected.get(TOTAL_KEY, sum(v for k, v in expected.items() if k != TOTAL_KEY))
+    total = expected.get(TOTAL_KEY, sum(v for k, v in expected.items() if k != TOTAL_KEY and not k.startswith("_")))
     baseline_key = row.get("baseline_key") or "?"
     return f"{row['group']}: {breakdown} = {total} (baseline {baseline_key})  · {row['batches']} batches"
 

@@ -84,7 +84,14 @@ async def read_timetable(batch: str, settings: Settings | None = None) -> dict[s
     # response shape stays compatible with every existing client.
     from timetable_parser.core.subject_catalog import ensure_catalog
     catalog = await ensure_catalog()
-    return _timetable_payload(doc, catalog)
+    payload = _timetable_payload(doc, catalog)
+    try:
+        current = await read_current(settings=settings)
+        year = str(code[0]) if code and code[0].isdigit() else "1"
+        payload["term_start_date"] = (current.get("term_start_dates") or {}).get(year)
+    except DataMissing:
+        payload["term_start_date"] = None
+    return payload
 
 
 # ── Writes ───────────────────────────────────────────────────────────────
@@ -284,6 +291,10 @@ def _baseline_payload(doc: BaselineDoc) -> dict[str, Any]:
         (c.model_dump() if isinstance(c, BaselineCourseCheck) else dict(c))
         for c in (doc.courses or [])
     ]
+    option_groups = [
+        [c.model_dump() if isinstance(c, BaselineCourseCheck) else dict(c) for c in group]
+        for group in (doc.option_groups or [])
+    ]
     return {
         "key": doc.key,
         "semester_prefix": doc.semester_prefix,
@@ -292,13 +303,20 @@ def _baseline_payload(doc: BaselineDoc) -> dict[str, Any]:
         "total": total,
         "courses": courses,
         "course_count": len(courses),
+        "elective_count": doc.elective_count or 0,
+        "option_groups": option_groups,
         "scheme_source": doc.scheme_source,
         "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
     }
 
 
-async def list_baselines(settings: Settings | None = None) -> list[dict[str, Any]]:
-    return [_baseline_payload(doc) async for doc in BaselineDoc.find_all(sort=[("key", 1)])]
+async def list_baselines(settings: Settings | None = None, *, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
+    docs = BaselineDoc.find_all(sort=[("key", 1)]).skip(offset).limit(limit)
+    return [_baseline_payload(doc) async for doc in docs]
+
+
+async def count_baselines() -> int:
+    return await BaselineDoc.find_all().count()
 
 
 async def read_baseline(key: str, settings: Settings | None = None) -> dict[str, Any]:
@@ -325,13 +343,25 @@ def _clean_courses(courses: Any) -> list[BaselineCourseCheck]:
         if isinstance(raw, BaselineCourseCheck):
             course = raw
         elif isinstance(raw, dict):
-            allowed = {"code", "title", "category", "L", "T", "P", "Cr"}
+            allowed = {"code", "title", "category", "L", "T", "P", "Cr", "alternate_weeks"}
             picked = {k: raw.get(k) for k in allowed if raw.get(k) not in (None, "")}
             if not picked:
                 continue  # skip completely blank rows
             for field_name, value in list(picked.items()):
                 if not isinstance(value, str):
-                    picked[field_name] = str(value)
+                    if field_name == "alternate_weeks":
+                        picked[field_name] = [str(v) for v in value] if isinstance(value, list) else []
+                    else:
+                        picked[field_name] = str(value)
+            if isinstance(picked.get("title"), str):
+                title = re.sub(r"\s*\*+\s*", " ", picked["title"]).strip()
+                if title.isupper():
+                    acronyms = {"AI", "API", "C++", "IOT", "UCS"}
+                    title = " ".join(
+                        word if word in acronyms else word.lower().capitalize()
+                        for word in title.split()
+                    )
+                picked["title"] = title
             course = BaselineCourseCheck(**picked)
         else:
             raise ValueError(f"courses[{i}] must be an object, got {type(raw).__name__}")
@@ -351,6 +381,8 @@ async def write_baseline(
     settings: Settings | None = None,
     *,
     courses: Any = None,
+    option_groups: Any = None,
+    elective_count: int = 0,
     scheme_source: str | None = None,
     merge_courses: bool = False,
 ) -> dict[str, Any]:
@@ -370,6 +402,10 @@ async def write_baseline(
         raise ValueError("'total' is reserved; it is derived from the sum of the other counts")
 
     parsed_courses = _clean_courses(courses) if courses is not None else None
+    parsed_groups = (
+        [_clean_courses(group) for group in option_groups]
+        if isinstance(option_groups, list) else None
+    )
 
     prefix = cleaned_key[0]
     group = cleaned_key[1:]
@@ -382,6 +418,8 @@ async def write_baseline(
             group=group,
             counts=cleaned_counts,
             courses=parsed_courses or [],
+            elective_count=max(0, int(elective_count or 0)),
+            option_groups=parsed_groups or [],
             scheme_source=scheme_source,
         )
         await doc.insert()
@@ -400,6 +438,9 @@ async def write_baseline(
                 update["courses"] = list(by_code.values())
             else:
                 update["courses"] = parsed_courses
+        if parsed_groups is not None:
+            update["option_groups"] = parsed_groups
+        update["elective_count"] = max(0, int(elective_count or 0))
         if scheme_source is not None:
             update["scheme_source"] = scheme_source
         await doc.set(update)
@@ -448,7 +489,7 @@ def _numeric_str(value: str | None) -> int:
     if not value:
         return 0
     try:
-        return int(float(str(value).strip()))
+        return int(sum(float(token) for token in re.findall(r"\d+(?:\.\d+)?", str(value))))
     except (ValueError, TypeError):
         return 0
 
@@ -479,6 +520,8 @@ async def upsert_baseline_courses(
     key: str,
     courses: Any,
     *,
+    option_groups: Any = None,
+    elective_count: int = 0,
     scheme_source: str | None = None,
     merge: bool = False,
     settings: Settings | None = None,
@@ -494,6 +537,7 @@ async def upsert_baseline_courses(
     prefix = cleaned_key[0]
     group = cleaned_key[1:]
     parsed_courses = _clean_courses(courses)
+    parsed_groups = [_clean_courses(group) for group in (option_groups or [])] if isinstance(option_groups, list) else []
     # Derive counts from the course L/T/P columns so the schema is uniform
     # regardless of whether the admin used the manual form or a PDF upload.
     derived_counts = _counts_from_courses(parsed_courses)
@@ -506,6 +550,8 @@ async def upsert_baseline_courses(
             group=group,
             counts=derived_counts,  # populated, not empty
             courses=parsed_courses,
+            elective_count=max(0, int(elective_count or 0)),
+            option_groups=parsed_groups,
             scheme_source=scheme_source,
         )
         await doc.insert()
@@ -523,6 +569,8 @@ async def upsert_baseline_courses(
             update["courses"] = list(by_code.values())
         else:
             update["courses"] = parsed_courses
+        update["elective_count"] = max(0, int(elective_count or 0))
+        update["option_groups"] = parsed_groups
         # If the baseline has no explicit counts yet, derive them from the
         # incoming courses so the schema stays uniform (same as on create).
         if not doc.counts:
@@ -583,8 +631,12 @@ async def check_baseline_group(
         }
 
     baselines_map = {group: dict(doc.counts)}
-    course_codes = [c.code for c in (doc.courses or []) if (c.code or "").strip()]
-    courses_map = {group: course_codes} if course_codes else {}
+    course_rows = [
+        c.model_dump(exclude_none=False) if hasattr(c, "model_dump") else dict(c)
+        for c in (doc.courses or [])
+        if (getattr(c, "code", None) or (c.get("code") if isinstance(c, dict) else ""))
+    ]
+    courses_map = {group: course_rows} if course_rows else {}
 
     report = build_doctor_report(
         counts_by_batch,
@@ -647,7 +699,7 @@ async def read_baselines_for_prefix(
 async def read_baseline_courses_for_prefix(
     prefix: str,
     settings: Settings | None = None,
-) -> dict[str, list[str]]:
+) -> dict[str, list[dict[str, Any]]]:
     """Return ``{group: [expected_course_code, …]}`` for a semester prefix.
 
     Codes are uppercased and de-duplicated; placeholder rows without a code
@@ -657,19 +709,50 @@ async def read_baseline_courses_for_prefix(
     prefix = (prefix or "").strip().upper()[:1]
     if not prefix:
         return {}
-    out: dict[str, list[str]] = {}
+    out: dict[str, list[dict[str, Any]]] = {}
     async for doc in BaselineDoc.find(BaselineDoc.semester_prefix == prefix):
-        codes: list[str] = []
+        courses: list[dict[str, Any]] = []
         seen: set[str] = set()
         for c in (doc.courses or []):
             code = (c.code or "").strip().upper()
             if not code or code in seen:
                 continue
             seen.add(code)
-            codes.append(code)
-        if codes:
-            out[doc.group] = codes
+            courses.append(c.model_dump(exclude_none=False) if hasattr(c, "model_dump") else dict(c))
+        if courses:
+            out[doc.group] = courses
     return out
+
+
+async def apply_baseline_alternate_weeks(
+    payloads: dict[str, dict[str, Any]],
+    semester_label: str,
+) -> int:
+    """Apply baseline ``*`` L/T/P markers to matching timetable sections.
+
+    Baseline markers do not specify an initial parity, so they default to week
+    1. Explicit timetable metadata is preserved and wins over the baseline.
+    """
+    prefix = semester_prefix(semester_label)
+    baselines = await read_baseline_courses_for_prefix(prefix)
+    updated = 0
+    for batch, payload in payloads.items():
+        group = batch[1:3].upper() if len(batch) >= 3 else ""
+        courses = baselines.get(group) or []
+        marked = {
+            str(c.get("code") or "").strip().upper(): {str(v).upper() for v in (c.get("alternate_weeks") or [])}
+            for c in courses
+        }
+        for entry in payload.get("classes") or []:
+            if entry.get("alternate_week_start"):
+                continue
+            code = str(entry.get("code") or "").strip().upper()
+            section = code[-1:] if code and code[-1:] in {"L", "T", "P"} else ""
+            base = code[:-1] if section else code
+            if section and section in marked.get(base, set()):
+                entry["alternate_week_start"] = 1
+                updated += 1
+    return updated
 
 
 # ── Contributors ─────────────────────────────────────────────────────────
@@ -688,15 +771,20 @@ def _safe_username(username: str) -> str:
     return cleaned
 
 
-async def list_contributors(settings: Settings | None = None) -> list[dict[str, Any]]:
+async def list_contributors(settings: Settings | None = None, *, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
+    docs = ContributorDoc.find_all(sort=[("username", 1)]).skip(offset).limit(limit)
     return [
         {
             "username": doc.username,
             "display_name": doc.display_name,
             "created_at": doc.created_at.isoformat() if doc.created_at else None,
         }
-        async for doc in ContributorDoc.find_all(sort=[("username", 1)])
+        async for doc in docs
     ]
+
+
+async def count_contributors() -> int:
+    return await ContributorDoc.find_all().count()
 
 
 async def list_contributor_usernames(settings: Settings | None = None) -> list[str]:
@@ -920,18 +1008,25 @@ async def list_change_requests(
     *,
     status: str | None = None,
     limit: int = 200,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     if status is not None and status not in {"pending", "approved", "rejected"}:
         raise ValueError(f"invalid status {status!r}")
-    query = ChangeRequestDoc.find_all(sort=[("created_at", -1)])
+    query = ChangeRequestDoc.find_all(sort=[("created_at", -1)]).skip(offset).limit(limit)
     if status:
-        query = ChangeRequestDoc.find(ChangeRequestDoc.status == status, sort=[("created_at", -1)])
+        query = ChangeRequestDoc.find(ChangeRequestDoc.status == status, sort=[("created_at", -1)]).skip(offset).limit(limit)
     out: list[dict[str, Any]] = []
     async for doc in query:
         out.append(_serialize_change_request(doc))
         if len(out) >= limit:
             break
     return out
+
+
+async def count_change_requests(*, status: str | None = None) -> int:
+    if status:
+        return await ChangeRequestDoc.find(ChangeRequestDoc.status == status).count()
+    return await ChangeRequestDoc.find_all().count()
 
 
 async def _resolve_target_batches(scope: str, requester_batch: str) -> list[str]:
@@ -1143,11 +1238,11 @@ def _serialize_class(entry: Any, catalog: Any = None) -> dict[str, Any]:
     if catalog is not None:
         code = out.get("code")
         subject = out.get("subject")
-        if code and not (isinstance(subject, str) and subject.strip()):
+        has_elective_options = isinstance(opts := out.get("options"), list) and len(opts) > 1
+        if code and not has_elective_options and not (isinstance(subject, str) and subject.strip()):
             resolved = catalog.name_for(code)
             if resolved:
                 out["subject"] = resolved
-        opts = out.get("options")
         if isinstance(opts, list):
             for opt in opts:
                 if not isinstance(opt, dict):
@@ -1192,6 +1287,11 @@ def _normalize_classes_for_write(classes: list[Any], catalog: Any) -> list[Any]:
             entry["subject"] = None
         opts = entry.get("options")
         if isinstance(opts, list):
+            if len(opts) > 1 and not entry.get("electiveChoice"):
+                entry["subject"] = None
+                entry["code"] = None
+                entry["type"] = "Elective"
+                entry["room"] = None
             new_opts = []
             for opt in opts:
                 if not isinstance(opt, dict):
@@ -1406,13 +1506,14 @@ async def list_upload_attempts(
     *,
     limit: int = 50,
     status: str | None = None,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     if status is not None and status not in {"ok", "partial", "failed"}:
         raise ValueError(f"invalid status {status!r}")
     if status:
-        query = UploadAttemptDoc.find(UploadAttemptDoc.status == status).sort(-UploadAttemptDoc.started_at)
+        query = UploadAttemptDoc.find(UploadAttemptDoc.status == status).sort(-UploadAttemptDoc.started_at).skip(offset).limit(limit)
     else:
-        query = UploadAttemptDoc.find_all().sort(-UploadAttemptDoc.started_at)
+        query = UploadAttemptDoc.find_all().sort(-UploadAttemptDoc.started_at).skip(offset).limit(limit)
     out: list[dict[str, Any]] = []
     async for doc in query:
         out.append(_serialize_upload_attempt(doc))
@@ -1501,6 +1602,12 @@ async def list_upload_attempts(
                 )[:4]
 
     return out
+
+
+async def count_upload_attempts(*, status: str | None = None) -> int:
+    if status:
+        return await UploadAttemptDoc.find(UploadAttemptDoc.status == status).count()
+    return await UploadAttemptDoc.find_all().count()
 
 
 async def get_upload_attempt(attempt_id: str) -> dict[str, Any] | None:
@@ -1853,8 +1960,16 @@ async def save_parsing_errors(
             group = grp.get("group")
             baseline_key = grp.get("baseline_key")
             expected = grp.get("expected") or {}
-            for out in grp.get("outliers") or []:
-                batch = out.get("batch")
+            outliers = {out.get("batch"): out for out in (grp.get("outliers") or [])}
+            course_check = grp.get("course_check") or {}
+            course_rows = dict(course_check.get("per_batch_detail") or {})
+            affected_batches = sorted(set(outliers) | {
+                batch for batch, row in course_rows.items()
+                if row.get("missing") or row.get("extra") or row.get("course_deltas")
+            })
+            for batch in affected_batches:
+                out = outliers.get(batch) or {}
+                course_row = course_rows.get(batch) or {}
                 counts = out.get("counts") or {}
                 deltas = out.get("deltas") or {}
                 delta_pieces = ", ".join(
@@ -1862,9 +1977,11 @@ async def save_parsing_errors(
                     for k, v in sorted(deltas.items())
                     if k != "total"
                 )
+                issue_count = len(course_row.get("course_deltas") or [])
                 msg = (
                     f"{batch} deviates from baseline {baseline_key or group}: "
-                    f"{delta_pieces or 'total mismatch'}"
+                    f"{delta_pieces or ('course roster mismatch' if course_row.get('missing') or course_row.get('extra') or issue_count else 'total mismatch')}"
+                    + (f"; {issue_count} course count issue(s)" if issue_count else "")
                 )
                 try:
                     await ParsingErrorDoc(
@@ -1879,6 +1996,11 @@ async def save_parsing_errors(
                             "expected": expected,
                             "actual": counts,
                             "deltas": deltas,
+                            "course_deltas": course_row.get("course_deltas", []),
+                            "missing_courses": course_row.get("missing", []),
+                            "extra_courses": course_row.get("extra", []),
+                            "missing_course_details": course_row.get("missing_details", []),
+                            "extra_course_details": course_row.get("extra_details", []),
                         },
                         status="open",
                         created_at=now,
@@ -1996,12 +2118,14 @@ async def list_parsing_errors(
     error_type: str | None = None,
     batch_code: str | None = None,
     limit: int = 500,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     query = ParsingErrorDoc.find_all(sort=[("created_at", -1)])
     if status:
         query = ParsingErrorDoc.find(ParsingErrorDoc.status == status, sort=[("created_at", -1)])
     _ORPHAN_DOCTOR_TYPES = {"BASELINE_MISSING", "BASELINE_MISMATCH", "doctor_mismatch"}
     out: list[dict[str, Any]] = []
+    skipped = 0
     async for doc in query:
         if upload_id and doc.upload_id != upload_id:
             # Also surface orphan doctor rows so upload detail pages show
@@ -2012,10 +2136,21 @@ async def list_parsing_errors(
             continue
         if batch_code and (doc.batch_code or "").upper() != batch_code.upper():
             continue
+        if skipped < offset:
+            skipped += 1
+            continue
         out.append(_parsing_error_payload(doc))
         if len(out) >= limit:
             break
     return out
+
+
+async def count_parsing_errors(
+    *, status: str | None = None, upload_id: str | None = None,
+    error_type: str | None = None, batch_code: str | None = None,
+) -> int:
+    rows = await list_parsing_errors(status=status, upload_id=upload_id, error_type=error_type, batch_code=batch_code, limit=10**9)
+    return len(rows)
 
 
 async def parsing_errors_summary(upload_id: str | None = None) -> dict[str, Any]:
@@ -2123,23 +2258,49 @@ def _normalize_subject_code(code: str) -> str:
     return cleaned
 
 
+def _camel_subject_name(value: str) -> str:
+    acronyms = {"AI", "API", "CPU", "GPU", "IoT", "ML", "NLP", "UCS", "UI", "URL", "XML"}
+    result = []
+    for word in " ".join(str(value or "").split()).split(" "):
+        bare = word.strip("()[],.:;/-")
+        result.append(word if bare.upper() in {item.upper() for item in acronyms} else word[:1].upper() + word[1:].lower())
+    return " ".join(result)
+
+
 async def list_subjects(
     *,
     q: str | None = None,
     source: str | None = None,
     limit: int = 500,
+    offset: int = 0,
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     qnorm = (q or "").strip().upper()
+    skipped = 0
     async for doc in SubjectDoc.find_all(sort=[("code", 1)]):
         if source and doc.source != source:
             continue
         if qnorm and qnorm not in (doc.code or "").upper() and qnorm not in (doc.name or "").upper():
             continue
+        if skipped < max(0, offset):
+            skipped += 1
+            continue
         out.append(_subject_payload(doc))
         if len(out) >= limit:
             break
     return out
+
+
+async def count_subjects(*, q: str | None = None, source: str | None = None) -> int:
+    qnorm = (q or "").strip().upper()
+    count = 0
+    async for doc in SubjectDoc.find_all():
+        if source and doc.source != source:
+            continue
+        if qnorm and qnorm not in (doc.code or "").upper() and qnorm not in (doc.name or "").upper():
+            continue
+        count += 1
+    return count
 
 
 async def upsert_subject(
@@ -2155,7 +2316,7 @@ async def upsert_subject(
     from timetable_parser.core.subject_catalog import invalidate_catalog
 
     norm = _normalize_subject_code(code)
-    clean_name = (name or "").strip()
+    clean_name = _camel_subject_name(name)
     if not clean_name:
         raise ValueError("subject name required")
     now = datetime.now(timezone.utc)
@@ -2212,12 +2373,14 @@ async def bulk_upsert_subjects(
     added = 0
     updated = 0
     failed = 0
+    normalized_codes: set[str] = set()
     for raw in items or []:
         if not isinstance(raw, dict):
             failed += 1
             continue
         try:
             norm = _normalize_subject_code(raw.get("code", ""))
+            normalized_codes.add(norm)
             existed = await SubjectDoc.find_one(SubjectDoc.code == norm)
             await upsert_subject(
                 code=norm,
@@ -2234,7 +2397,25 @@ async def bulk_upsert_subjects(
         except Exception:
             logger.exception("bulk_upsert_subjects: row failed: %r", raw)
             failed += 1
-    return {"added": added, "updated": updated, "failed": failed}
+    resolved = 0
+    if normalized_codes:
+        candidates = await list_parsing_errors(
+            status="open", error_type="SUBJECT_NOT_IN_CATALOG", limit=10000,
+        )
+        ids = [
+            row["id"] for row in candidates
+            if any(
+                code in (row.get("code") or "").upper()
+                or code in str(row.get("context") or {}).upper()
+                or code in (row.get("message") or "").upper()
+                for code in normalized_codes
+            )
+        ]
+        if ids:
+            resolved = await bulk_update_parsing_errors(
+                error_ids=ids, new_status="resolved", resolved_by=created_by,
+            )
+    return {"added": added, "updated": updated, "failed": failed, "errors_resolved": resolved}
 
 
 async def normalize_all_timetables() -> dict[str, int]:

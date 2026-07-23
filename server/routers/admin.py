@@ -30,9 +30,109 @@ class AdminEmailBody(BaseModel):
     display_name: Optional[str] = None
 
 
+class CalendarSyncTestBody(BaseModel):
+    email: str
+
+
 @router.get("/health")
 async def admin_health() -> dict[str, object]:
     return {"ok": True, "scope": "admin"}
+
+
+@router.post("/calendar/sync-test")
+async def calendar_sync_test(
+    body: CalendarSyncTestBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Run a calendar reconcile immediately for one connected Google account."""
+    email = body.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail={
+            "error": "A valid Google email is required",
+            "code": "invalid_email",
+        })
+    from server import calendar_storage, calendar_sync
+    from server.db.models import CalendarConnectionDoc
+
+    conn = await CalendarConnectionDoc.find_one(CalendarConnectionDoc.google_email == email)
+    if conn is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"No connected calendar found for {email}",
+            "code": "calendar_not_found",
+        })
+    if not conn.batch_code:
+        raise HTTPException(status_code=400, detail={
+            "error": f"No batch is configured for {email}",
+            "code": "batch_not_configured",
+        })
+    try:
+        await calendar_sync.full_sync_user(conn.user_id, force=True)
+    except calendar_sync.InvalidGrantError as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": "Google authorization has expired or was revoked. Reconnect this Google account before syncing.",
+            "code": "calendar_reauth_required",
+            "detail": str(exc),
+        }) from exc
+    status = await calendar_storage.get_status(conn.user_id)
+    if status.get("last_error") == "invalid_grant":
+        raise HTTPException(status_code=409, detail={
+            "error": "Google authorization has expired or was revoked. Reconnect this Google account before syncing.",
+            "code": "calendar_reauth_required",
+        })
+    logger.info("Calendar test sync by %s for %s", principal.label, email)
+    return {"ok": True, "email": email, "status": status}
+
+
+@router.post("/calendar/clear-test")
+async def calendar_clear_test(
+    body: CalendarSyncTestBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Clear one connected account's dedicated MLSC calendar, keeping OAuth."""
+    email = body.email.strip().lower()
+    if not email or "@" not in email:
+        raise HTTPException(status_code=400, detail={
+            "error": "A valid Google email is required",
+            "code": "invalid_email",
+        })
+    from server import calendar_storage, calendar_sync
+    from server.db.models import CalendarConnectionDoc
+
+    conn = await CalendarConnectionDoc.find_one(CalendarConnectionDoc.google_email == email)
+    if conn is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"No connected calendar found for {email}",
+            "code": "calendar_not_found",
+        })
+
+    deleted = False
+    if conn.calendar_id:
+        try:
+            access_token = await calendar_sync.get_valid_access_token(conn)
+            await calendar_sync.delete_calendar(conn.calendar_id, access_token)
+            deleted = True
+        except calendar_sync.InvalidGrantError as exc:
+            raise HTTPException(status_code=409, detail={
+                "error": "Google authorization has expired or was revoked. Reconnect this Google account before clearing it.",
+                "code": "calendar_reauth_required",
+                "detail": str(exc),
+            }) from exc
+        except Exception as exc:
+            logger.exception("Calendar clear failed for %s", email)
+            raise HTTPException(status_code=502, detail={
+                "error": "Google Calendar could not be cleared. No local event mappings were removed.",
+                "code": "calendar_clear_failed",
+                "detail": str(exc),
+            }) from exc
+    maps_cleared = await calendar_storage.clear_event_maps(conn.user_id)
+    await calendar_storage.wipe_calendar_id(conn.user_id)
+    logger.info("Calendar clear by %s for %s", principal.label, email)
+    return {
+        "ok": True,
+        "email": email,
+        "calendar_deleted": deleted,
+        "event_maps_cleared": maps_cleared,
+    }
 
 
 @router.get("/whoami")
@@ -276,11 +376,15 @@ async def post_baseline(key: str, payload: dict) -> dict[str, object]:
         })
     courses = payload.get("courses") if isinstance(payload, dict) else None
     scheme_source = payload.get("scheme_source") if isinstance(payload, dict) else None
+    option_groups = payload.get("option_groups") if isinstance(payload, dict) else None
+    elective_count = payload.get("elective_count", 0) if isinstance(payload, dict) else 0
     try:
         doc = await storage.write_baseline(
             key,
             counts,
             courses=courses,
+            option_groups=option_groups,
+            elective_count=elective_count,
             scheme_source=scheme_source if isinstance(scheme_source, str) else None,
         )
     except ValueError as exc:
@@ -430,8 +534,15 @@ async def _build_scheme_plan(
         # Flatten "OR" alternatives (e.g. Sem 8 electives) into a single
         # course roster so the doctor check accepts any code from any option.
         flat_courses: list[dict] = []
+        option_groups: list[list[dict]] = []
         for opt in sem.get("options") or []:
-            flat_courses.extend(opt.get("courses") or [])
+            group = opt.get("courses") or []
+            option_groups.append(group)
+            flat_courses.extend(group)
+        elective_count = sum(
+            1 for course in flat_courses
+            if not course.get("code") and "ELECTIVE" in str(course.get("title") or "").upper()
+        )
 
         for key_branch, pool_swap_year1 in cohorts:
             try:
@@ -445,6 +556,8 @@ async def _build_scheme_plan(
                 "baseline_key": key,
                 "year": sem["year"],
                 "courses": flat_courses,
+                "option_groups": option_groups,
+                "elective_count": elective_count,
                 "course_count": len(flat_courses),
                 "option_count": len(sem.get("options") or []),
                 "totals": [opt.get("totals") for opt in sem.get("options") or []],
@@ -469,6 +582,16 @@ async def _build_scheme_plan(
         return (branch_letter, student_sem)
 
     plan.sort(key=_sort_key)
+    catalog = await storage.list_subjects(limit=100000)
+    catalog_codes = {str(row.get("code") or "").upper() for row in catalog}
+    mapped_codes = {
+        str(course.get("code") or "").strip().upper()
+        for entry in plan for course in entry.get("courses") or []
+        if course.get("code")
+    }
+    missing = sorted(code for code in mapped_codes if code not in catalog_codes)
+    for entry in plan:
+        entry["missing_subject_codes"] = missing
     return plan
 
 
@@ -534,6 +657,8 @@ async def post_scheme_apply(
                 entry["courses"],
                 scheme_source=file.filename,
                 merge=bool(merge),
+                option_groups=entry.get("option_groups"),
+                elective_count=entry.get("elective_count", 0),
             )
             written.append({
                 "baseline_key": key,
@@ -610,6 +735,8 @@ async def post_scheme_apply_plan(
                 courses,
                 scheme_source=source,
                 merge=merge,
+                option_groups=entry.get("option_groups"),
+                elective_count=entry.get("elective_count", 0),
             )
             written.append({
                 "baseline_key": key,
@@ -722,7 +849,7 @@ async def delete_announcement(announcement_id: str) -> dict[str, object]:
 @router.post("/announcements/reset",
              dependencies=[Depends(require_admin)])
 async def reset_announcements() -> dict[str, object]:
-    """Delete all announcements and re-seed from the bundled defaults."""
+    """Clear all announcements. No bundled defaults are restored."""
     result = await storage.reset_announcements()
     return {"ok": True, **result}
 
@@ -764,7 +891,7 @@ async def delete_exam_date(exam_id: str) -> dict[str, object]:
 @router.post("/exam-dates/reset",
              dependencies=[Depends(require_admin)])
 async def reset_exam_dates() -> dict[str, object]:
-    """Delete all exam dates and re-seed from the bundled defaults."""
+    """Clear all exam dates. No bundled defaults are restored."""
     result = await storage.reset_exam_dates()
     return {"ok": True, **result}
 
@@ -1064,6 +1191,7 @@ async def list_errors(
     error_type: Optional[str] = Query(default=None),
     batch_code: Optional[str] = Query(default=None),
     limit: int = Query(default=500, ge=1, le=2000),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
     items = await storage.list_parsing_errors(
         status=status,
@@ -1071,8 +1199,9 @@ async def list_errors(
         error_type=error_type,
         batch_code=batch_code,
         limit=limit,
+        offset=offset,
     )
-    return {"items": items, "count": len(items)}
+    return {"items": items, "count": await storage.count_parsing_errors(status=status, upload_id=upload_id, error_type=error_type, batch_code=batch_code), "limit": limit, "offset": offset}
 
 
 @router.get("/errors/summary")
@@ -1236,14 +1365,20 @@ class _SubjectBulkBody(BaseModel):
     resolve_errors: bool = True  # auto-bulk-resolve matching SUBJECT_NOT_IN_CATALOG rows
 
 
+class _SubjectImportBody(BaseModel):
+    items: dict[str, str]
+
+
 @router.get("/subjects")
 async def list_subjects(
     q: str | None = None,
     source: str | None = None,
-    limit: int = 500,
+    limit: int = Query(default=25, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
 ) -> dict[str, object]:
-    rows = await storage.list_subjects(q=q, source=source, limit=limit)
-    return {"items": rows, "count": len(rows)}
+    rows = await storage.list_subjects(q=q, source=source, limit=limit, offset=offset)
+    total = await storage.count_subjects(q=q, source=source)
+    return {"items": rows, "count": total, "limit": limit, "offset": offset}
 
 
 @router.post("/subjects")
@@ -1356,6 +1491,16 @@ async def bulk_subjects(
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
     summary = await storage.bulk_upsert_subjects(body.items, created_by=principal.label)
+    return {"ok": True, **summary}
+
+
+@router.post("/subjects/import")
+async def import_subject_mapping(
+    body: _SubjectImportBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    items = [{"code": code, "name": name} for code, name in body.items.items()]
+    summary = await storage.bulk_upsert_subjects(items, created_by=principal.label)
     return {"ok": True, **summary}
 
 

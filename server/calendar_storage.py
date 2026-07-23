@@ -9,6 +9,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
+from beanie.operators import In
+
 from server.config import get_settings
 from server.db.models import (
     CalendarConnectionDoc,
@@ -69,7 +71,15 @@ async def get_status(user_id: str) -> dict[str, Any]:
             "last_synced_at": None,
             "last_error": None,
         }
-    return _conn_payload(conn)
+    payload = _conn_payload(conn)
+    job = await CalendarSyncJobDoc.find_one(
+        CalendarSyncJobDoc.user_id == user_id,
+        In("status", ["pending", "running"]),
+        sort=[("created_at", -1)],
+    )
+    payload["sync_state"] = "syncing" if job is not None else "idle"
+    payload["sync_job_id"] = str(job.id) if job is not None and job.id else None
+    return payload
 
 
 async def create_or_replace_connection(

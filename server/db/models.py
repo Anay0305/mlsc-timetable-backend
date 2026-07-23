@@ -145,6 +145,7 @@ class BaselineCourseCheck(BaseModel):
     T: Optional[str] = None
     P: Optional[str] = None
     Cr: Optional[str] = None
+    alternate_weeks: list[str] = Field(default_factory=list)
 
 
 class BaselineDoc(Document):
@@ -167,6 +168,8 @@ class BaselineDoc(Document):
     group: str            # "1A", "3C", ...
     counts: dict[str, int] = Field(default_factory=dict)
     courses: list[BaselineCourseCheck] = Field(default_factory=list)
+    elective_count: int = 0
+    option_groups: list[list[BaselineCourseCheck]] = Field(default_factory=list)
     scheme_source: Optional[str] = None  # filename of the PDF that supplied the courses
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -220,6 +223,27 @@ class ChangeRequestDoc(Document):
         indexes = [
             "status",
             [("status", 1), ("created_at", -1)],
+        ]
+
+
+class SubjectRequestDoc(Document):
+    """A user proposal to add a missing subject-code mapping to the catalog."""
+
+    requester_id: Optional[str] = None
+    requester_batch: str
+    code: str
+    name: str
+    status: Literal["pending", "approved", "rejected"] = "pending"
+    decision_note: Optional[str] = None
+    decided_by: Optional[str] = None
+    decided_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "subject_requests"
+        indexes = [
+            "status",
+            [("code", 1), ("status", 1)],
         ]
 
 
@@ -528,6 +552,7 @@ ALL_DOCUMENTS = [
     BaselineDoc,
     ContributorDoc,
     ChangeRequestDoc,
+    SubjectRequestDoc,
     AdminEmailDoc,
     UploadAttemptDoc,
     AnnouncementDoc,

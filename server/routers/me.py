@@ -63,15 +63,25 @@ def _normalize_batch(value: str) -> str:
 
 async def _require_batch(user_id: str, batch: Optional[str]) -> str:
     """Resolve the batch to operate on: explicit arg wins, else user.default_batch."""
+    user = await UserDoc.find_one(UserDoc.user_id == user_id)
     code = _normalize_batch(batch) if batch else ""
     if not code:
-        user = await UserDoc.find_one(UserDoc.user_id == user_id)
         code = (user.default_batch or "") if user else ""
     if not code:
         raise HTTPException(
             status_code=400,
             detail={"error": "no batch supplied and no default set", "code": "no_batch"},
         )
+    if user is not None and user.default_batch and user.default_batch != code:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": f"Personal edits are only allowed for your default batch ({user.default_batch})",
+                "code": "default_batch_only",
+            },
+        )
+    if user is not None and not user.default_batch:
+        await user.set({"default_batch": code, "last_seen_at": datetime.now(timezone.utc)})
     return code
 
 
@@ -139,8 +149,17 @@ async def set_default_batch(
     await _touch_user(user_id)
     user = await UserDoc.find_one(UserDoc.user_id == user_id)
     assert user is not None
+    previous_batch = user.default_batch
+    if previous_batch and previous_batch != code:
+        old_overrides = await _load_overrides(user_id, previous_batch)
+        if old_overrides is not None:
+            await old_overrides.delete()
     await user.set({"default_batch": code, "last_seen_at": datetime.now(timezone.utc)})
-    return {"user_id": user_id, "default_batch": code}
+    return {
+        "user_id": user_id,
+        "default_batch": code,
+        "deleted_previous_batch_overrides": previous_batch if previous_batch != code else None,
+    }
 
 
 @router.get("/timetable")
@@ -245,3 +264,20 @@ async def delete_override(
     doc.updated_at = datetime.now(timezone.utc)
     await doc.save()
     return {"deleted": True, "key": key}
+
+
+@router.delete("/overrides", status_code=status.HTTP_200_OK)
+async def delete_overrides(
+    batch: Optional[str] = Query(default=None),
+    user_id: str = Depends(require_user_id),
+) -> dict[str, Any]:
+    """Delete all personal overrides for one batch."""
+    code = await _require_batch(user_id, batch)
+    result = await OverrideDoc.find_one(
+        OverrideDoc.user_id == user_id,
+        OverrideDoc.batch == code,
+    )
+    if result is None:
+        return {"deleted": False, "batch": code}
+    await result.delete()
+    return {"deleted": True, "batch": code}

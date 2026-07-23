@@ -72,9 +72,10 @@ def _timetable_payload(
 
 def _split_block(block: ClassBlock, day: str) -> Iterable[dict[str, object]]:
     """Expand a ClassBlock into one entry per slot it occupies."""
-    type_title = TYPE_TITLE_CASE.get((block.type or "UNKNOWN").upper(), "Unknown")
+    is_elective_group = len(block.options) > 1
+    type_title = "Elective" if is_elective_group else TYPE_TITLE_CASE.get((block.type or "UNKNOWN").upper(), "Unknown")
     subject = _resolve_subject(block)
-    room = _resolve_room(block)
+    room = None if is_elective_group else _resolve_room(block)
     options = [_option_payload(option) for option in block.options]
 
     for period_index in range(block.periods):
@@ -85,14 +86,19 @@ def _split_block(block: ClassBlock, day: str) -> Iterable[dict[str, object]]:
             "start_time": start,
             "end_time": end,
             "subject": subject,
-            "code": block.subject_code,
+            "code": None if is_elective_group else block.subject_code,
             "type": type_title,
             "room": room,
             "options": options,
+            "alternate_week_start": block.alternate_week_start,
         }
 
 
 def _resolve_subject(block: ClassBlock) -> str | None:
+    if len(block.options) > 1:
+        # Keep an unresolved elective block neutral. The catalog name for the
+        # first code must not make the group look like a selected course.
+        return None
     if block.subject_name:
         return block.subject_name
     if block.options:

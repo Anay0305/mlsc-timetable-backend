@@ -53,3 +53,4 @@ class ClassBlock:
     bounds: CellBounds
     raw: list[str]
     cells: list[RawCell]
+    alternate_week_start: int | None = None

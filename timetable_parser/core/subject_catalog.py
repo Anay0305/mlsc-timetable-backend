@@ -31,7 +31,7 @@ class SubjectCatalog:
     @classmethod
     def from_pairs(cls, pairs) -> "SubjectCatalog":
         return cls(
-            subjects={str(code).upper(): str(name) for code, name in pairs}
+            subjects={str(code).upper(): normalize_subject_name(str(name)) for code, name in pairs}
         )
 
     @classmethod
@@ -47,7 +47,8 @@ class SubjectCatalog:
     def name_for(self, subject_code: Optional[str]) -> Optional[str]:
         if subject_code is None:
             return None
-        return self.subjects.get(base_subject_code(subject_code))
+        code = subject_code.strip().upper()
+        return self.subjects.get(code) or self.subjects.get(base_subject_code(code))
 
 
 def base_subject_code(subject_code: str) -> str:
@@ -152,3 +153,10 @@ async def seed_subjects_from_file_if_empty(
 
 def load_default_subject_catalog() -> SubjectCatalog:
     return get_cached_catalog()
+def normalize_subject_name(value: str) -> str:
+    acronyms = {"AI", "API", "CPU", "GPU", "IoT", "ML", "NLP", "UCS", "UI", "URL", "XML"}
+    words = []
+    for word in " ".join(str(value or "").split()).split(" "):
+        bare = word.strip("()[],.:;/-")
+        words.append(word if bare.upper() in {item.upper() for item in acronyms} else word[:1].upper() + word[1:].lower())
+    return " ".join(words)

@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
+from beanie.operators import In
 
 from server import calendar_storage, calendar_sync
 from server.auth import require_clerk_user
@@ -231,11 +232,12 @@ async def enable_sync(
     from server.db.models import CalendarSyncJobDoc
     existing_job = await CalendarSyncJobDoc.find_one(
         CalendarSyncJobDoc.user_id == user_id,
-        CalendarSyncJobDoc.status.in_(["pending", "running"]),
+        In("status", ["pending", "running"]),
     )
-    if existing_job is None:
-        await calendar_storage.enqueue_job(user_id, "initial")
-    return {"ok": True}
+    if existing_job is not None:
+        return {"ok": True, "job_id": str(existing_job.id) if existing_job.id else None, "already_running": True}
+    job = await calendar_storage.enqueue_job(user_id, "initial")
+    return {"ok": True, "job_id": str(job.id) if job.id else None, "already_running": False}
 
 
 @router.post("/disable")
@@ -261,8 +263,20 @@ async def resync(
     if batch:
         await calendar_storage.set_enabled(user_id, enabled=conn.enabled, batch_code=batch.upper())
 
-    await calendar_storage.enqueue_job(user_id, "manual")
-    return {"ok": True}
+    from server.db.models import CalendarSyncJobDoc
+    existing = await CalendarSyncJobDoc.find_one(
+        CalendarSyncJobDoc.user_id == user_id,
+        In("status", ["pending", "running"]),
+        sort=[("created_at", -1)],
+    )
+    if existing is not None:
+        return {
+            "ok": True,
+            "job_id": str(existing.id) if existing.id else None,
+            "already_running": True,
+        }
+    job = await calendar_storage.enqueue_job(user_id, "manual")
+    return {"ok": True, "job_id": str(job.id) if job.id else None, "already_running": False}
 
 
 @router.delete("/disconnect")

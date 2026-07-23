@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 from openpyxl.cell.cell import Cell
 from openpyxl.worksheet.worksheet import Worksheet
 
@@ -126,6 +128,7 @@ class ClassBlockExtractor:
         # Elective cells can contain several subject codes; the primary code anchors the
         # block while options preserve the individual subject/place/teacher combinations.
         subject_codes = find_subject_codes(raw)
+        alternate_week_start = cls._alternate_week_start(raw)
         subject_code = subject_codes[0] if subject_codes else find_subject_code(raw)
         subject_name = subject_catalog.name_for(subject_code)
         options = build_elective_options(raw, subject_catalog)
@@ -166,7 +169,19 @@ class ClassBlockExtractor:
             bounds=final_bounds,
             raw=raw,
             cells=raw_cells,
+            alternate_week_start=alternate_week_start,
         )
+
+    @staticmethod
+    def _alternate_week_start(raw: list[str]) -> int | None:
+        text = " ".join(raw).upper().replace("\u2013", "-")
+        if "ALTERNATE" not in text:
+            return None
+        if re.search(r"(?:FIRST|1ST)\s+WEEK", text):
+            return 1
+        if re.search(r"(?:SECOND|2ND)\s+WEEK", text):
+            return 2
+        return 1
 
     @staticmethod
     def find_batch_cells(sheet: Worksheet) -> list[Cell]:

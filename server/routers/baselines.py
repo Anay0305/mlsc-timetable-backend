@@ -18,8 +18,8 @@ router = APIRouter()
 
 
 @router.get("/baselines")
-async def list_baselines() -> list[dict[str, object]]:
-    return await storage.list_baselines()
+async def list_baselines(limit: int = 25, offset: int = 0) -> dict[str, object]:
+    return {"items": await storage.list_baselines(limit=limit, offset=offset), "count": await storage.count_baselines(), "limit": limit, "offset": offset}
 
 
 @router.get("/baselines/{key}")

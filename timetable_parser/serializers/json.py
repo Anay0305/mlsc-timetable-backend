@@ -39,6 +39,7 @@ def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> 
                         for option in block.options
                     ],
                     "raw": block.raw,
+                    "alternate_week_start": block.alternate_week_start,
                     "bounds": {
                         "start": f"{get_column_letter(block.bounds.min_col)}{block.bounds.min_row}",
                         "end": f"{get_column_letter(block.bounds.max_col)}{block.bounds.max_row}",

@@ -310,13 +310,62 @@ def _baseline_payload(doc: BaselineDoc) -> dict[str, Any]:
     }
 
 
-async def list_baselines(settings: Settings | None = None, *, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
-    docs = BaselineDoc.find_all(sort=[("key", 1)]).skip(offset).limit(limit)
+def _build_baselines_query(
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+) -> dict[str, Any]:
+    regex_pattern = "^"
+    if parity and parity != "all":
+        regex_pattern += re.escape(parity)
+    else:
+        regex_pattern += "[EO]"
+
+    if year and year != "all":
+        regex_pattern += re.escape(str(year))
+    else:
+        regex_pattern += r"\d+"
+
+    if stream and stream != "all":
+        regex_pattern += re.escape(stream)
+    else:
+        regex_pattern += "[A-Z]+"
+
+    regex_pattern += "$"
+
+    query: dict[str, Any] = {"key": {"$regex": regex_pattern, "$options": "i"}}
+    if q:
+        query = {"$and": [
+            {"key": {"$regex": regex_pattern, "$options": "i"}},
+            {"key": {"$regex": re.escape(q), "$options": "i"}}
+        ]}
+    return query
+
+
+async def list_baselines(
+    settings: Settings | None = None,
+    *,
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    query = _build_baselines_query(q, parity, year, stream)
+    docs = BaselineDoc.find(query, sort=[("key", 1)]).skip(offset).limit(limit)
     return [_baseline_payload(doc) async for doc in docs]
 
 
-async def count_baselines() -> int:
-    return await BaselineDoc.find_all().count()
+async def count_baselines(
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+) -> int:
+    query = _build_baselines_query(q, parity, year, stream)
+    return await BaselineDoc.find(query).count()
 
 
 async def read_baseline(key: str, settings: Settings | None = None) -> dict[str, Any]:

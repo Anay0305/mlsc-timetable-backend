@@ -310,13 +310,62 @@ def _baseline_payload(doc: BaselineDoc) -> dict[str, Any]:
     }
 
 
-async def list_baselines(settings: Settings | None = None, *, limit: int = 25, offset: int = 0) -> list[dict[str, Any]]:
-    docs = BaselineDoc.find_all(sort=[("key", 1)]).skip(offset).limit(limit)
+def _build_baselines_query(
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+) -> dict[str, Any]:
+    regex_pattern = "^"
+    if parity and parity != "all":
+        regex_pattern += re.escape(parity)
+    else:
+        regex_pattern += "[EO]"
+
+    if year and year != "all":
+        regex_pattern += re.escape(str(year))
+    else:
+        regex_pattern += r"\d+"
+
+    if stream and stream != "all":
+        regex_pattern += re.escape(stream)
+    else:
+        regex_pattern += "[A-Z]+"
+
+    regex_pattern += "$"
+
+    query: dict[str, Any] = {"key": {"$regex": regex_pattern, "$options": "i"}}
+    if q:
+        query = {"$and": [
+            {"key": {"$regex": regex_pattern, "$options": "i"}},
+            {"key": {"$regex": re.escape(q), "$options": "i"}}
+        ]}
+    return query
+
+
+async def list_baselines(
+    settings: Settings | None = None,
+    *,
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+    limit: int = 25,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    query = _build_baselines_query(q, parity, year, stream)
+    docs = BaselineDoc.find(query, sort=[("key", 1)]).skip(offset).limit(limit)
     return [_baseline_payload(doc) async for doc in docs]
 
 
-async def count_baselines() -> int:
-    return await BaselineDoc.find_all().count()
+async def count_baselines(
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+) -> int:
+    query = _build_baselines_query(q, parity, year, stream)
+    return await BaselineDoc.find(query).count()
 
 
 async def read_baseline(key: str, settings: Settings | None = None) -> dict[str, Any]:
@@ -870,10 +919,30 @@ def _resolve_scope_batches(scope: str, requester_batch: str) -> list[str]:
     raise ChangeRequestRefused(f"unknown scope {scope!r}", code="bad_scope")
 
 
+async def get_existing_entry_for_slot(batch: str, day: str, start_time: str) -> dict[str, Any] | None:
+    try:
+        code = _safe_batch(batch)
+        doc = await TimetableDoc.find_one(TimetableDoc.code == code)
+        if doc is None or not doc.schedule:
+            return None
+        entries = doc.schedule.get(day) or []
+        for e in entries:
+            st = getattr(e, "start_time", None) if not isinstance(e, dict) else e.get("start_time")
+            if st == start_time:
+                return _serialize_class(e) if not isinstance(e, dict) else e
+    except Exception:
+        pass
+    return None
+
+
 def _serialize_change_request(doc) -> dict[str, Any]:
+    existing = getattr(doc, "existing_entry", None)
+    if existing is not None and not isinstance(existing, dict):
+        existing = _serialize_class(existing)
     payload: dict[str, Any] = {
         "id": str(doc.id),
         "requester_id": doc.requester_id,
+        "requester_email": getattr(doc, "requester_email", None),
         "requester_batch": doc.requester_batch,
         "semester": doc.semester,
         "scope": doc.scope,
@@ -881,6 +950,7 @@ def _serialize_change_request(doc) -> dict[str, Any]:
         "day": doc.day,
         "start_time": doc.start_time,
         "entry": _serialize_class(doc.entry) if doc.entry is not None else None,
+        "existing_entry": existing,
         "status": doc.status,
         "decision_note": doc.decision_note,
         "decided_by": doc.decided_by,
@@ -900,6 +970,7 @@ async def create_change_request(
     start_time: str,
     entry: dict[str, Any] | None = None,
     requester_id: str | None = None,
+    requester_email: str | None = None,
 ) -> dict[str, Any]:
     """Validate + insert a pending ChangeRequestDoc.
 
@@ -990,8 +1061,12 @@ async def create_change_request(
             code="duplicate",
         )
 
+    # Look up existing entry in slot for before/after comparison
+    existing_entry = await get_existing_entry_for_slot(requester_batch_safe, day.strip(), start_time.strip())
+
     doc = ChangeRequestDoc(
         requester_id=requester_id,
+        requester_email=requester_email,
         requester_batch=requester_batch_safe,
         semester=semester_label,
         scope=scope,  # type: ignore[arg-type]
@@ -999,6 +1074,7 @@ async def create_change_request(
         day=day.strip(),
         start_time=start_time.strip(),
         entry=entry,  # type: ignore[arg-type]
+        existing_entry=existing_entry,
     )
     await doc.insert()
     return _serialize_change_request(doc)
@@ -1017,8 +1093,13 @@ async def list_change_requests(
         query = ChangeRequestDoc.find(ChangeRequestDoc.status == status, sort=[("created_at", -1)]).skip(offset).limit(limit)
     out: list[dict[str, Any]] = []
     async for doc in query:
-        out.append(_serialize_change_request(doc))
+        serialized = _serialize_change_request(doc)
+        if serialized.get("existing_entry") is None:
+            serialized["existing_entry"] = await get_existing_entry_for_slot(doc.requester_batch, doc.day, doc.start_time)
+        out.append(serialized)
         if len(out) >= limit:
+            break
+    return out
             break
     return out
 

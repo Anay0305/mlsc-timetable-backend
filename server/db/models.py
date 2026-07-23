@@ -204,6 +204,7 @@ class ChangeRequestDoc(Document):
     """
 
     requester_id: Optional[str] = None
+    requester_email: Optional[str] = None
     requester_batch: str
     semester: str
     scope: Literal["batch", "class"]
@@ -211,6 +212,7 @@ class ChangeRequestDoc(Document):
     day: str
     start_time: str
     entry: Optional[ClassEntry] = None
+    existing_entry: Optional[dict[str, Any]] = None
     status: Literal["pending", "approved", "rejected"] = "pending"
     decision_note: Optional[str] = None
     decided_by: Optional[str] = None
@@ -230,6 +232,7 @@ class SubjectRequestDoc(Document):
     """A user proposal to add a missing subject-code mapping to the catalog."""
 
     requester_id: Optional[str] = None
+    requester_email: Optional[str] = None
     requester_batch: str
     code: str
     name: str
@@ -543,6 +546,21 @@ class SubjectDoc(Document):
         name = "subjects"
 
 
+class DownloadEventDoc(Document):
+    format: str  # "png" or "pdf"
+    batch: str
+    aspect: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "download_events"
+        indexes = [
+            "format",
+            "batch",
+            [("created_at", -1)],
+        ]
+
+
 ALL_DOCUMENTS = [
     SemesterDoc,
     BatchDoc,
@@ -564,4 +582,5 @@ ALL_DOCUMENTS = [
     IngestSnapshotDoc,
     ParsingErrorDoc,
     SubjectDoc,
+    DownloadEventDoc,
 ]

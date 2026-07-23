@@ -10,7 +10,7 @@ co-exist: ``E1A``, ``O3C``, etc.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from server import storage
 
@@ -18,8 +18,24 @@ router = APIRouter()
 
 
 @router.get("/baselines")
-async def list_baselines(limit: int = 25, offset: int = 0) -> dict[str, object]:
-    return {"items": await storage.list_baselines(limit=limit, offset=offset), "count": await storage.count_baselines(), "limit": limit, "offset": offset}
+async def list_baselines(
+    q: str | None = None,
+    parity: str | None = None,
+    year: str | None = None,
+    stream: str | None = None,
+    limit: int = Query(default=25, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    return {
+        "items": await storage.list_baselines(
+            q=q, parity=parity, year=year, stream=stream, limit=limit, offset=offset
+        ),
+        "count": await storage.count_baselines(
+            q=q, parity=parity, year=year, stream=stream
+        ),
+        "limit": limit,
+        "offset": offset,
+    }
 
 
 @router.get("/baselines/{key}")

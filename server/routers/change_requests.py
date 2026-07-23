@@ -30,6 +30,7 @@ class ChangeRequestBody(BaseModel):
     day: str = Field(min_length=3, max_length=12)
     start_time: str = Field(min_length=1, max_length=16)
     entry: Optional[ClassEntry] = None
+    requester_email: Optional[str] = None
 
 
 class DecisionBody(BaseModel):
@@ -42,6 +43,7 @@ class SubjectRequestBody(BaseModel):
     requester_batch: str = Field(min_length=2, max_length=16)
     code: str = Field(min_length=2, max_length=24)
     name: str = Field(min_length=2, max_length=200)
+    requester_email: Optional[str] = None
 
 
 def _refusal_to_http(exc: storage.ChangeRequestRefused) -> HTTPException:
@@ -75,6 +77,7 @@ async def submit_change_request(
     body: ChangeRequestBody,
 ) -> dict[str, Any]:
     requester_id = request.headers.get("X-User-Id")
+    requester_email = request.headers.get("X-User-Email") or body.requester_email
     entry_payload: dict[str, Any] | None = None
     if body.entry is not None:
         entry_payload = body.entry.model_dump(exclude_none=False)
@@ -87,6 +90,7 @@ async def submit_change_request(
             start_time=body.start_time,
             entry=entry_payload,
             requester_id=requester_id,
+            requester_email=requester_email,
         )
     except storage.ChangeRequestRefused as exc:
         raise _refusal_to_http(exc) from exc
@@ -115,8 +119,10 @@ async def submit_subject_request(
     )
     if existing is not None:
         raise HTTPException(status_code=409, detail={"error": "A subject request for this code is already pending", "code": "duplicate"})
+    requester_email = request.headers.get("X-User-Email") or body.requester_email
     doc = SubjectRequestDoc(
         requester_id=request.headers.get("X-User-Id"),
+        requester_email=requester_email,
         requester_batch=body.requester_batch.strip().upper(),
         code=code,
         name=name,
@@ -155,6 +161,7 @@ async def list_subject_requests(
     async for doc in query.limit(limit):
         rows.append({
             "id": str(doc.id), "requester_batch": doc.requester_batch,
+            "requester_id": doc.requester_id, "requester_email": getattr(doc, "requester_email", None),
             "code": doc.code, "name": doc.name, "status": doc.status,
             "created_at": doc.created_at.isoformat(),
         })

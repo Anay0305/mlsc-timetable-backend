@@ -30,6 +30,21 @@ def find_capstone_type(raw: list[str]) -> str | None:
     return None
 
 
+# Manual overrides for free-text cells that carry no standard subject code.
+# Any cell containing one of these markers is kept verbatim as both code and
+# name; a trailing L/T/P picks the class type. Add new markers as they show up.
+MANUAL_SUBJECT_MARKERS = ("BEST",)
+
+
+def find_manual_subject(raw: list[str]) -> tuple[str, str] | None:
+    """Return (code, class_type) for manually overridden cells, else None."""
+    for value in raw:
+        candidate = " ".join(str(value).split()).upper()
+        if any(marker in candidate for marker in MANUAL_SUBJECT_MARKERS):
+            return candidate, CLASS_TYPE_BY_SUFFIX.get(candidate[-1], "UNKNOWN")
+    return None
+
+
 def find_subject_code(raw: list[str]) -> str | None:
     for value in raw:
         candidate = value.strip().upper().replace(" ", "")

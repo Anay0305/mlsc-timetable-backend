@@ -27,6 +27,7 @@ from timetable_parser.core.subject_parser import (
     CAPSTONE_NAME,
     class_type_for_subject,
     find_capstone_type,
+    find_manual_subject,
     find_subject_code,
 )
 from timetable_parser.extractors.batch import BatchExtractor
@@ -146,6 +147,13 @@ class ClassBlockExtractor:
                 subject_code = CAPSTONE_CODE
                 subject_name = CAPSTONE_NAME
                 class_type = capstone_type
+            else:
+                # Manual string overrides (e.g. "BEST-EEL"): keep the cell
+                # text verbatim as both code and name.
+                manual = find_manual_subject(raw)
+                if manual is not None:
+                    subject_code, class_type = manual
+                    subject_name = subject_code
         options = build_elective_options(raw, subject_catalog)
         final_bounds = CellBounds(
             min_row=start_slot.cell.row,

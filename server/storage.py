@@ -923,13 +923,15 @@ async def get_existing_entry_for_slot(batch: str, day: str, start_time: str) -> 
     try:
         code = _safe_batch(batch)
         doc = await TimetableDoc.find_one(TimetableDoc.code == code)
-        if doc is None or not doc.schedule:
+        if doc is None or not doc.classes:
             return None
-        entries = doc.schedule.get(day) or []
-        for e in entries:
-            st = getattr(e, "start_time", None) if not isinstance(e, dict) else e.get("start_time")
-            if st == start_time:
-                return _serialize_class(e) if not isinstance(e, dict) else e
+        target_day = (day or "").strip().lower()
+        target_time = (start_time or "").strip().lstrip("0")
+        for c in doc.classes:
+            c_day = (getattr(c, "day", None) or (c.get("day") if isinstance(c, dict) else "") or "").strip().lower()
+            c_time = (getattr(c, "start_time", None) or (c.get("start_time") if isinstance(c, dict) else "") or "").strip().lstrip("0")
+            if c_day == target_day and c_time == target_time:
+                return _serialize_class(c) if not isinstance(c, dict) else c
     except Exception:
         pass
     return None
@@ -1098,8 +1100,6 @@ async def list_change_requests(
             serialized["existing_entry"] = await get_existing_entry_for_slot(doc.requester_batch, doc.day, doc.start_time)
         out.append(serialized)
         if len(out) >= limit:
-            break
-    return out
             break
     return out
 

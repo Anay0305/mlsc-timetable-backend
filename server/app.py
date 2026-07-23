@@ -90,7 +90,7 @@ def create_app() -> FastAPI:
         allow_origins=list(settings.cors_origins),
         allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Authorization", "Content-Type", "X-User-Id"],
+        allow_headers=["Authorization", "Content-Type", "X-User-Id", "X-User-Email", "*"],
     )
 
     @app.exception_handler(RateLimitExceeded)

@@ -8,7 +8,8 @@ from timetable_parser.core.subject_catalog import SubjectCatalog
 from timetable_parser.core.subject_parser import class_type_for_subject
 
 
-SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Z]{3}\d{3}|[A-Z]{5}\d)[LTP]")
+# TODO(temporary): the XXX alternative accepts placeholder codes like UMCXXX.
+SUBJECT_TOKEN_PATTERN = re.compile(r"([A-Z]{3}(?:\d{3}|XXX)|[A-Z]{5}\d)[LTP]")
 
 
 def build_elective_options(raw: list[str], subject_catalog: SubjectCatalog) -> list[ElectiveOption]:

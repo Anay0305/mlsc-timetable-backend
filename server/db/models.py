@@ -543,6 +543,21 @@ class SubjectDoc(Document):
         name = "subjects"
 
 
+class DownloadEventDoc(Document):
+    format: str  # "png" or "pdf"
+    batch: str
+    aspect: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "download_events"
+        indexes = [
+            "format",
+            "batch",
+            [("created_at", -1)],
+        ]
+
+
 ALL_DOCUMENTS = [
     SemesterDoc,
     BatchDoc,
@@ -564,4 +579,5 @@ ALL_DOCUMENTS = [
     IngestSnapshotDoc,
     ParsingErrorDoc,
     SubjectDoc,
+    DownloadEventDoc,
 ]

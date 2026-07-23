@@ -89,14 +89,26 @@ def _build_column_map(header_rows: list[list[Any]]) -> dict[str, list[int]]:
     """Return ``{field: [col_index, …]}`` after joining multi-row headers and
     extending each labeled column rightward into its unlabeled neighbours (a
     single visual header cell is often split into 2+ sub-columns).
+
+    Fixed: rightward extension stops as soon as ANY header row has a non-empty
+    value in the candidate column, not just when the joined text is non-empty.
+    This prevents a label like ``CODE**`` from claiming columns that belong to
+    ``L`` (which appears in a different row at the same horizontal position).
     """
     if not header_rows:
         return {}
     width = max(len(r) for r in header_rows)
+
+    # joined[c] = concatenation of non-empty cell texts across all header rows
+    # for column c.  Used for alias matching.
     joined: list[str] = []
+    # has_content[c] = True when at least one header row has a non-empty cell
+    # at column c.  Used as a stop-criterion for rightward extension.
+    has_content: list[bool] = []
     for c in range(width):
         parts = [_norm(r[c]) for r in header_rows if c < len(r) and _norm(r[c])]
         joined.append(" ".join(parts).lower())
+        has_content.append(bool(parts))
 
     field_of: list[str | None] = [None] * width
     for c, label in enumerate(joined):
@@ -116,7 +128,9 @@ def _build_column_map(header_rows: list[list[Any]]) -> dict[str, list[int]]:
             continue
         col_map[owner].append(c)
         j = c + 1
-        while j < width and field_of[j] is None:
+        # Extend rightward only into columns that have NO content in any
+        # header row AND have not been claimed by another label.
+        while j < width and field_of[j] is None and not has_content[j]:
             col_map[owner].append(j)
             j += 1
         c = j
@@ -135,8 +149,21 @@ def _looks_like_header_start(row: list[Any]) -> bool:
     return "title" in tokens and ("code" in tokens or "l" in tokens)
 
 
+_HDR_LOOK_BACK_RE = re.compile(
+    r"\b(course|code|name|s\.?\s*no|title)\b", re.I
+)
+
+
 def _find_header_span(rows: list[list[Any]]) -> tuple[int, int]:
-    """Return ``(start, end_exclusive)`` covering the header block."""
+    """Return ``(start, end_exclusive)`` covering the header block.
+
+    Extended: after locating the first row that makes the block look like a
+    complete header (contains L/T/P/Cr/Credits), we look *backwards* up to 2
+    rows to include any preceding rows that contain recognisable header tokens
+    such as 'Course', 'Code', 'Name', 'S. No.' etc.  This handles PDFs (e.g.
+    AI-DS 2024) where ``Course Code`` appears on a different row from
+    ``L / T / P / Cr``.
+    """
     for i, r in enumerate(rows):
         combined_ok = _is_header_row(r)
         if not combined_ok and _looks_like_header_start(r) and i + 1 < len(rows):
@@ -157,7 +184,24 @@ def _find_header_span(rows: list[list[Any]]) -> tuple[int, int]:
                     end += 1
                     continue
                 break
-            return i, end
+
+            # Look backwards: absorb preceding rows that look like header rows
+            # (contain course/code/name/s.no tokens) but not data rows (no
+            # COURSE_CODE_RE match).  Stop at the beginning of the table.
+            start = i
+            for back in range(i - 1, max(i - 3, -1), -1):
+                prev_row = rows[back]
+                prev_text = " ".join(_norm(c) for c in prev_row)
+                # Skip if any cell looks like an actual course code (data row)
+                if any(COURSE_CODE_RE.match(_norm(c)) for c in prev_row):
+                    break
+                # Include if it has recognisable header tokens
+                if _HDR_LOOK_BACK_RE.search(prev_text):
+                    start = back
+                else:
+                    break
+
+            return start, end
     return -1, -1
 
 
@@ -172,6 +216,40 @@ def _extract_courses_from_table(
     required = {"title", "L", "T", "P", "Cr"}
     if not all(col_map.get(k) for k in required):
         return [], {}
+
+    # ── Column-shift correction ──────────────────────────────────────────
+    # In some PDFs (e.g. AI-DS 2024) pdfplumber places merged header cells
+    # one or more columns to the RIGHT of where actual data lands.  Detect
+    # this by scanning the first few data rows for a cell that looks like a
+    # course code and comparing its column index to the first col in
+    # col_map['code'].  If they differ by a consistent offset, slide every
+    # entry in col_map by that amount so pick_from() finds the right cells.
+    def _detect_shift(data_rows: list[list[Any]], col_map: dict) -> int:
+        mapped_code_cols = col_map.get("code", [])
+        if not mapped_code_cols:
+            return 0
+        # If the mapped columns already contain a valid code in any of the first few rows,
+        # the column mapping is already correct. No shift needed.
+        for row in data_rows[:6]:
+            for col_idx in mapped_code_cols:
+                if col_idx < len(row) and COURSE_CODE_RE.match(_norm(row[col_idx])):
+                    return 0
+        # Otherwise, find where a valid code actually lands and calculate the shift.
+        for row in data_rows[:6]:
+            for ci, cell in enumerate(row):
+                if COURSE_CODE_RE.match(_norm(cell)):
+                    return ci - mapped_code_cols[0]
+        return 0
+
+    data_rows_sample = [r for r in table[hdr_end:] if any(_norm(c) for c in r)]
+    shift = _detect_shift(data_rows_sample, col_map)
+    if shift != 0:
+        max_col = max(len(r) for r in table)
+        col_map = {
+            field: [c + shift for c in cols if 0 <= c + shift < max_col]
+            for field, cols in col_map.items()
+        }
+
 
     def pick_from(row: list[Any], field_name: str) -> str:
         for idx in col_map.get(field_name, ()):
@@ -203,6 +281,14 @@ def _extract_courses_from_table(
         category = pick_from(raw, "category")
         L, T, P, Cr = (pick_from(raw, k) for k in ("L", "T", "P", "Cr"))
 
+        # If the value found in the 'code' column isn't a real course code
+        # (e.g. "Generic Elective", "Elective-II" — placeholder rows in some
+        # PDFs), demote it: use it as a title supplement and clear the code.
+        if code and not COURSE_CODE_RE.match(code):
+            if not title:
+                title = _clean_title(code)
+            code = ""
+
         is_pure_continuation = (not sn and not code and not category
                                 and not L and not T and not P and not Cr
                                 and title)
@@ -226,6 +312,7 @@ def _extract_courses_from_table(
 
         if not (title or code):
             continue
+
 
         alternate_weeks = [k for k, value in (("L", L), ("T", T), ("P", P), ("Cr", Cr))
                            if value and "*" in value]

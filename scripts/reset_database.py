@@ -23,7 +23,6 @@ import json
 from server.db import close_db, init_db
 from server.db.models import (
     ALL_DOCUMENTS,
-    BaselineDoc,
     BatchDoc,
     ChangeRequestDoc,
     IngestSnapshotDoc,
@@ -39,7 +38,6 @@ FRESH_TIMETABLE_COLLECTIONS = (
     BatchDoc,
     TimetableDoc,
     SemesterDoc,
-    BaselineDoc,
     UploadAttemptDoc,
     IngestSnapshotDoc,
     ParsingErrorDoc,

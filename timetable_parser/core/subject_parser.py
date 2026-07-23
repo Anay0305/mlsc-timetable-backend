@@ -3,7 +3,8 @@ from __future__ import annotations
 import re
 
 
-SUBJECT_CODE_PATTERN = re.compile(r"^([A-Z]{3}\d{3}|[A-Z]{5}\d)[LTP]$")
+# TODO(temporary): the XXX alternative accepts placeholder codes like UMCXXX.
+SUBJECT_CODE_PATTERN = re.compile(r"^([A-Z]{3}(?:\d{3}|XXX)|[A-Z]{5}\d)[LTP]$")
 
 CLASS_TYPE_BY_SUFFIX = {
     "L": "LECTURE",

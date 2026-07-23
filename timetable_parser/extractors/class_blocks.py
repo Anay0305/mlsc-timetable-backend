@@ -22,7 +22,13 @@ from timetable_parser.core.sheet_geometry import (
     visible_bounds_for_cell,
 )
 from timetable_parser.core.subject_catalog import SubjectCatalog, load_default_subject_catalog
-from timetable_parser.core.subject_parser import class_type_for_subject, find_subject_code
+from timetable_parser.core.subject_parser import (
+    CAPSTONE_CODE,
+    CAPSTONE_NAME,
+    class_type_for_subject,
+    find_capstone_type,
+    find_subject_code,
+)
 from timetable_parser.extractors.batch import BatchExtractor
 from timetable_parser.extractors.day_slots import DaySlotExtractor, Slot
 
@@ -131,6 +137,15 @@ class ClassBlockExtractor:
         alternate_week_start = cls._alternate_week_start(raw)
         subject_code = subject_codes[0] if subject_codes else find_subject_code(raw)
         subject_name = subject_catalog.name_for(subject_code)
+        class_type = class_type_for_subject(subject_code)
+        if subject_code is None:
+            # Free-text capstone cells have no code; give them a synthetic one
+            # so they don't surface as SUBJECT_CODE_NOT_DETECTED errors.
+            capstone_type = find_capstone_type(raw)
+            if capstone_type is not None:
+                subject_code = CAPSTONE_CODE
+                subject_name = CAPSTONE_NAME
+                class_type = capstone_type
         options = build_elective_options(raw, subject_catalog)
         final_bounds = CellBounds(
             min_row=start_slot.cell.row,
@@ -160,7 +175,7 @@ class ClassBlockExtractor:
             end_time=end_time(start_slot.time, periods),
             subject_code=subject_code,
             subject_name=subject_name,
-            type=class_type_for_subject(subject_code),
+            type=class_type,
             confidence=confidence.level,
             confidence_score=confidence.score,
             confidence_reasons=confidence.reasons,

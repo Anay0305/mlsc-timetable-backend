@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from server import storage
 from server.auth import require_admin
-from server.db.models import ClassEntry, SubjectRequestDoc
+from server.db.models import ClassEntry, SubjectRequestDoc, SubjectDoc, ChangeRequestDoc
 from server.rate_limit import limiter
 
 router = APIRouter(tags=["change-requests"])
@@ -119,6 +119,12 @@ async def submit_subject_request(
     )
     if existing is not None:
         raise HTTPException(status_code=409, detail={"error": "A subject request for this code is already pending", "code": "duplicate"})
+    cat_match = await SubjectDoc.find_one(SubjectDoc.code == code)
+    if cat_match is not None and cat_match.name.strip().lower() == name.strip().lower():
+        raise HTTPException(
+            status_code=409,
+            detail={"error": f"Subject '{code}' is already mapped in catalog as '{cat_match.name}'", "code": "already_mapped"},
+        )
     requester_email = request.headers.get("X-User-Email") or body.requester_email
     doc = SubjectRequestDoc(
         requester_id=request.headers.get("X-User-Id"),
@@ -159,10 +165,13 @@ async def list_subject_requests(
         query = SubjectRequestDoc.find(SubjectRequestDoc.status == status, sort=[("created_at", -1)])
     rows = []
     async for doc in query.limit(limit):
+        cat_match = await SubjectDoc.find_one(SubjectDoc.code == doc.code)
         rows.append({
             "id": str(doc.id), "requester_batch": doc.requester_batch,
             "requester_id": doc.requester_id, "requester_email": getattr(doc, "requester_email", None),
             "code": doc.code, "name": doc.name, "status": doc.status,
+            "already_mapped": cat_match is not None,
+            "existing_catalog_name": cat_match.name if cat_match else None,
             "created_at": doc.created_at.isoformat(),
         })
     return {"items": rows, "count": len(rows)}
@@ -189,7 +198,29 @@ async def approve_subject_request(
         "decision_note": body.note if body else None,
         "decided_at": datetime.now(timezone.utc),
     })
-    return {"ok": True, "subject": row, "request_id": request_id}
+
+    # Auto-reject pending change requests targeting this same subject code,
+    # as the catalog update now handles the subject mapping globally across all batches.
+    auto_rejected_count = 0
+    pending_crs = await ChangeRequestDoc.find(ChangeRequestDoc.status == "pending").to_list()
+    now_utc = datetime.now(timezone.utc)
+    for cr in pending_crs:
+        cr_code = (cr.entry or {}).get("code") or (cr.existing_entry or {}).get("code")
+        if cr_code and "".join(ch for ch in str(cr_code).strip().upper() if ch.isalnum()) == doc.code:
+            await cr.set({
+                "status": "rejected",
+                "decided_by": principal.label,
+                "decided_at": now_utc,
+                "decision_note": f"Auto-rejected: Subject '{doc.code}' was approved in global catalog ({doc.name})",
+            })
+            auto_rejected_count += 1
+
+    return {
+        "ok": True,
+        "subject": row,
+        "request_id": request_id,
+        "auto_rejected_change_requests": auto_rejected_count,
+    }
 
 
 @admin_router.post("/subjects/{request_id}/reject")

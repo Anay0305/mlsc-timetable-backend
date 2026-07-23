@@ -1098,6 +1098,14 @@ async def list_change_requests(
         serialized = _serialize_change_request(doc)
         if serialized.get("existing_entry") is None:
             serialized["existing_entry"] = await get_existing_entry_for_slot(doc.requester_batch, doc.day, doc.start_time)
+        code = (serialized.get("entry") or {}).get("code") or (serialized.get("existing_entry") or {}).get("code")
+        if code:
+            code_clean = "".join(ch for ch in str(code).strip().upper() if ch.isalnum())
+            if code_clean:
+                cat_match = await SubjectDoc.find_one(SubjectDoc.code == code_clean)
+                if cat_match:
+                    serialized["catalog_name"] = cat_match.name
+                    serialized["already_mapped"] = True
         out.append(serialized)
         if len(out) >= limit:
             break

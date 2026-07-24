@@ -6,7 +6,12 @@ from openpyxl.cell.cell import Cell
 from openpyxl.worksheet.worksheet import Worksheet
 
 from timetable_parser.core.confidence import assess_confidence
-from timetable_parser.core.elective_parser import build_elective_options, elective_mapping_counts, find_subject_codes
+from timetable_parser.core.elective_parser import (
+    bare_subject_code,
+    build_elective_options,
+    elective_mapping_counts,
+    find_subject_codes,
+)
 from timetable_parser.core.models import CellBounds, ClassBlock, RawCell
 from timetable_parser.core.sheet_geometry import (
     build_merge_bounds,
@@ -136,7 +141,9 @@ class ClassBlockExtractor:
         # block while options preserve the individual subject/place/teacher combinations.
         subject_codes = find_subject_codes(raw)
         alternate_week_start = cls._alternate_week_start(raw)
-        subject_code = subject_codes[0] if subject_codes else find_subject_code(raw)
+        # The primary code anchors the block for catalog/type lookup, so keep it
+        # bare even when the elective segment preserved an attached group tag.
+        subject_code = bare_subject_code(subject_codes[0]) if subject_codes else find_subject_code(raw)
         subject_name = subject_catalog.name_for(subject_code)
         class_type = class_type_for_subject(subject_code)
         if subject_code is None:

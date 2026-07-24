@@ -76,8 +76,18 @@ def find_subject_codes(raw: list[str]) -> list[str]:
     codes: list[str] = []
     seen_prior: set[str] = set()
     for value in raw:
+        segments = split_multi_value(value)
+        # A group of codes usually shares one L/T/P suffix written only on the
+        # last one (e.g. "UCS546/URA411/URA732/URA414P" is all Practical). Use the
+        # last explicit suffix in the value for every code that omits its own,
+        # falling back to Lecture when none of them carry a suffix.
+        default_suffix = "L"
+        for segment in segments:
+            for token_match in SUBJECT_TOKEN_PATTERN.finditer(segment.upper().replace(" ", "")):
+                if token_match.group(2):
+                    default_suffix = token_match.group(2)
         this_value: set[str] = set()
-        for segment in split_multi_value(value):
+        for segment in segments:
             normalized = segment.strip().upper().replace(" ", "")
             matches = list(SUBJECT_TOKEN_PATTERN.finditer(normalized))
             if not matches:
@@ -85,18 +95,17 @@ def find_subject_codes(raw: list[str]) -> list[str]:
             # One code in this segment: keep the whole thing so attached text
             # (e.g. a group tag) survives. Several codes jammed together (a
             # missing "/" between them) are split back into bare codes so their
-            # count still matches the rooms/teachers listed alongside. Either way,
-            # a code with no L/T/P suffix gets a Lecture "L" injected after it.
+            # count still matches the rooms/teachers listed alongside.
             if len(matches) == 1:
                 match = matches[0]
                 if match.group(2):
                     candidates = [normalized]
                 else:
-                    # inject the default "L" right after the bare code, keeping
+                    # inject the shared suffix right after the bare code, keeping
                     # any attached text (e.g. a group tag) that follows it.
-                    candidates = [normalized[: match.end(1)] + "L" + normalized[match.end(1) :]]
+                    candidates = [normalized[: match.end(1)] + default_suffix + normalized[match.end(1) :]]
             else:
-                candidates = [m.group(1) + (m.group(2) or "L") for m in matches]
+                candidates = [m.group(1) + (m.group(2) or default_suffix) for m in matches]
             for candidate in candidates:
                 if candidate in seen_prior:
                     continue

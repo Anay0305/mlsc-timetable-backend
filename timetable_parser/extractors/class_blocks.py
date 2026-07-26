@@ -215,13 +215,18 @@ class ClassBlockExtractor:
 
     @staticmethod
     def find_batch_cells(sheet: Worksheet) -> list[Cell]:
-        anchor = BatchExtractor.find_anchor_cell(sheet)
-        if anchor is None:
-            return []
-
+        # Header layouts can place regular cohorts and special cohorts on
+        # different rows (the 2+2 headers are one row below adjacent batches).
+        # Scan the sheet for valid batch-shaped cells instead of assuming one
+        # header row; timetable values do not begin with a digit.
         cells: list[Cell] = []
-        for col in range(anchor.column, sheet.max_column + 1):
-            cell = sheet.cell(row=anchor.row, column=col)
-            if BatchExtractor.is_batch_code(cell.value):
+        seen: set[str] = set()
+        for row in sheet.iter_rows():
+            for cell in row:
+                if not BatchExtractor.is_batch_code(cell.value):
+                    continue
+                if cell.coordinate in seen:
+                    continue
+                seen.add(cell.coordinate)
                 cells.append(cell)
         return cells

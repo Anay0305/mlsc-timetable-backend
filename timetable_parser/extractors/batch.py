@@ -14,7 +14,9 @@ logger = logging.getLogger(__name__)
 class BatchExtractor:
     """Find batch anchor cells such as 1B14, 1A11, or 3C11."""
 
-    batch_code_pattern = re.compile(r"^\d[A-Z]\d{2}$")
+    # Standard batches are e.g. 2C11. International 2+2 cohorts use a
+    # descriptive alphabetic suffix, e.g. "2 UOQ" -> "2UOQ".
+    batch_code_pattern = re.compile(r"^\d[A-Z][A-Z0-9]{2,}$")
 
     @classmethod
     def find_anchor_cell(cls, sheet: Worksheet) -> Cell | None:

@@ -26,6 +26,20 @@ from typing import Any, Iterable, Mapping
 
 TOTAL_KEY = "total"
 
+SPECIAL_BATCH_SCHEME_GROUPS = {
+    "2UOQ": "2C",
+    "2UNSW": "2C",
+    "2TCD": "2C",
+}
+
+
+def scheme_group_for_batch(code: str) -> str:
+    """Return the baseline group, including aliases for non-standard codes."""
+    normalized = str(code or "").strip().upper()
+    if normalized in SPECIAL_BATCH_SCHEME_GROUPS:
+        return SPECIAL_BATCH_SCHEME_GROUPS[normalized]
+    return normalized[:2].upper() if len(normalized) >= 2 else "??"
+
 
 def count_classes(classes: Iterable[Any]) -> dict[str, Any]:
     """Count classes by type, total, and subject-code/type."""
@@ -95,6 +109,9 @@ def build_doctor_report(
 
     groups: dict[str, list[str]] = defaultdict(list)
     for code in counts_by_batch:
+        if code.upper() in SPECIAL_BATCH_SCHEME_GROUPS:
+            groups[scheme_group_for_batch(code)].append(code)
+            continue
         if len(code) < 2 or not code[0].isdigit() or not code[1].isalpha():
             groups["??"].append(code)
             continue

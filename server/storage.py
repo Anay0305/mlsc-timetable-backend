@@ -1409,7 +1409,15 @@ _BATCH_PATTERN = re.compile(r"^(?P<year>\d)(?P<section>[A-Z]+)")
 
 def _derive_batch_meta(code: str) -> dict[str, Any]:
     """Best-effort split of a batch code like "1B11" into year=1, section="B"."""
-    m = _BATCH_PATTERN.match(code)
+    special = {
+        "2UOQ": "C",
+        "2UNSW": "C",
+        "2TCD": "C",
+    }
+    normalized = code.strip().upper()
+    if normalized in special:
+        return {"year": 2, "section": special[normalized]}
+    m = _BATCH_PATTERN.match(normalized)
     if not m:
         return {"year": None, "section": None}
     year = int(m.group("year"))

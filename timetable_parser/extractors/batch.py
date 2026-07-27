@@ -14,9 +14,11 @@ logger = logging.getLogger(__name__)
 class BatchExtractor:
     """Find batch anchor cells such as 1B14, 1A11, or 3C11."""
 
-    # Standard batches are e.g. 2C11. International 2+2 cohorts use a
-    # descriptive alphabetic suffix, e.g. "2 UOQ" -> "2UOQ".
-    batch_code_pattern = re.compile(r"^\d[A-Z][A-Z0-9]{2,}$")
+    # Keep the regular format strict so adjacent spreadsheet headers such as
+    # "1A1A" cannot become a duplicate of the real "1A11" batch. The only
+    # non-standard codes are the named Computer Engineering (2+2) cohorts.
+    standard_batch_code_pattern = re.compile(r"^\d[A-Z]\d{2}$")
+    special_batch_codes = frozenset({"2UOQ", "2UNSW", "2TCD"})
 
     @classmethod
     def find_anchor_cell(cls, sheet: Worksheet) -> Cell | None:
@@ -41,7 +43,13 @@ class BatchExtractor:
     @classmethod
     def is_batch_code(cls, value: object) -> bool:
         text = cls.normalize(value)
-        return bool(text and cls.batch_code_pattern.fullmatch(text))
+        return bool(
+            text
+            and (
+                cls.standard_batch_code_pattern.fullmatch(text)
+                or text in cls.special_batch_codes
+            )
+        )
 
     @staticmethod
     def normalize(value: object) -> str | None:

@@ -1,0 +1,67 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      PORT: "8000"
+      # Keep this at one unless the calendar worker is moved to a dedicated
+      # process. More workers each start their own polling loop.
+      WEB_CONCURRENCY: "1"
+    expose:
+      - "8000"
+    init: true
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - app_network
+
+  nginx:
+    image: nginx:1.27-alpine
+    environment:
+      DOMAIN: ${DOMAIN:?Set DOMAIN in .env to the API hostname}
+      # Only substitute DOMAIN in the Nginx template. This preserves Nginx
+      # runtime variables such as $host and $proxy_add_x_forwarded_for.
+      NGINX_ENVSUBST_FILTER: DOMAIN
+    depends_on:
+      api:
+        condition: service_healthy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/nginx/templates:/etc/nginx/templates:ro
+      - ./certbot/conf:/etc/letsencrypt:ro
+      - ./certbot/www:/var/www/certbot:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app_network
+
+  # Run on demand, e.g. `docker compose run --rm certbot renew`. It is not
+  # started with the application stack.
+  certbot:
+    image: certbot/certbot:v2.11.0
+    profiles: ["tools"]
+    volumes:
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+
+networks:
+  app_network:
+    driver: bridge

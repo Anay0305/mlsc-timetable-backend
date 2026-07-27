@@ -87,7 +87,10 @@ def create_app() -> FastAPI:
     # report it as a misleading cross-origin failure.
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        # Keep the browser policy aligned with CORS_ORIGINS. Nginx protects
+        # the origin server, but CORS is still required while the frontend is
+        # hosted on a separate domain.
+        allow_origins=list(settings.cors_origins),
         allow_credentials=False,
         allow_methods=["*"],
         allow_headers=["*"],

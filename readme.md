@@ -10,6 +10,13 @@ The current codebase focuses on the timetable parser. It reads spreadsheet-based
 
 Planned backend work includes API endpoints, PostgreSQL database integration, and a clean ingestion flow from parsed spreadsheet data to production-ready timetable records.
 
+## Deployment
+
+The production deployment target is an EC2 instance running Docker Compose.
+Nginx is the public HTTPS reverse proxy and the FastAPI container stays on the
+private Docker network. Follow [the EC2 deployment guide](docs/EC2_DEPLOYMENT.md)
+for DNS, TLS certificates, environment variables, renewal, and updates.
+
 ## Current Scope
 
 - Thapar timetable spreadsheet parsing

@@ -1,6 +1,7 @@
 .git
 .github
 .env
+certbot
 .venv
 __pycache__
 *.py[cod]

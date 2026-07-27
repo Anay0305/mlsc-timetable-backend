@@ -19,6 +19,7 @@ def class_blocks_to_jsonable(blocks: dict[str, dict[str, list[ClassBlock]]]) -> 
                     "periods": block.periods,
                     "subject_code": block.subject_code,
                     "subject_name": block.subject_name,
+                    "teacher": block.teacher,
                     "type": block.type,
                     "confidence": block.confidence,
                     "confidence_score": block.confidence_score,

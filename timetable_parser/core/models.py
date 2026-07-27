@@ -44,6 +44,7 @@ class ClassBlock:
     end_time: str
     subject_code: str | None
     subject_name: str | None
+    teacher: str | None
     type: str
     confidence: str
     confidence_score: int

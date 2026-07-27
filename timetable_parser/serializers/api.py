@@ -87,6 +87,7 @@ def _split_block(block: ClassBlock, day: str) -> Iterable[dict[str, object]]:
             "end_time": end,
             "subject": subject,
             "code": None if is_elective_group else block.subject_code,
+            "teacher": None if is_elective_group else block.teacher,
             "type": type_title,
             "room": room,
             "options": options,

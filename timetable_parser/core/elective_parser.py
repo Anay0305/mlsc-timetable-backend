@@ -211,6 +211,26 @@ def collect_teacher_candidates(raw: list[str]) -> list[str]:
     return candidates
 
 
+def find_class_teacher(raw: list[str]) -> str | None:
+    """Return the teacher-code line for a normal (non-elective) class.
+
+    Regular timetable cells place the teacher on its own final visual line,
+    after the subject and room. Requiring every token on that line to look
+    teacher-like avoids treating room values such as ``W/SHOP`` as a teacher.
+    The original slash-separated spelling is kept so team-taught classes can
+    store all listed codes in one value.
+    """
+    for value in reversed(raw[1:]):
+        if should_skip_metadata(value):
+            continue
+        tokens = split_multi_value(value)
+        if not tokens:
+            continue
+        if all(is_teacher_like(token) and not is_place_like(token) for token in tokens):
+            return value.strip()
+    return None
+
+
 def split_multi_value(value: str) -> list[str]:
     return [token.strip() for token in re.split(r"[/\n]", value) if token.strip()]
 

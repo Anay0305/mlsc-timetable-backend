@@ -10,6 +10,7 @@ from timetable_parser.core.elective_parser import (
     bare_subject_code,
     build_elective_options,
     elective_mapping_counts,
+    find_class_teacher,
     find_subject_codes,
 )
 from timetable_parser.core.models import CellBounds, ClassBlock, RawCell
@@ -162,6 +163,7 @@ class ClassBlockExtractor:
                     subject_code, class_type = manual
                     subject_name = subject_code
         options = build_elective_options(raw, subject_catalog)
+        teacher = None if len(options) > 1 else find_class_teacher(raw)
         final_bounds = CellBounds(
             min_row=start_slot.cell.row,
             min_col=base_bounds.min_col,
@@ -190,6 +192,7 @@ class ClassBlockExtractor:
             end_time=end_time(start_slot.time, periods),
             subject_code=subject_code,
             subject_name=subject_name,
+            teacher=teacher,
             type=class_type,
             confidence=confidence.level,
             confidence_score=confidence.score,

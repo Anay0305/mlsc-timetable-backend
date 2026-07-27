@@ -183,6 +183,8 @@ async def get_my_timetable(
         ) from exc
     overrides = await _load_overrides(user_id, code)
     merged = _merge(canonical, overrides)
+    if not merged.get("teacher_codes_visible"):
+        storage.redact_teacher_codes(merged)
     merged["overrides_applied"] = 0 if overrides is None else len(overrides.entries)
     return merged
 

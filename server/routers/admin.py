@@ -34,6 +34,10 @@ class CalendarSyncTestBody(BaseModel):
     email: str
 
 
+class TeacherVisibilityBody(BaseModel):
+    batches: list[str]
+
+
 @router.get("/health")
 async def admin_health() -> dict[str, object]:
     return {"ok": True, "scope": "admin"}
@@ -188,6 +192,32 @@ async def delete_admin_user(email: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "email": email.strip().lower()}
+
+
+@router.get("/teacher-visibility")
+async def get_teacher_visibility() -> dict[str, object]:
+    items = await storage.read_teacher_visibility()
+    return {
+        "items": items,
+        "enabled_batches": [item["batch"] for item in items if item["enabled"]],
+        "count": len(items),
+    }
+
+
+@router.put("/teacher-visibility")
+async def put_teacher_visibility(
+    body: TeacherVisibilityBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        enabled = await storage.replace_teacher_visibility(body.batches)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc),
+            "code": "invalid_batch",
+        }) from exc
+    logger.info("Teacher visibility updated by %s: %d batch(es)", principal.label, len(enabled))
+    return {"ok": True, "enabled_batches": enabled, "count": len(enabled)}
 
 
 @router.put("/timetable/{batch}")
@@ -1308,7 +1338,7 @@ async def backfill_baseline_errors(
 async def get_timetable_for_admin(batch: str) -> dict[str, object]:
     """Read a batch's timetable in raw form — used by the Fix grid editor."""
     try:
-        data = await storage.read_timetable(batch)
+        data = await storage.read_timetable(batch, include_hidden_teachers=True)
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={
             "error": str(exc), "code": "not_found",
@@ -1327,7 +1357,7 @@ async def patch_timetable(batch: str, payload: dict) -> dict[str, object]:
     """
     _validate_timetable_payload(payload)
     try:
-        current = await storage.read_timetable(batch)
+        current = await storage.read_timetable(batch, include_hidden_teachers=True)
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={
             "error": str(exc), "code": "not_found",

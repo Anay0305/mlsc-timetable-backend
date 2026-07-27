@@ -75,7 +75,12 @@ async def read_current(settings: Settings | None = None) -> dict[str, Any]:
     return result
 
 
-async def read_timetable(batch: str, settings: Settings | None = None) -> dict[str, Any]:
+async def read_timetable(
+    batch: str,
+    settings: Settings | None = None,
+    *,
+    include_hidden_teachers: bool = False,
+) -> dict[str, Any]:
     code = _safe_batch(batch)
     doc = await TimetableDoc.find_one(TimetableDoc.code == code)
     if doc is None:
@@ -85,6 +90,11 @@ async def read_timetable(batch: str, settings: Settings | None = None) -> dict[s
     from timetable_parser.core.subject_catalog import ensure_catalog
     catalog = await ensure_catalog()
     payload = _timetable_payload(doc, catalog)
+    batch_doc = await BatchDoc.find_one(BatchDoc.code == code)
+    teacher_codes_visible = bool(batch_doc and batch_doc.teacher_codes_visible)
+    payload["teacher_codes_visible"] = teacher_codes_visible
+    if not teacher_codes_visible and not include_hidden_teachers:
+        redact_teacher_codes(payload)
     try:
         current = await read_current(settings=settings)
         year = str(code[0]) if code and code[0].isdigit() else "1"
@@ -92,6 +102,36 @@ async def read_timetable(batch: str, settings: Settings | None = None) -> dict[s
     except DataMissing:
         payload["term_start_date"] = None
     return payload
+
+
+async def read_teacher_visibility() -> list[dict[str, Any]]:
+    """Return every known batch and its public teacher-code visibility."""
+    return [
+        {
+            "batch": doc.code,
+            "enabled": bool(doc.teacher_codes_visible),
+            "year": doc.year,
+            "section": doc.section,
+        }
+        async for doc in BatchDoc.find_all(sort=[("code", 1)])
+    ]
+
+
+async def replace_teacher_visibility(batches: list[str]) -> list[str]:
+    """Replace the exact set of batches allowed to expose teacher codes."""
+    requested = {_safe_batch(batch) for batch in batches}
+    docs = [doc async for doc in BatchDoc.find_all()]
+    known = {doc.code for doc in docs}
+    unknown = sorted(requested - known)
+    if unknown:
+        raise ValueError(f"Unknown batch code(s): {', '.join(unknown)}")
+
+    now = datetime.now(timezone.utc)
+    for doc in docs:
+        enabled = doc.code in requested
+        if bool(doc.teacher_codes_visible) != enabled:
+            await doc.set({"teacher_codes_visible": enabled, "updated_at": now})
+    return sorted(requested)
 
 
 # ── Writes ───────────────────────────────────────────────────────────────
@@ -1343,6 +1383,23 @@ def _serialize_class(entry: Any, catalog: Any = None) -> dict[str, Any]:
                     if resolved:
                         opt["subject_name"] = resolved
     return out
+
+
+def redact_teacher_codes(payload: dict[str, Any]) -> None:
+    """Remove teacher codes from a public payload without mutating DB models."""
+    classes = payload.get("classes") or []
+    if not isinstance(classes, list):
+        return
+    for entry in classes:
+        if not isinstance(entry, dict):
+            continue
+        entry.pop("teacher", None)
+        options = entry.get("options")
+        if not isinstance(options, list):
+            continue
+        for option in options:
+            if isinstance(option, dict):
+                option.pop("teacher", None)
 
 
 def _norm_subject(value: Any) -> str:

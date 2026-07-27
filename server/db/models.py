@@ -36,6 +36,7 @@ class ClassEntry(BaseModel):
     end_time: str
     subject: Optional[str] = None
     code: Optional[str] = None
+    teacher: Optional[str] = None
     type: str = "Unknown"
     room: Optional[str] = None
     options: list[ElectiveOption] = Field(default_factory=list)
@@ -66,6 +67,7 @@ class BatchDoc(Document):
     year: Optional[int] = None
     section: Optional[str] = None
     source_sheet: Optional[str] = None
+    teacher_codes_visible: bool = False
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 

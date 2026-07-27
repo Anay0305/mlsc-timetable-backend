@@ -105,3 +105,33 @@ reboot once Docker itself is enabled. Check `https://<api-host>/healthz` from
 your monitoring system. Keep `WEB_CONCURRENCY=1` while calendar sync is an
 in-process worker; scale it only after moving that worker into a dedicated
 service.
+
+## Continuous deployment from GitHub Actions
+
+The workflow in `.github/workflows/ec2-deploy.yml` validates Python syntax and
+builds the Docker image for every pull request and push. A successful push to
+`main` then updates the EC2 checkout and recreates the Compose stack.
+
+Create a dedicated deploy key on the EC2 instance as `ubuntu`:
+
+```bash
+ssh-keygen -t ed25519 -f ~/.ssh/github_actions_deploy -C github-actions -N ""
+cat ~/.ssh/github_actions_deploy.pub >> ~/.ssh/authorized_keys
+chmod 600 ~/.ssh/authorized_keys
+```
+
+In the GitHub repository, open **Settings → Secrets and variables → Actions**
+and add these repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `EC2_HOST` | The EC2 public IP or hostname. |
+| `EC2_USER` | `ubuntu` |
+| `EC2_SSH_PRIVATE_KEY` | Contents of `~/.ssh/github_actions_deploy` on EC2. |
+| `EC2_KNOWN_HOSTS` | Output of `ssh-keyscan -H <EC2 public IP>`. |
+
+Keep the production environment approval optional but recommended: create a
+GitHub environment named `production` and require a reviewer before deploys.
+The workflow uses `git pull --ff-only`, so it refuses to overwrite unexpected
+tracked changes on the server. The untracked `.env` and Let’s Encrypt files
+remain on EC2 and are never sent to GitHub.

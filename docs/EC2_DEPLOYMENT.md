@@ -130,6 +130,10 @@ and add these repository secrets:
 | `EC2_SSH_PRIVATE_KEY` | Contents of `~/.ssh/github_actions_deploy` on EC2. |
 | `EC2_KNOWN_HOSTS` | Output of `ssh-keyscan -H <EC2 public IP>`. |
 
+Add a repository variable named `EC2_DEPLOY_ENABLED` with the value `true`
+only after all four secrets are present. Until then, pushes still run CI but
+skip the deployment job safely.
+
 Keep the production environment approval optional but recommended: create a
 GitHub environment named `production` and require a reviewer before deploys.
 The workflow uses `git pull --ff-only`, so it refuses to overwrite unexpected

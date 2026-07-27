@@ -35,7 +35,7 @@ jobs:
   deploy:
     name: Deploy main to EC2
     needs: validate
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.EC2_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-latest
     environment: production
 

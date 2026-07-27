@@ -324,6 +324,8 @@ below requires `Authorization: Bearer <ADMIN_TOKEN>`.
 - `PUT /admin/current` → set semester label
 - `POST /admin/ingest` *(multipart)* → parse uploaded `.xlsx/.xlsm`
 - `POST /admin/baselines/{key}` / `DELETE /admin/baselines/{key}`
+- `GET /admin/library` / `GET|PUT|DELETE /admin/library/{branch}/{semester}`
+- `POST /admin/library-import/preview` / `POST /admin/library-import/apply`
 - `POST /admin/contributors` / `DELETE /admin/contributors/{username}`
 - `GET /admin/change-requests?status=pending&limit=100`
 - `POST /admin/change-requests/{id}/approve`

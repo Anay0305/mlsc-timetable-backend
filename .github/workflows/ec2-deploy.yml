@@ -30,6 +30,9 @@ jobs:
       - name: Check Python syntax
         run: python -m compileall -q server timetable_parser
 
+      - name: Run backend unit tests
+        run: python -m unittest discover -s tests -v
+
       - name: Build production image
         run: docker build --tag mlsc-timetable-backend:ci .
 

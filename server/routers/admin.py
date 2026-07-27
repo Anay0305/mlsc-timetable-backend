@@ -7,6 +7,7 @@ with real user sessions in Phase 3.
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -36,6 +37,12 @@ class CalendarSyncTestBody(BaseModel):
 
 class TeacherVisibilityBody(BaseModel):
     batches: list[str]
+
+
+class CurriculumLibraryBody(BaseModel):
+    sections: list[dict]
+    source: Optional[str] = None
+    revision: Optional[int] = None
 
 
 @router.get("/health")
@@ -789,6 +796,279 @@ async def post_scheme_apply_plan(
     }
 
 
+def _library_kind_for_scheme_course(course: dict) -> str:
+    """Best-effort section mapping; uncertain coded rows remain core."""
+    text = " ".join(
+        str(course.get(field) or "") for field in ("title", "category")
+    ).upper().replace("_", " ")
+    if any(token in text for token in ("GENERAL ELECTIVE", "GENERIC ELECTIVE", "OPEN ELECTIVE")):
+        return "general_elective"
+    match = re.search(r"ELECTIVE\s*[-–]?\s*(III|II|I|3|2|1)\b", text)
+    if match:
+        number = {"I": 1, "II": 2, "III": 3}.get(match.group(1), int(match.group(1)) if match.group(1).isdigit() else 1)
+        return f"elective_{number}"
+    return "core"
+
+
+def _library_scheme_rows(parsed: dict, branch: str) -> list[dict]:
+    """Map parsed semesters to Library branch/semester rows without Baselines."""
+    rows: list[dict] = []
+    is_pool = branch == _POOL_SELECTOR
+    is_independent = branch in _INDEPENDENT_BRANCHES
+    for semester_row in parsed.get("semesters") or []:
+        semester = int(semester_row.get("number") or 0)
+        if is_pool and semester not in (1, 2):
+            continue
+        if not is_pool and not is_independent and semester in (1, 2):
+            continue
+        courses = [
+            course
+            for option in (semester_row.get("options") or [])
+            for course in (option.get("courses") or [])
+        ]
+        if is_pool:
+            # Pool B follows the opposite year-one rotation.
+            targets = [("POOL-A", semester), ("POOL-B", 3 - semester)]
+        else:
+            targets = [(branch, semester)]
+        for target_branch, target_semester in targets:
+            rows.append({
+                "branch": target_branch,
+                "semester": target_semester,
+                "courses": courses,
+            })
+    rows.sort(key=lambda row: (row["branch"], row["semester"]))
+    return rows
+
+
+def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list[dict]:
+    """Convert parsed scheme rows into separate Library documents."""
+    plan: list[dict] = []
+    for row in rows:
+        branch = str(row.get("branch") or "").strip().upper()
+        try:
+            semester = int(row.get("semester") or 0)
+            storage.library_key(branch, semester)
+        except (TypeError, ValueError):
+            continue
+        buckets: dict[str, list[str]] = {"core": []}
+        missing_details: list[dict[str, str]] = []
+        baseline_suggestion = {"Lecture": 0, "Tutorial": 0, "Practical": 0}
+        seen: set[str] = set()
+        for course in row.get("courses") or []:
+            if not isinstance(course, dict):
+                continue
+            kind = _library_kind_for_scheme_course(course)
+            buckets.setdefault(kind, [])
+            raw_code = str(course.get("code") or "").strip()
+            if not raw_code:
+                # Placeholder rows create the elective section but are not
+                # catalog subjects themselves.
+                continue
+            try:
+                code = storage._normalize_subject_code(raw_code)
+            except ValueError:
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            buckets[kind].append(code)
+            missing_details.append({"code": code, "title": str(course.get("title") or "").strip()})
+            baseline_suggestion["Lecture"] += storage._numeric_str(course.get("L"))
+            baseline_suggestion["Tutorial"] += storage._numeric_str(course.get("T"))
+            baseline_suggestion["Practical"] += storage._numeric_str(course.get("P"))
+        sections = [
+            {"kind": kind, "subject_codes": buckets[kind]}
+            for kind in storage.LIBRARY_SECTION_LABELS
+            if kind in buckets
+        ]
+        plan.append({
+            "key": storage.library_key(branch, semester),
+            "branch": branch,
+            "semester": semester,
+            "sections": sections,
+            "source": source,
+            "parsed_subjects": missing_details,
+            # Suggestions are preview-only. The apply endpoint below ignores
+            # this object and never writes to BaselineDoc.
+            "baseline_suggestion": {k: v for k, v in baseline_suggestion.items() if v},
+        })
+    return plan
+
+
+@router.post("/library-import/preview")
+async def preview_library_scheme(
+    branch: str = Form(...),
+    file: UploadFile = File(...),
+) -> dict[str, object]:
+    """Parse a scheme PDF into Library records without writing anything."""
+    branch = _validate_branch(branch)
+    tmp_path = await _load_scheme_upload(file)
+    try:
+        parsed = parse_scheme_pdf(tmp_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
+    plan = _library_plan_from_scheme_rows(
+        _library_scheme_rows(parsed, branch),
+        file.filename,
+    )
+    existing_items, _ = await storage.list_library_entries(limit=500)
+    existing_by_key = {item["key"]: item for item in existing_items}
+    for entry in plan:
+        existing = existing_by_key.get(entry["key"])
+        entry["would_overwrite"] = existing is not None
+        entry["existing_subject_count"] = existing.get("subject_count", 0) if existing else 0
+    catalog = await storage.list_subjects(limit=100000)
+    catalog_codes = {str(item.get("code") or "").upper() for item in catalog}
+    missing_by_code: dict[str, dict[str, str]] = {}
+    for entry in plan:
+        for subject in entry.pop("parsed_subjects", []):
+            if subject["code"] not in catalog_codes:
+                missing_by_code.setdefault(subject["code"], subject)
+    return {
+        "ok": True,
+        "source": file.filename,
+        "branch": branch,
+        "plan": plan,
+        "entry_count": len(plan),
+        "missing_subjects": list(missing_by_code.values()),
+    }
+
+
+@router.post("/library-import/apply")
+async def apply_library_scheme(
+    payload: dict,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Apply a reviewed Library plan. Baselines are never changed here."""
+    plan = payload.get("plan") if isinstance(payload, dict) else None
+    if not isinstance(plan, list) or not plan:
+        raise HTTPException(status_code=400, detail={
+            "error": "'plan' must be a non-empty list",
+            "code": "invalid_payload",
+        })
+    source = payload.get("source") if isinstance(payload.get("source"), str) else None
+    written: list[dict] = []
+    errors: list[dict] = []
+    prepared: list[tuple[str, int, list[dict]]] = []
+    for index, entry in enumerate(plan):
+        if not isinstance(entry, dict):
+            errors.append({"index": index, "error": "entry must be an object"})
+            continue
+        try:
+            clean_branch = storage.normalize_library_branch(str(entry.get("branch") or ""))
+            clean_semester = int(entry.get("semester") or 0)
+            storage.library_key(clean_branch, clean_semester)
+            # Resolve all catalog references before the first write. A missing
+            # subject therefore rejects the whole import instead of leaving a
+            # partially applied Library plan.
+            await storage._clean_library_sections(entry.get("sections"))
+            prepared.append((clean_branch, clean_semester, entry.get("sections")))
+        except (TypeError, ValueError) as exc:
+            errors.append({"index": index, "key": entry.get("key"), "error": str(exc)})
+    if errors:
+        return {"ok": False, "source": source, "written": [], "errors": errors}
+
+    for clean_branch, clean_semester, sections in prepared:
+        try:
+            item = await storage.write_library_entry(
+                clean_branch,
+                clean_semester,
+                sections,
+                source=source,
+                actor=principal.label,
+            )
+            written.append({
+                "key": item["key"],
+                "subject_count": item["subject_count"],
+                "revision": item["revision"],
+            })
+        except (TypeError, ValueError) as exc:  # catalog could change after preflight
+            errors.append({"key": storage.library_key(clean_branch, clean_semester), "error": str(exc)})
+    logger.info(
+        "Library scheme apply by %s: wrote=%d errors=%d",
+        principal.label, len(written), len(errors),
+    )
+    return {"ok": not errors, "source": source, "written": written, "errors": errors}
+
+
+@router.get("/library")
+async def list_library(
+    q: str | None = None,
+    branch: str | None = None,
+    semester: int | None = Query(default=None, ge=1, le=8),
+    limit: int = Query(default=100, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, object]:
+    try:
+        items, total = await storage.list_library_entries(
+            q=q, branch=branch, semester=semester, limit=limit, offset=offset,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_library_filter",
+        }) from exc
+    return {"items": items, "count": total, "limit": limit, "offset": offset}
+
+
+@router.get("/library/{branch}/{semester}")
+async def get_library(branch: str, semester: int) -> dict[str, object]:
+    try:
+        return await storage.read_library_entry(branch, semester)
+    except storage.DataMissing as exc:
+        raise HTTPException(status_code=404, detail={
+            "error": str(exc), "code": "library_not_found",
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_library_key",
+        }) from exc
+
+
+@router.put("/library/{branch}/{semester}")
+async def put_library(
+    branch: str,
+    semester: int,
+    body: CurriculumLibraryBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        item = await storage.write_library_entry(
+            branch,
+            semester,
+            body.sections,
+            source=body.source,
+            expected_revision=body.revision,
+            actor=principal.label,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": str(exc),
+            "code": "revision_conflict",
+            "current_revision": exc.current_revision,
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_library",
+        }) from exc
+    return {"ok": True, "item": item}
+
+
+@router.delete("/library/{branch}/{semester}")
+async def remove_library(branch: str, semester: int) -> dict[str, object]:
+    try:
+        deleted = await storage.delete_library_entry(branch, semester)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_library_key",
+        }) from exc
+    if not deleted:
+        raise HTTPException(status_code=404, detail={
+            "error": "curriculum library entry not found", "code": "library_not_found",
+        })
+    return {"ok": True}
+
+
 @router.post("/contributors")
 async def post_contributor(payload: dict) -> dict[str, object]:
     """Add (or upsert) a contributor by GitHub username.
@@ -1500,8 +1780,9 @@ async def delete_subject(
     try:
         ok = await storage.delete_subject(code, force=force)
     except PermissionError as exc:
+        error_code = "subject_in_use" if "Curriculum Library" in str(exc) else "seed_protected"
         raise HTTPException(status_code=409, detail={
-            "error": str(exc), "code": "seed_protected",
+            "error": str(exc), "code": error_code,
         }) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={

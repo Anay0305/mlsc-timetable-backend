@@ -31,6 +31,8 @@ from server.db.models import (
     CalendarOverrideDoc,
     ChangeRequestDoc,
     ContributorDoc,
+    CurriculumLibraryDoc,
+    CurriculumSection,
     ExamDateDoc,
     IngestSnapshotDoc,
     ParsingErrorDoc,
@@ -842,6 +844,286 @@ async def apply_baseline_alternate_weeks(
                 entry["alternate_week_start"] = 1
                 updated += 1
     return updated
+
+
+# ── Curriculum library ──────────────────────────────────────────────────
+# Curriculum membership is deliberately separate from baseline counts. The
+# two features may share a branch/semester, but neither write path mutates the
+# other collection.
+
+LIBRARY_SECTION_LABELS = {
+    "core": "Core Subjects",
+    "elective_1": "Elective 1",
+    "elective_2": "Elective 2",
+    "elective_3": "Elective 3",
+    "general_elective": "General Elective",
+}
+_LIBRARY_SECTION_ORDER = tuple(LIBRARY_SECTION_LABELS)
+_LIBRARY_BRANCH_RE = re.compile(r"^[A-Z][A-Z0-9+\-]{0,15}$")
+LIBRARY_POOL_BRANCHES = frozenset({"POOL-A", "POOL-B", "POOL-C", "POOL-D"})
+LIBRARY_ALL_SEMESTER_BRANCHES = frozenset({"X", "G", "J", "R"})
+LIBRARY_BRANCH_INHERITANCE = {"CE-2+2": "C"}
+
+
+class LibraryRevisionConflict(Exception):
+    def __init__(self, current_revision: int) -> None:
+        super().__init__("curriculum was changed by another admin")
+        self.current_revision = current_revision
+
+
+def normalize_library_branch(branch: str) -> str:
+    cleaned = re.sub(r"\s+", "", str(branch or "").strip().upper())
+    if not _LIBRARY_BRANCH_RE.fullmatch(cleaned):
+        raise ValueError("branch must be 1-16 uppercase letters/numbers (plus '+' or '-')")
+    return cleaned
+
+
+def library_key(branch: str, semester: int) -> str:
+    clean_branch = normalize_library_branch(branch)
+    try:
+        clean_semester = int(semester)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("semester must be an integer from 1 to 8") from exc
+    if not 1 <= clean_semester <= 8:
+        raise ValueError("semester must be an integer from 1 to 8")
+    resolved_branch = LIBRARY_BRANCH_INHERITANCE.get(clean_branch, clean_branch)
+    if resolved_branch in LIBRARY_POOL_BRANCHES:
+        allowed = {1, 2}
+        rule = "only supports semesters 1 and 2"
+    elif resolved_branch in LIBRARY_ALL_SEMESTER_BRANCHES:
+        allowed = set(range(1, 9))
+        rule = "supports semesters 1 through 8"
+    else:
+        allowed = set(range(3, 9))
+        rule = "only supports semesters 3 through 8"
+    if clean_semester not in allowed:
+        raise ValueError(f"{clean_branch} {rule}")
+    return f"{clean_branch}:S{clean_semester}"
+
+
+async def _clean_library_sections(raw_sections: Any) -> list[CurriculumSection]:
+    if raw_sections is None:
+        raw_sections = []
+    if not isinstance(raw_sections, list):
+        raise ValueError("sections must be a list")
+
+    by_kind: dict[str, CurriculumSection] = {}
+    all_codes: set[str] = set()
+    for index, raw in enumerate(raw_sections):
+        if isinstance(raw, CurriculumSection):
+            kind = raw.kind
+            values = raw.subject_codes
+        elif isinstance(raw, dict):
+            kind = str(raw.get("kind") or "").strip().lower()
+            values = raw.get("subject_codes", [])
+        else:
+            raise ValueError(f"sections[{index}] must be an object")
+        if kind not in LIBRARY_SECTION_LABELS:
+            raise ValueError(f"unknown curriculum section {kind!r}")
+        if kind in by_kind:
+            raise ValueError(f"section {kind!r} can only appear once")
+        if not isinstance(values, list):
+            raise ValueError(f"sections[{index}].subject_codes must be a list")
+
+        codes: list[str] = []
+        for value in values:
+            code = _normalize_subject_code(str(value or ""))
+            if code in all_codes:
+                raise ValueError(f"subject {code} appears in more than one section")
+            all_codes.add(code)
+            codes.append(code)
+        by_kind[kind] = CurriculumSection(kind=kind, subject_codes=codes)
+
+    # Core is permanent. New or older clients cannot remove the section.
+    by_kind.setdefault("core", CurriculumSection(kind="core", subject_codes=[]))
+    if len(all_codes) > 300:
+        raise ValueError("a curriculum cannot contain more than 300 subjects")
+
+    if all_codes:
+        found = {
+            doc.code
+            async for doc in SubjectDoc.find({"code": {"$in": sorted(all_codes)}})
+        }
+        missing = sorted(all_codes - found)
+        if missing:
+            raise ValueError(f"subject code(s) not found in catalog: {', '.join(missing)}")
+
+    return [by_kind[kind] for kind in _LIBRARY_SECTION_ORDER if kind in by_kind]
+
+
+async def _library_payload(
+    doc: CurriculumLibraryDoc,
+    *,
+    include_subjects: bool = True,
+) -> dict[str, Any]:
+    codes = {
+        code
+        for section in (doc.sections or [])
+        for code in (section.subject_codes or [])
+    }
+    subjects = ({
+        subject.code: _subject_payload(subject)
+        async for subject in SubjectDoc.find({"code": {"$in": sorted(codes)}})
+    } if codes and include_subjects else {})
+    sections = []
+    seen_kinds: set[str] = set()
+    for section in (doc.sections or []):
+        seen_kinds.add(section.kind)
+        sections.append({
+            "kind": section.kind,
+            "label": LIBRARY_SECTION_LABELS[section.kind],
+            "subject_codes": list(section.subject_codes or []),
+            "subjects": [subjects[code] for code in section.subject_codes if code in subjects]
+            if include_subjects else [],
+        })
+    if "core" not in seen_kinds:
+        sections.insert(0, {
+            "kind": "core",
+            "label": LIBRARY_SECTION_LABELS["core"],
+            "subject_codes": [],
+            "subjects": [],
+        })
+    sections.sort(key=lambda row: _LIBRARY_SECTION_ORDER.index(row["kind"]))
+    return {
+        "key": doc.key,
+        "branch": doc.branch,
+        "semester": doc.semester,
+        "sections": sections,
+        "subject_count": len(codes),
+        "source": doc.source,
+        "revision": doc.revision,
+        "created_by": doc.created_by,
+        "updated_by": doc.updated_by,
+        "created_at": _iso_z(doc.created_at),
+        "updated_at": _iso_z(doc.updated_at),
+        "inherited_from": None,
+        "editable": True,
+    }
+
+
+async def list_library_entries(
+    *,
+    q: str | None = None,
+    branch: str | None = None,
+    semester: int | None = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], int]:
+    qnorm = str(q or "").strip().upper()
+    branch_norm = normalize_library_branch(branch) if branch else None
+    matched: list[CurriculumLibraryDoc] = []
+    async for doc in CurriculumLibraryDoc.find_all(sort=[("branch", 1), ("semester", 1)]):
+        if branch_norm and doc.branch != branch_norm:
+            continue
+        if semester is not None and doc.semester != int(semester):
+            continue
+        if qnorm and qnorm not in doc.key.upper() and qnorm not in doc.branch.upper():
+            continue
+        matched.append(doc)
+    total = len(matched)
+    start = max(0, offset)
+    window = matched[start:start + max(1, limit)]
+    return [await _library_payload(doc, include_subjects=False) for doc in window], total
+
+
+async def read_library_entry(branch: str, semester: int) -> dict[str, Any]:
+    clean_branch = normalize_library_branch(branch)
+    requested_key = library_key(clean_branch, semester)
+    inherited_branch = LIBRARY_BRANCH_INHERITANCE.get(clean_branch)
+    resolved_branch = inherited_branch or clean_branch
+    resolved_key = library_key(resolved_branch, semester)
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == resolved_key)
+    if doc is None:
+        if inherited_branch:
+            raise DataMissing(
+                f"no Computer Engineering curriculum exists for {resolved_key}; "
+                f"{requested_key} inherits from it"
+            )
+        raise DataMissing(f"no curriculum library entry for {requested_key}")
+    payload = await _library_payload(doc)
+    if inherited_branch:
+        payload.update({
+            "key": requested_key,
+            "branch": clean_branch,
+            "inherited_from": resolved_key,
+            "editable": False,
+        })
+    return payload
+
+
+async def write_library_entry(
+    branch: str,
+    semester: int,
+    sections: Any,
+    *,
+    source: str | None = None,
+    expected_revision: int | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    clean_branch = normalize_library_branch(branch)
+    if clean_branch in LIBRARY_BRANCH_INHERITANCE:
+        parent = LIBRARY_BRANCH_INHERITANCE[clean_branch]
+        raise ValueError(
+            f"{clean_branch} inherits automatically from {parent} and cannot be saved separately"
+        )
+    key = library_key(clean_branch, semester)
+    clean_sections = await _clean_library_sections(sections)
+    now = datetime.now(timezone.utc)
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+    if doc is None:
+        if expected_revision not in (None, 0):
+            raise LibraryRevisionConflict(0)
+        doc = CurriculumLibraryDoc(
+            key=key,
+            branch=clean_branch,
+            semester=int(semester),
+            sections=clean_sections,
+            source=source,
+            created_by=actor,
+            updated_by=actor,
+        )
+        await doc.insert()
+    else:
+        if expected_revision is not None and expected_revision != doc.revision:
+            raise LibraryRevisionConflict(doc.revision)
+        updates: dict[str, Any] = {
+            "sections": clean_sections,
+            "revision": doc.revision + 1,
+            "updated_by": actor,
+            "updated_at": now,
+        }
+        if source is not None:
+            updates["source"] = source
+        await doc.set(updates)
+        doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+    return await _library_payload(doc)
+
+
+async def delete_library_entry(branch: str, semester: int) -> bool:
+    clean_branch = normalize_library_branch(branch)
+    if clean_branch in LIBRARY_BRANCH_INHERITANCE:
+        raise ValueError(f"{clean_branch} is inherited and has no separate Library entry")
+    key = library_key(clean_branch, semester)
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+    if doc is None:
+        return False
+    await doc.delete()
+    return True
+
+
+async def library_references_for_subject(code: str) -> list[dict[str, Any]]:
+    norm = _normalize_subject_code(code)
+    references: list[dict[str, Any]] = []
+    async for doc in CurriculumLibraryDoc.find_all():
+        for section in doc.sections or []:
+            if norm in (section.subject_codes or []):
+                references.append({
+                    "key": doc.key,
+                    "branch": doc.branch,
+                    "semester": doc.semester,
+                    "section": section.kind,
+                })
+    return references
 
 
 # ── Contributors ─────────────────────────────────────────────────────────
@@ -2509,6 +2791,16 @@ async def delete_subject(code: str, *, force: bool = False) -> bool:
     doc = await SubjectDoc.find_one(SubjectDoc.code == norm)
     if doc is None:
         return False
+    references = await library_references_for_subject(norm)
+    if references:
+        locations = ", ".join(
+            f"{row['key']} ({LIBRARY_SECTION_LABELS[row['section']]})"
+            for row in references[:5]
+        )
+        suffix = "" if len(references) <= 5 else f" and {len(references) - 5} more"
+        raise PermissionError(
+            f"subject {norm!r} is referenced by Curriculum Library: {locations}{suffix}"
+        )
     if doc.source == "seed" and not force:
         raise PermissionError(
             f"refusing to delete seed subject {norm!r} without force=True"

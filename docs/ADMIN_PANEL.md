@@ -115,7 +115,43 @@ drifted.
 
 ---
 
-## 6. Contributor roster
+## 6. Curriculum Library
+
+The Curriculum Library is deliberately separate from doctor baselines. Each
+record is keyed by a branch and student-facing semester (`C:S3`,
+`CE-2+2:S4`) and contains catalog subject-code references grouped into these
+sections: `core`, `elective_1`, `elective_2`, `elective_3`, and
+`general_elective`.
+
+Pool curricula use the explicit branches `POOL-A`, `POOL-B`, `POOL-C`, and
+`POOL-D`; those keys are valid only for semesters 1 and 2. Independent
+branches `X`, `G`, `J`, and `R` are valid for semesters 1 through 8. Every
+other regular branch is valid from semester 3 onward, matching the Baseline
+scheme rules. `CE-2+2` has no
+independent stored record: reads resolve the matching `C` (Computer
+Engineering) semester automatically and return it as an inherited, read-only
+curriculum.
+
+`core` is permanent and is restored automatically if omitted. Every subject
+code must exist in the Subject Catalog, a code may occur in only one section,
+and referenced catalog subjects cannot be deleted.
+
+- `GET /admin/library` — list configured records.
+- `GET /admin/library/{branch}/{semester}` — read one record.
+- `PUT /admin/library/{branch}/{semester}` — create or replace one record.
+- `DELETE /admin/library/{branch}/{semester}` — remove one record; baselines
+  are not affected.
+- `POST /admin/library-import/preview` *(multipart PDF + branch)* — parse a
+  scheme without writing.
+- `POST /admin/library-import/apply` — apply a reviewed preview plan to the
+  Library only.
+
+The PDF preview includes L/T/P baseline suggestions for the administrator's
+reference, but the Library apply endpoint never writes `BaselineDoc` records.
+
+---
+
+## 7. Contributor roster
 
 The DB stores only GitHub **usernames**; the public `GET /contributors` endpoint
 enriches each one live from `https://api.github.com/users/<u>` (cache TTL
@@ -132,7 +168,7 @@ restart the server).
 
 ---
 
-## 7. Change-request moderation
+## 8. Change-request moderation
 
 Crowd-sourced edits land in `ChangeRequestDoc` with `status="pending"`. The
 admin sub-router (`/admin/change-requests`) is the only way to triage them.
@@ -200,7 +236,7 @@ way to admit new ones.
 
 ---
 
-## 8. Operational notes
+## 9. Operational notes
 
 - **Auth**: rotate `ADMIN_TOKEN` by restarting the process with a new env. No
   invalidation list; the token is the only credential.

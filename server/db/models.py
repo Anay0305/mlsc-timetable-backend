@@ -179,6 +179,46 @@ class BaselineDoc(Document):
         name = "baselines"
 
 
+class CurriculumSection(BaseModel):
+    """One catalog-backed section in a branch/semester curriculum."""
+
+    kind: Literal[
+        "core",
+        "elective_1",
+        "elective_2",
+        "elective_3",
+        "general_elective",
+    ]
+    subject_codes: list[str] = Field(default_factory=list)
+
+
+class CurriculumLibraryDoc(Document):
+    """Subjects offered for one branch and student-facing semester.
+
+    Library records intentionally do not contain baseline counts. Course names
+    are resolved from :class:`SubjectDoc`; only its stable, normalized code is
+    stored here.
+    """
+
+    key: Annotated[str, Indexed(unique=True)]  # e.g. "C:S3", "CE-2+2:S3"
+    branch: str
+    semester: int = Field(ge=1, le=8)
+    sections: list[CurriculumSection] = Field(default_factory=list)
+    source: Optional[str] = None
+    revision: int = 1
+    created_by: Optional[str] = None
+    updated_by: Optional[str] = None
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "curriculum_library"
+        indexes = [
+            [("branch", 1), ("semester", 1)],
+            [("updated_at", -1)],
+        ]
+
+
 class ContributorDoc(Document):
     """A community contributor whose avatar is sourced live from GitHub.
 
@@ -570,6 +610,7 @@ ALL_DOCUMENTS = [
     UserDoc,
     OverrideDoc,
     BaselineDoc,
+    CurriculumLibraryDoc,
     ContributorDoc,
     ChangeRequestDoc,
     SubjectRequestDoc,

@@ -31,6 +31,7 @@ class ElectiveOption(BaseModel):
 
 class ClassEntry(BaseModel):
     model_config = ConfigDict(extra="allow")
+    class_id: Optional[str] = None
     day: str
     start_time: str
     end_time: str
@@ -125,6 +126,39 @@ class OverrideDoc(Document):
         name = "overrides"
         indexes = [
             [("user_id", 1), ("batch", 1)],
+        ]
+
+
+class PersonalOverrideOperation(BaseModel):
+    """One V2 personal timetable operation targeting a stable class id."""
+
+    kind: Literal["elective_pick", "edit", "delete", "add"]
+    target_id: str
+    entry: Optional[ClassEntry] = None
+    base_fingerprint: Optional[str] = None
+    updated_at: datetime = Field(default_factory=_utcnow)
+    migration: Optional[dict[str, Any]] = None
+
+
+class PersonalCustomizationDoc(Document):
+    """Atomic, revisioned personal timetable state for one user and batch."""
+
+    user_id: str
+    batch: str
+    revision: int = 1
+    operations: dict[str, PersonalOverrideOperation] = Field(default_factory=dict)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "personal_timetable_customizations_v2"
+        indexes = [
+            IndexModel(
+                [("user_id", ASCENDING), ("batch", ASCENDING)],
+                unique=True,
+                name="unique_user_batch_v2",
+            ),
+            [("updated_at", -1)],
         ]
 
 
@@ -251,6 +285,7 @@ class ChangeRequestDoc(Document):
     semester: str
     scope: Literal["batch", "class"]
     kind: Literal["add", "edit", "delete"]
+    target_id: Optional[str] = None
     day: str
     start_time: str
     entry: Optional[ClassEntry] = None
@@ -609,6 +644,7 @@ ALL_DOCUMENTS = [
     TimetableDoc,
     UserDoc,
     OverrideDoc,
+    PersonalCustomizationDoc,
     BaselineDoc,
     CurriculumLibraryDoc,
     ContributorDoc,

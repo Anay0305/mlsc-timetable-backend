@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import re
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from server import storage
 from server.auth import require_user_id
@@ -20,7 +22,14 @@ from server.db.models import (
     ClassEntry,
     OverrideDoc,
     OverrideEntry,
+    PersonalCustomizationDoc,
+    PersonalOverrideOperation,
     UserDoc,
+)
+from server.personal_timetable import (
+    apply_operations,
+    merge_draft_operations,
+    with_stable_class_ids,
 )
 
 router = APIRouter(prefix="/me", tags=["me"])
@@ -36,6 +45,18 @@ class SetDefaultBatch(BaseModel):
 class OverrideBody(BaseModel):
     kind: str
     entry: Optional[ClassEntry] = None
+
+
+class PersonalOperationBody(BaseModel):
+    kind: Literal["elective_pick", "edit", "delete", "add"]
+    target_id: str = Field(min_length=3, max_length=128)
+    entry: Optional[ClassEntry] = None
+    base_fingerprint: Optional[str] = Field(default=None, max_length=128)
+
+
+class ApplyPersonalChangesBody(BaseModel):
+    expected_revision: int = Field(default=0, ge=0)
+    operations: list[PersonalOperationBody] = Field(min_length=1, max_length=250)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -57,6 +78,28 @@ async def _load_overrides(user_id: str, batch: str) -> Optional[OverrideDoc]:
     )
 
 
+async def _load_all_legacy_overrides(user_id: str, batch: str) -> list[OverrideDoc]:
+    """Load every legacy doc; old concurrent writes created duplicates."""
+    return await OverrideDoc.find(
+        OverrideDoc.user_id == user_id,
+        OverrideDoc.batch == batch,
+    ).sort("updated_at").to_list()
+
+
+def _merged_legacy_entries(docs: list[OverrideDoc]) -> dict[str, OverrideEntry]:
+    merged: dict[str, OverrideEntry] = {}
+    for doc in sorted(docs, key=lambda item: (item.updated_at, str(item.id))):
+        merged.update(doc.entries or {})
+    return merged
+
+
+async def _load_personal_v2(user_id: str, batch: str) -> Optional[PersonalCustomizationDoc]:
+    return await PersonalCustomizationDoc.find_one(
+        PersonalCustomizationDoc.user_id == user_id,
+        PersonalCustomizationDoc.batch == batch,
+    )
+
+
 def _normalize_batch(value: str) -> str:
     return "".join(ch for ch in value.strip().upper() if ch.isalnum())
 
@@ -71,14 +114,6 @@ async def _require_batch(user_id: str, batch: Optional[str]) -> str:
         raise HTTPException(
             status_code=400,
             detail={"error": "no batch supplied and no default set", "code": "no_batch"},
-        )
-    if user is not None and user.default_batch and user.default_batch != code:
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "error": f"Personal edits are only allowed for your default batch ({user.default_batch})",
-                "code": "default_batch_only",
-            },
         )
     if user is not None and not user.default_batch:
         await user.set({"default_batch": code, "last_seen_at": datetime.now(timezone.utc)})
@@ -97,15 +132,15 @@ def _validate_slot(day: str, slot: str) -> tuple[str, str]:
     return day, slot
 
 
-def _merge(canonical: dict[str, Any], overrides: Optional[OverrideDoc]) -> dict[str, Any]:
-    if overrides is None or not overrides.entries:
+def _merge_legacy(canonical: dict[str, Any], entries: dict[str, OverrideEntry]) -> dict[str, Any]:
+    if not entries:
         return canonical
     classes = list(canonical.get("classes", []))
     touched: set[str] = set()
     merged: list[dict[str, Any]] = []
     for klass in classes:
         key = _slot_key(klass.get("day", ""), klass.get("start_time", ""))
-        ov = overrides.entries.get(key)
+        ov = entries.get(key)
         if ov is None:
             merged.append(klass)
             continue
@@ -113,16 +148,23 @@ def _merge(canonical: dict[str, Any], overrides: Optional[OverrideDoc]) -> dict[
         if ov.kind == "delete":
             continue
         if ov.entry is not None:
-            merged.append(ov.entry.model_dump(exclude_none=False))
+            # Keep the canonical id so a later V2 save can target this class.
+            merged.append({
+                **klass,
+                **ov.entry.model_dump(exclude_none=False),
+                "class_id": klass.get("class_id"),
+            })
         else:
             merged.append(klass)
     # `add`/orphan overrides → append
-    for key, ov in overrides.entries.items():
+    for key, ov in entries.items():
         if key in touched:
             continue
         if ov.kind == "delete" or ov.entry is None:
             continue
-        merged.append(ov.entry.model_dump(exclude_none=False))
+        orphan = ov.entry.model_dump(exclude_none=False)
+        orphan.setdefault("class_id", f"legacy_{str(key).replace('|', '_')}")
+        merged.append(orphan)
     return {**canonical, "classes": merged}
 
 
@@ -150,15 +192,11 @@ async def set_default_batch(
     user = await UserDoc.find_one(UserDoc.user_id == user_id)
     assert user is not None
     previous_batch = user.default_batch
-    if previous_batch and previous_batch != code:
-        old_overrides = await _load_overrides(user_id, previous_batch)
-        if old_overrides is not None:
-            await old_overrides.delete()
     await user.set({"default_batch": code, "last_seen_at": datetime.now(timezone.utc)})
     return {
         "user_id": user_id,
         "default_batch": code,
-        "deleted_previous_batch_overrides": previous_batch if previous_batch != code else None,
+        "deleted_previous_batch_overrides": None,
     }
 
 
@@ -181,12 +219,160 @@ async def get_my_timetable(
             status_code=404,
             detail={"error": str(exc), "code": "batch_not_found", "batch": exc.batch},
         ) from exc
-    overrides = await _load_overrides(user_id, code)
-    merged = _merge(canonical, overrides)
+    canonical_classes = with_stable_class_ids(code, canonical.get("classes", []))
+    canonical = {**canonical, "classes": canonical_classes}
+    personal = await _load_personal_v2(user_id, code)
+    stale: list[str] = []
+    if personal is not None:
+        personalized_classes, stale = apply_operations(canonical_classes, personal.operations)
+        merged = {**canonical, "classes": personalized_classes}
+        applied_count = len(personal.operations)
+        revision = personal.revision
+        source = "v2"
+    else:
+        legacy_entries = _merged_legacy_entries(await _load_all_legacy_overrides(user_id, code))
+        merged = _merge_legacy(canonical, legacy_entries)
+        applied_count = len(legacy_entries)
+        revision = 0
+        source = "legacy" if legacy_entries else "none"
+    merged["canonical_classes"] = canonical_classes
     if not merged.get("teacher_codes_visible"):
         storage.redact_teacher_codes(merged)
-    merged["overrides_applied"] = 0 if overrides is None else len(overrides.entries)
+        canonical_payload = {"classes": merged["canonical_classes"]}
+        storage.redact_teacher_codes(canonical_payload)
+        merged["canonical_classes"] = canonical_payload["classes"]
+    merged["overrides_applied"] = applied_count
+    merged["personal_revision"] = revision
+    merged["customization_source"] = source
+    merged["stale_override_ids"] = stale
     return merged
+
+
+@router.put("/customizations/{batch}")
+async def apply_personal_changes(
+    batch: str,
+    body: ApplyPersonalChangesBody,
+    user_id: str = Depends(require_user_id),
+) -> dict[str, Any]:
+    """Atomically merge a complete frontend draft into V2 personal state."""
+    await _touch_user(user_id)
+    code = _normalize_batch(batch)
+    if not code:
+        raise HTTPException(status_code=400, detail={"error": "invalid batch", "code": "bad_batch"})
+    try:
+        canonical_payload = await storage.read_timetable(code)
+    except storage.BatchNotFound as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "batch_not_found"}) from exc
+    canonical = with_stable_class_ids(code, canonical_payload.get("classes", []))
+    current = await _load_personal_v2(user_id, code)
+    if current is None and await OverrideDoc.find(
+        OverrideDoc.user_id == user_id,
+        OverrideDoc.batch == code,
+    ).count() > 0:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Legacy personal timetable must be migrated before it can be changed",
+                "code": "migration_required",
+            },
+        )
+    current_revision = current.revision if current else 0
+    if body.expected_revision != current_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "Personal timetable changed on another device; reload before saving",
+                "code": "revision_conflict",
+                "current_revision": current_revision,
+            },
+        )
+    try:
+        merged = merge_draft_operations(
+            canonical,
+            current.operations if current else {},
+            [operation.model_dump(exclude_none=False) for operation in body.operations],
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"error": str(exc), "code": "invalid_operation"}) from exc
+
+    now = datetime.now(timezone.utc)
+    next_revision = current_revision + 1
+    serialized = {
+        key: PersonalOverrideOperation.model_validate(value).model_dump(exclude_none=False)
+        for key, value in merged.items()
+    }
+    collection = PersonalCustomizationDoc.get_motor_collection()
+    if current is None:
+        try:
+            created = PersonalCustomizationDoc(
+                user_id=user_id,
+                batch=code,
+                revision=next_revision,
+                operations={key: PersonalOverrideOperation.model_validate(value) for key, value in merged.items()},
+                created_at=now,
+                updated_at=now,
+            )
+            await created.insert()
+        except DuplicateKeyError as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "Concurrent personal save; reload before retrying", "code": "revision_conflict"},
+            ) from exc
+    else:
+        updated = await collection.find_one_and_update(
+            {"_id": current.id, "revision": current_revision},
+            {"$set": {"operations": serialized, "updated_at": now}, "$inc": {"revision": 1}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if updated is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"error": "Concurrent personal save; reload before retrying", "code": "revision_conflict"},
+            )
+    return {
+        "ok": True,
+        "batch": code,
+        "revision": next_revision,
+        "saved_operations": len(merged),
+    }
+
+
+@router.delete("/customizations/{batch}")
+async def reset_personal_changes(
+    batch: str,
+    expected_revision: int = Query(default=0, ge=0),
+    user_id: str = Depends(require_user_id),
+) -> dict[str, Any]:
+    """Atomically clear V2 personal state while preserving revision history."""
+    code = _normalize_batch(batch)
+    current = await _load_personal_v2(user_id, code)
+    if current is None:
+        # A V2 reset also suppresses legacy fallback without mutating legacy.
+        if expected_revision != 0:
+            raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"})
+        now = datetime.now(timezone.utc)
+        try:
+            await PersonalCustomizationDoc(
+                user_id=user_id, batch=code, revision=1, operations={}, created_at=now, updated_at=now,
+            ).insert()
+        except DuplicateKeyError as exc:
+            raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"}) from exc
+        return {"ok": True, "batch": code, "revision": 1, "saved_operations": 0}
+    if current.revision != expected_revision:
+        raise HTTPException(
+            status_code=409,
+            detail={"error": "Personal timetable changed on another device", "code": "revision_conflict", "current_revision": current.revision},
+        )
+    now = datetime.now(timezone.utc)
+    collection = PersonalCustomizationDoc.get_motor_collection()
+    updated = await collection.find_one_and_update(
+        {"_id": current.id, "revision": current.revision},
+        {"$set": {"operations": {}, "updated_at": now}, "$inc": {"revision": 1}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"})
+    return {"ok": True, "batch": code, "revision": current.revision + 1, "saved_operations": 0}
 
 
 @router.get("/overrides")

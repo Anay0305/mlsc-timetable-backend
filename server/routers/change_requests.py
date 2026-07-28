@@ -27,6 +27,7 @@ class ChangeRequestBody(BaseModel):
     requester_batch: str = Field(min_length=2, max_length=16)
     scope: Literal["batch", "class"]
     kind: Literal["add", "edit", "delete"]
+    target_id: Optional[str] = Field(default=None, max_length=128)
     day: str = Field(min_length=3, max_length=12)
     start_time: str = Field(min_length=1, max_length=16)
     entry: Optional[ClassEntry] = None
@@ -86,6 +87,7 @@ async def submit_change_request(
             requester_batch=body.requester_batch,
             scope=body.scope,
             kind=body.kind,
+            target_id=body.target_id,
             day=body.day,
             start_time=body.start_time,
             entry=entry_payload,

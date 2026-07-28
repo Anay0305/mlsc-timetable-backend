@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from server.config import Settings, get_settings
+from server.personal_timetable import with_stable_class_ids
 from server.db.models import (
     AdminEmailDoc,
     AnnouncementDoc,
@@ -1241,7 +1242,12 @@ def _resolve_scope_batches(scope: str, requester_batch: str) -> list[str]:
     raise ChangeRequestRefused(f"unknown scope {scope!r}", code="bad_scope")
 
 
-async def get_existing_entry_for_slot(batch: str, day: str, start_time: str) -> dict[str, Any] | None:
+async def get_existing_entry_for_slot(
+    batch: str,
+    day: str,
+    start_time: str,
+    target_id: str | None = None,
+) -> dict[str, Any] | None:
     try:
         code = _safe_batch(batch)
         doc = await TimetableDoc.find_one(TimetableDoc.code == code)
@@ -1249,11 +1255,16 @@ async def get_existing_entry_for_slot(batch: str, day: str, start_time: str) -> 
             return None
         target_day = (day or "").strip().lower()
         target_time = (start_time or "").strip().lstrip("0")
-        for c in doc.classes:
-            c_day = (getattr(c, "day", None) or (c.get("day") if isinstance(c, dict) else "") or "").strip().lower()
-            c_time = (getattr(c, "start_time", None) or (c.get("start_time") if isinstance(c, dict) else "") or "").strip().lstrip("0")
+        identified = with_stable_class_ids(code, [_serialize_class(c) for c in doc.classes])
+        for c in identified:
+            if target_id:
+                if c.get("class_id") == target_id:
+                    return c
+                continue
+            c_day = str(c.get("day") or "").strip().lower()
+            c_time = str(c.get("start_time") or "").strip().lstrip("0")
             if c_day == target_day and c_time == target_time:
-                return _serialize_class(c) if not isinstance(c, dict) else c
+                return c
     except Exception:
         pass
     return None
@@ -1271,6 +1282,7 @@ def _serialize_change_request(doc) -> dict[str, Any]:
         "semester": doc.semester,
         "scope": doc.scope,
         "kind": doc.kind,
+        "target_id": getattr(doc, "target_id", None),
         "day": doc.day,
         "start_time": doc.start_time,
         "entry": _serialize_class(doc.entry) if doc.entry is not None else None,
@@ -1290,6 +1302,7 @@ async def create_change_request(
     requester_batch: str,
     scope: str,
     kind: str,
+    target_id: str | None = None,
     day: str,
     start_time: str,
     entry: dict[str, Any] | None = None,
@@ -1370,15 +1383,19 @@ async def create_change_request(
             code="quota_global",
         )
 
-    # Dupe guard: identical pending request for same (batch, scope, slot, kind)
-    dupe = await ChangeRequestDoc.find_one(
-        ChangeRequestDoc.requester_batch == requester_batch_safe,
-        ChangeRequestDoc.scope == scope,
-        ChangeRequestDoc.kind == kind,
-        ChangeRequestDoc.day == day,
-        ChangeRequestDoc.start_time == start_time,
-        ChangeRequestDoc.status == "pending",
-    )
+    # Dupe guard compares the target and proposed payload as well as the slot;
+    # two genuinely different edits in one slot must not block each other.
+    dupe_query: dict[str, Any] = {
+        "requester_batch": requester_batch_safe,
+        "scope": scope,
+        "kind": kind,
+        "target_id": target_id,
+        "day": day.strip(),
+        "start_time": start_time.strip(),
+        "status": "pending",
+        "entry": entry,
+    }
+    dupe = await ChangeRequestDoc.get_motor_collection().find_one(dupe_query)
     if dupe is not None:
         raise ChangeRequestRefused(
             "an identical pending request already exists",
@@ -1386,7 +1403,9 @@ async def create_change_request(
         )
 
     # Look up existing entry in slot for before/after comparison
-    existing_entry = await get_existing_entry_for_slot(requester_batch_safe, day.strip(), start_time.strip())
+    existing_entry = await get_existing_entry_for_slot(
+        requester_batch_safe, day.strip(), start_time.strip(), target_id,
+    )
 
     doc = ChangeRequestDoc(
         requester_id=requester_id,
@@ -1395,6 +1414,7 @@ async def create_change_request(
         semester=semester_label,
         scope=scope,  # type: ignore[arg-type]
         kind=kind,  # type: ignore[arg-type]
+        target_id=target_id,
         day=day.strip(),
         start_time=start_time.strip(),
         entry=entry,  # type: ignore[arg-type]
@@ -1419,7 +1439,9 @@ async def list_change_requests(
     async for doc in query:
         serialized = _serialize_change_request(doc)
         if serialized.get("existing_entry") is None:
-            serialized["existing_entry"] = await get_existing_entry_for_slot(doc.requester_batch, doc.day, doc.start_time)
+            serialized["existing_entry"] = await get_existing_entry_for_slot(
+                doc.requester_batch, doc.day, doc.start_time, getattr(doc, "target_id", None),
+            )
         code = (serialized.get("entry") or {}).get("code") or (serialized.get("existing_entry") or {}).get("code")
         if code:
             code_clean = "".join(ch for ch in str(code).strip().upper() if ch.isalnum())
@@ -1462,36 +1484,86 @@ async def _resolve_target_batches(scope: str, requester_batch: str) -> list[str]
 def _apply_change_to_classes(
     classes: list[Any],
     *,
+    batch: str = "",
     kind: str,
+    target_id: str | None = None,
     day: str,
     start_time: str,
     entry: dict[str, Any] | None,
+    existing_entry: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """Pure function: apply add/edit/delete to a list of class entries."""
+    """Apply one unambiguous change, retaining other classes in the slot."""
     out: list[dict[str, Any]] = []
-    target_key = (day, start_time)
+    # Batch-scoped requests carry a stable target id. Class-scoped requests
+    # cannot reuse that id across sibling batches, so anchor their fallback
+    # match to the canonical before-image captured from the requester batch.
+    # This also handles a user who had already moved the class personally:
+    # the request's visible day/time may be personal, while existing_entry is
+    # still the official source location that must be changed everywhere.
+    target_key = (
+        (existing_entry or {}).get("day", day),
+        (existing_entry or {}).get("start_time", start_time),
+    ) if not target_id else (day, start_time)
     replaced = False
-    for c in classes:
-        c_dict = _serialize_class(c)
-        if (c_dict.get("day"), c_dict.get("start_time")) == target_key:
+    identified = with_stable_class_ids(batch, [_serialize_class(c) for c in classes])
+    for c_dict in identified:
+        slot_matches = (c_dict.get("day"), c_dict.get("start_time")) == target_key
+        identity_matches = bool(target_id) and c_dict.get("class_id") == target_id
+        fallback_matches = slot_matches
+        if fallback_matches and existing_entry:
+            for field in ("code", "type", "subject"):
+                expected = existing_entry.get(field)
+                if expected not in (None, "") and c_dict.get(field) != expected:
+                    fallback_matches = False
+                    break
+        matches = not replaced and (identity_matches if target_id else fallback_matches)
+        if matches:
             if kind == "delete":
+                replaced = True
                 continue
             if kind == "edit":
                 merged = {**c_dict, **(entry or {})}
-                merged["day"] = day
-                merged["start_time"] = start_time
+                merged["class_id"] = c_dict.get("class_id")
                 out.append(merged)
                 replaced = True
                 continue
         out.append(c_dict)
     if kind == "add" and entry is not None:
-        new_entry = {**entry, "day": day, "start_time": start_time}
+        new_entry = {**entry}
+        new_entry.setdefault("day", day)
+        new_entry.setdefault("start_time", start_time)
+        new_entry.pop("class_id", None)
         out.append(new_entry)
-    elif kind == "edit" and not replaced and entry is not None:
-        # Slot was empty in the canonical data — treat the edit as an add.
-        new_entry = {**entry, "day": day, "start_time": start_time}
-        out.append(new_entry)
-    return out
+    return with_stable_class_ids(batch, out)
+
+
+def _has_change_target(
+    classes: list[Any],
+    *,
+    batch: str,
+    target_id: str | None,
+    day: str,
+    start_time: str,
+    existing_entry: dict[str, Any] | None,
+) -> bool:
+    """Whether an edit/delete has one unambiguous canonical target."""
+    identified = with_stable_class_ids(batch, [_serialize_class(c) for c in classes])
+    if target_id:
+        return any(item.get("class_id") == target_id for item in identified)
+    source_day = (existing_entry or {}).get("day", day)
+    source_time = (existing_entry or {}).get("start_time", start_time)
+    matches = []
+    for item in identified:
+        if (item.get("day"), item.get("start_time")) != (source_day, source_time):
+            continue
+        if existing_entry and any(
+            expected not in (None, "") and item.get(field) != expected
+            for field in ("code", "type", "subject")
+            if (expected := existing_entry.get(field)) is not None
+        ):
+            continue
+        matches.append(item)
+    return len(matches) == 1
 
 
 async def approve_change_request(
@@ -1531,12 +1603,25 @@ async def approve_change_request(
         tt = await TimetableDoc.find_one(TimetableDoc.code == code)
         if tt is None:
             continue
+        request_target_id = getattr(doc, "target_id", None) if doc.scope == "batch" else None
+        if doc.kind in {"edit", "delete"} and not _has_change_target(
+            tt.classes,
+            batch=code,
+            target_id=request_target_id,
+            day=doc.day,
+            start_time=doc.start_time,
+            existing_entry=getattr(doc, "existing_entry", None),
+        ):
+            continue
         new_classes = _apply_change_to_classes(
             tt.classes,
+            batch=code,
             kind=doc.kind,
+            target_id=request_target_id,
             day=doc.day,
             start_time=doc.start_time,
             entry=entry_payload,
+            existing_entry=getattr(doc, "existing_entry", None),
         )
         await tt.set({
             "classes": new_classes,

@@ -156,6 +156,14 @@ async def parse_workbook(
         auto_alternates = await storage.apply_baseline_alternate_weeks(payloads, semester_label)
         if auto_alternates:
             logger.info("Applied %d baseline alternate-week markers", auto_alternates)
+        # Curriculum validation is live and non-blocking. Persist the raw
+        # payload below; this pass only records Fix issues using the same
+        # projector that public timetable reads use.
+        curriculum_errors: list[dict[str, object]] = []
+        for code, payload in payloads.items():
+            _, issues = await storage.project_curriculum_payload(code, payload)
+            curriculum_errors.extend(issues)
+        error_rows.extend(curriculum_errors)
         batches = sorted(merged.keys())
 
         # Snapshot the current state BEFORE we mutate anything, so a rollback

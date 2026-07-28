@@ -22,6 +22,18 @@ from pathlib import Path
 from typing import Any
 
 from server.config import Settings, get_settings
+from server.curriculum_projection import (
+    LIBRARY_ALL_SEMESTER_BRANCHES,
+    LIBRARY_BRANCH_INHERITANCE,
+    LIBRARY_POOL_BRANCHES,
+    LIBRARY_SECTION_LABELS,
+    LIBRARY_SECTION_ORDER,
+    CurriculumContext,
+    library_key,
+    normalize_library_branch,
+    project_curriculum_classes,
+    resolve_curriculum_context,
+)
 from server.personal_timetable import with_stable_class_ids
 from server.db.models import (
     AdminEmailDoc,
@@ -83,6 +95,7 @@ async def read_timetable(
     settings: Settings | None = None,
     *,
     include_hidden_teachers: bool = False,
+    project_curriculum: bool = True,
 ) -> dict[str, Any]:
     code = _safe_batch(batch)
     doc = await TimetableDoc.find_one(TimetableDoc.code == code)
@@ -93,6 +106,12 @@ async def read_timetable(
     from timetable_parser.core.subject_catalog import ensure_catalog
     catalog = await ensure_catalog()
     payload = _timetable_payload(doc, catalog)
+    # Stable ids are minted from the stored Excel observation before the live
+    # Library projection changes code/type/options. A Library edit must never
+    # invalidate the identity used by personal timetable operations.
+    payload["classes"] = with_stable_class_ids(code, payload.get("classes") or [])
+    if project_curriculum:
+        payload, _ = await project_curriculum_payload(code, payload)
     batch_doc = await BatchDoc.find_one(BatchDoc.code == code)
     teacher_codes_visible = bool(batch_doc and batch_doc.teacher_codes_visible)
     payload["teacher_codes_visible"] = teacher_codes_visible
@@ -105,6 +124,36 @@ async def read_timetable(
     except DataMissing:
         payload["term_start_date"] = None
     return payload
+
+
+async def project_curriculum_payload(
+    batch: str,
+    payload: dict[str, Any],
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    """Overlay the current Library classification without mutating storage."""
+    semester = payload.get("semester") or {}
+    label = semester.get("label") if isinstance(semester, dict) else str(semester or "")
+    try:
+        context = resolve_curriculum_context(batch, label)
+    except ValueError:
+        return payload, []
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == context.resolved_key)
+    sections = doc.sections if doc is not None else []
+    revision = doc.revision if doc is not None else None
+    classes, issues = project_curriculum_classes(
+        payload.get("classes") or [],
+        context=context,
+        sections=sections,
+        library_revision=revision,
+    )
+    projected = {**payload, "classes": classes}
+    projected["curriculum"] = {
+        "key": context.requested_key,
+        "resolved_key": context.resolved_key,
+        "revision": revision,
+        "available": doc is not None,
+    }
+    return projected, issues
 
 
 async def read_teacher_visibility() -> list[dict[str, Any]]:
@@ -852,54 +901,13 @@ async def apply_baseline_alternate_weeks(
 # two features may share a branch/semester, but neither write path mutates the
 # other collection.
 
-LIBRARY_SECTION_LABELS = {
-    "core": "Core Subjects",
-    "elective_1": "Elective 1",
-    "elective_2": "Elective 2",
-    "elective_3": "Elective 3",
-    "general_elective": "General Elective",
-}
-_LIBRARY_SECTION_ORDER = tuple(LIBRARY_SECTION_LABELS)
-_LIBRARY_BRANCH_RE = re.compile(r"^[A-Z][A-Z0-9+\-]{0,15}$")
-LIBRARY_POOL_BRANCHES = frozenset({"POOL-A", "POOL-B", "POOL-C", "POOL-D"})
-LIBRARY_ALL_SEMESTER_BRANCHES = frozenset({"X", "G", "J", "R"})
-LIBRARY_BRANCH_INHERITANCE = {"CE-2+2": "C"}
+_LIBRARY_SECTION_ORDER = LIBRARY_SECTION_ORDER
 
 
 class LibraryRevisionConflict(Exception):
     def __init__(self, current_revision: int) -> None:
         super().__init__("curriculum was changed by another admin")
         self.current_revision = current_revision
-
-
-def normalize_library_branch(branch: str) -> str:
-    cleaned = re.sub(r"\s+", "", str(branch or "").strip().upper())
-    if not _LIBRARY_BRANCH_RE.fullmatch(cleaned):
-        raise ValueError("branch must be 1-16 uppercase letters/numbers (plus '+' or '-')")
-    return cleaned
-
-
-def library_key(branch: str, semester: int) -> str:
-    clean_branch = normalize_library_branch(branch)
-    try:
-        clean_semester = int(semester)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("semester must be an integer from 1 to 8") from exc
-    if not 1 <= clean_semester <= 8:
-        raise ValueError("semester must be an integer from 1 to 8")
-    resolved_branch = LIBRARY_BRANCH_INHERITANCE.get(clean_branch, clean_branch)
-    if resolved_branch in LIBRARY_POOL_BRANCHES:
-        allowed = {1, 2}
-        rule = "only supports semesters 1 and 2"
-    elif resolved_branch in LIBRARY_ALL_SEMESTER_BRANCHES:
-        allowed = set(range(1, 9))
-        rule = "supports semesters 1 through 8"
-    else:
-        allowed = set(range(3, 9))
-        rule = "only supports semesters 3 through 8"
-    if clean_semester not in allowed:
-        raise ValueError(f"{clean_branch} {rule}")
-    return f"{clean_branch}:S{clean_semester}"
 
 
 async def _clean_library_sections(raw_sections: Any) -> list[CurriculumSection]:
@@ -1097,7 +1105,12 @@ async def write_library_entry(
             updates["source"] = source
         await doc.set(updates)
         doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
-    return await _library_payload(doc)
+    payload = await _library_payload(doc)
+    try:
+        await refresh_curriculum_errors_for_library(clean_branch, int(semester))
+    except Exception:
+        logger.exception("Failed to refresh curriculum Fix errors for %s", key)
+    return payload
 
 
 async def delete_library_entry(branch: str, semester: int) -> bool:
@@ -1109,6 +1122,10 @@ async def delete_library_entry(branch: str, semester: int) -> bool:
     if doc is None:
         return False
     await doc.delete()
+    try:
+        await refresh_curriculum_errors_for_library(clean_branch, int(semester))
+    except Exception:
+        logger.exception("Failed to refresh curriculum Fix errors after deleting %s", key)
     return True
 
 
@@ -1780,11 +1797,10 @@ def _normalize_classes_for_write(classes: list[Any], catalog: Any) -> list[Any]:
     catalog default for the entry's code. Keeps overrides intact. Pure
     function — returns a new list, leaves the caller's data alone.
 
-    Catalog == ``None`` is a no-op so callers (or tests) without a cache
-    behave like before.
+    Live Curriculum Library fields are always removed: they describe the
+    current read-time projection and must never become canonical timetable
+    data. Catalog == ``None`` only disables subject-name compaction.
     """
-    if catalog is None:
-        return classes
     out: list[Any] = []
     for raw in classes:
         if hasattr(raw, "model_dump"):
@@ -1794,8 +1810,11 @@ def _normalize_classes_for_write(classes: list[Any], catalog: Any) -> list[Any]:
         else:
             out.append(raw)
             continue
+        entry.pop("curriculum_section", None)
+        entry.pop("requires_selection", None)
+        entry.pop("elective_group_id", None)
         code = entry.get("code")
-        default = catalog.name_for(code) if code else None
+        default = catalog.name_for(code) if catalog is not None and code else None
         if default and _norm_subject(entry.get("subject")) == _norm_subject(default):
             entry["subject"] = None
         opts = entry.get("options")
@@ -1812,7 +1831,7 @@ def _normalize_classes_for_write(classes: list[Any], catalog: Any) -> list[Any]:
                     continue
                 opt = dict(opt)
                 opt_code = opt.get("subject_code")
-                opt_default = catalog.name_for(opt_code) if opt_code else None
+                opt_default = catalog.name_for(opt_code) if catalog is not None and opt_code else None
                 if opt_default and _norm_subject(opt.get("subject_name")) == _norm_subject(opt_default):
                     opt["subject_name"] = None
                 new_opts.append(opt)
@@ -2418,6 +2437,68 @@ _PARSER_SEV_TO_FIX = {
     "UNRELIABLE": "error",
 }
 
+CURRICULUM_ERROR_TYPES = frozenset({
+    "SUBJECT_NOT_IN_LIBRARY",
+    "ELECTIVE_SECTION_CONFLICT",
+    "ELECTIVE_OPTION_SET_MISMATCH",
+})
+
+
+async def refresh_curriculum_errors_for_library(branch: str, semester: int) -> int:
+    """Refresh live Library-derived Fix rows for affected timetables.
+
+    Library edits must update both public projection and the Fix queue without
+    requiring a new spreadsheet ingest. Resolved/ignored history is retained;
+    only currently-open derived rows are replaced.
+    """
+    clean_branch = normalize_library_branch(branch)
+    resolved_branch = LIBRARY_BRANCH_INHERITANCE.get(clean_branch, clean_branch)
+    affected: list[TimetableDoc] = []
+    async for timetable in TimetableDoc.find_all():
+        try:
+            context = resolve_curriculum_context(timetable.code, timetable.semester)
+        except ValueError:
+            continue
+        if context.resolved_branch == resolved_branch and context.semester == int(semester):
+            affected.append(timetable)
+
+    batch_codes = [doc.code for doc in affected]
+    if batch_codes:
+        await ParsingErrorDoc.get_motor_collection().delete_many({
+            "batch_code": {"$in": batch_codes},
+            "error_type": {"$in": sorted(CURRICULUM_ERROR_TYPES)},
+            "status": "open",
+        })
+
+    now = datetime.now(timezone.utc)
+    written = 0
+    for timetable in affected:
+        raw_payload = _timetable_payload(timetable)
+        _, issues = await project_curriculum_payload(timetable.code, raw_payload)
+        for row in issues:
+            try:
+                await ParsingErrorDoc(
+                    upload_id=None,
+                    batch_code=row.get("batch"),
+                    error_type=str(row.get("code") or "curriculum_warning"),
+                    severity=_PARSER_SEV_TO_FIX.get(str(row.get("severity") or "").upper(), "warn"),
+                    day=row.get("day"),
+                    start_time=row.get("start_time"),
+                    code=row.get("subject_code"),
+                    message=str(row.get("message") or ""),
+                    context={
+                        key: value for key, value in row.items()
+                        if key not in {"batch", "day", "start_time", "severity", "code", "subject_code", "message"}
+                    },
+                    status="open",
+                    created_at=now,
+                    updated_at=now,
+                ).insert()
+                written += 1
+            except Exception:
+                logger.exception("Failed to write curriculum Fix issue %r", row)
+    return written
+
 
 async def save_parsing_errors(
     *,
@@ -2462,9 +2543,15 @@ async def save_parsing_errors(
                 severity=sev,
                 day=row.get("day"),
                 start_time=row.get("start_time"),
-                code=None,
+                code=row.get("subject_code"),
                 message=str(row.get("message") or ""),
-                context={k: v for k, v in row.items() if k not in {"batch", "day", "start_time", "severity", "code", "message"}},
+                context={
+                    k: v for k, v in row.items()
+                    if k not in {
+                        "batch", "day", "start_time", "severity", "code",
+                        "subject_code", "message",
+                    }
+                },
                 status="open",
                 created_at=now,
                 updated_at=now,

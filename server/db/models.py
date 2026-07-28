@@ -306,13 +306,15 @@ class ChangeRequestDoc(Document):
 
 
 class SubjectRequestDoc(Document):
-    """A user proposal to add a missing subject-code mapping to the catalog."""
+    """A user proposal to add or rename one subject-code mapping."""
 
     requester_id: Optional[str] = None
     requester_email: Optional[str] = None
     requester_batch: str
     code: str
     name: str
+    existing_catalog_name: Optional[str] = None
+    name_match_score: Optional[float] = None
     status: Literal["pending", "approved", "rejected"] = "pending"
     decision_note: Optional[str] = None
     decided_by: Optional[str] = None

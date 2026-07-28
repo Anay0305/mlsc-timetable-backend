@@ -811,7 +811,7 @@ def _library_kind_for_scheme_course(course: dict) -> str:
 
 
 def _library_scheme_rows(parsed: dict, branch: str) -> list[dict]:
-    """Map parsed semesters to Library branch/semester rows without Baselines."""
+    """Map parsed semesters to Curriculum Library branch/semester rows."""
     rows: list[dict] = []
     is_pool = branch == _POOL_SELECTOR
     is_independent = branch in _INDEPENDENT_BRANCHES
@@ -853,7 +853,7 @@ def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list
             continue
         buckets: dict[str, list[str]] = {"core": []}
         missing_details: list[dict[str, str]] = []
-        baseline_suggestion = {"Lecture": 0, "Tutorial": 0, "Practical": 0}
+        extracted_courses: list[dict[str, str | None]] = []
         seen: set[str] = set()
         for course in row.get("courses") or []:
             if not isinstance(course, dict):
@@ -864,6 +864,15 @@ def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list
             if not raw_code:
                 # Placeholder rows create the elective section but are not
                 # catalog subjects themselves.
+                title = str(course.get("title") or "").strip()
+                if title:
+                    extracted_courses.append({
+                        "code": None,
+                        "title": title,
+                        "category": str(course.get("category") or "").strip() or None,
+                        "credits": str(course.get("Cr") or "").strip() or None,
+                        "section": kind,
+                    })
                 continue
             try:
                 code = storage._normalize_subject_code(raw_code)
@@ -873,10 +882,16 @@ def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list
                 continue
             seen.add(code)
             buckets[kind].append(code)
-            missing_details.append({"code": code, "title": str(course.get("title") or "").strip()})
-            baseline_suggestion["Lecture"] += storage._numeric_str(course.get("L"))
-            baseline_suggestion["Tutorial"] += storage._numeric_str(course.get("T"))
-            baseline_suggestion["Practical"] += storage._numeric_str(course.get("P"))
+            title = str(course.get("title") or "").strip()
+            category = str(course.get("category") or "").strip() or None
+            missing_details.append({"code": code, "title": title})
+            extracted_courses.append({
+                "code": code,
+                "title": title,
+                "category": category,
+                "credits": str(course.get("Cr") or "").strip() or None,
+                "section": kind,
+            })
         sections = [
             {"kind": kind, "subject_codes": buckets[kind]}
             for kind in storage.LIBRARY_SECTION_LABELS
@@ -889,9 +904,7 @@ def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list
             "sections": sections,
             "source": source,
             "parsed_subjects": missing_details,
-            # Suggestions are preview-only. The apply endpoint below ignores
-            # this object and never writes to BaselineDoc.
-            "baseline_suggestion": {k: v for k, v in baseline_suggestion.items() if v},
+            "extracted_courses": extracted_courses,
         })
     return plan
 
@@ -940,7 +953,7 @@ async def apply_library_scheme(
     payload: dict,
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
-    """Apply a reviewed Library plan. Baselines are never changed here."""
+    """Apply a reviewed Curriculum Library plan."""
     plan = payload.get("plan") if isinstance(payload, dict) else None
     if not isinstance(plan, list) or not plan:
         raise HTTPException(status_code=400, detail={
@@ -1618,7 +1631,9 @@ async def backfill_baseline_errors(
 async def get_timetable_for_admin(batch: str) -> dict[str, object]:
     """Read a batch's timetable in raw form — used by the Fix grid editor."""
     try:
-        data = await storage.read_timetable(batch, include_hidden_teachers=True)
+        data = await storage.read_timetable(
+            batch, include_hidden_teachers=True, project_curriculum=False,
+        )
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={
             "error": str(exc), "code": "not_found",
@@ -1637,7 +1652,9 @@ async def patch_timetable(batch: str, payload: dict) -> dict[str, object]:
     """
     _validate_timetable_payload(payload)
     try:
-        current = await storage.read_timetable(batch, include_hidden_teachers=True)
+        current = await storage.read_timetable(
+            batch, include_hidden_teachers=True, project_curriculum=False,
+        )
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={
             "error": str(exc), "code": "not_found",

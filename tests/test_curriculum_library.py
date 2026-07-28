@@ -75,7 +75,26 @@ class CurriculumLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan[0]["key"], "C:S3")
         self.assertEqual(plan[0]["sections"][0]["subject_codes"], ["UCS301"])
         self.assertIn("elective_1", [section["kind"] for section in plan[0]["sections"]])
-        self.assertEqual(plan[0]["baseline_suggestion"], {"Lecture": 3, "Tutorial": 1})
+        self.assertNotIn("baseline_suggestion", plan[0])
+        self.assertEqual(
+            plan[0]["extracted_courses"],
+            [
+                {
+                    "code": "UCS301",
+                    "title": "Core",
+                    "category": None,
+                    "credits": None,
+                    "section": "core",
+                },
+                {
+                    "code": None,
+                    "title": "Elective-I",
+                    "category": None,
+                    "credits": None,
+                    "section": "elective_1",
+                },
+            ],
+        )
 
 
 if __name__ == "__main__":

@@ -1667,7 +1667,10 @@ async def get_timetable_for_admin(batch: str) -> dict[str, object]:
     """Read a batch's timetable in raw form — used by the Fix grid editor."""
     try:
         data = await storage.read_timetable(
-            batch, include_hidden_teachers=True, project_curriculum=False,
+            batch,
+            include_hidden_teachers=True,
+            project_curriculum=False,
+            include_unavailable=True,
         )
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={
@@ -1688,7 +1691,10 @@ async def patch_timetable(batch: str, payload: dict) -> dict[str, object]:
     _validate_timetable_payload(payload)
     try:
         current = await storage.read_timetable(
-            batch, include_hidden_teachers=True, project_curriculum=False,
+            batch,
+            include_hidden_teachers=True,
+            project_curriculum=False,
+            include_unavailable=True,
         )
     except storage.BatchNotFound as exc:
         raise HTTPException(status_code=404, detail={

@@ -45,6 +45,10 @@ class CurriculumLibraryBody(BaseModel):
     revision: Optional[int] = None
 
 
+class CurriculumPublishBody(BaseModel):
+    revision: Optional[int] = None
+
+
 @router.get("/health")
 async def admin_health() -> dict[str, object]:
     return {"ok": True, "scope": "admin"}
@@ -1059,6 +1063,37 @@ async def put_library(
             "error": str(exc),
             "code": "revision_conflict",
             "current_revision": exc.current_revision,
+        }) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_library",
+        }) from exc
+    return {"ok": True, "item": item}
+
+
+@router.post("/library/{branch}/{semester}/publish")
+async def publish_library(
+    branch: str,
+    semester: int,
+    body: CurriculumPublishBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        item = await storage.publish_library_entry(
+            branch,
+            semester,
+            expected_revision=body.revision,
+            actor=principal.label,
+        )
+    except storage.LibraryRevisionConflict as exc:
+        raise HTTPException(status_code=409, detail={
+            "error": str(exc),
+            "code": "revision_conflict",
+            "current_revision": exc.current_revision,
+        }) from exc
+    except storage.DataMissing as exc:
+        raise HTTPException(status_code=404, detail={
+            "error": str(exc), "code": "library_not_found",
         }) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail={

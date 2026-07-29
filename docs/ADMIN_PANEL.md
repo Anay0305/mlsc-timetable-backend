@@ -136,18 +136,24 @@ curriculum.
 code must exist in the Subject Catalog, a code may occur in only one section,
 and referenced catalog subjects cannot be deleted.
 
+Each record keeps an editable draft and a separate published snapshot. Draft
+saves and PDF imports never affect public timetables or generate Library Fix
+issues. Publishing atomically promotes the complete draft; later draft edits
+remain private until the next publish. Older Mongo documents require no data
+migration: their existing `sections` become drafts and start unpublished.
+
 - `GET /admin/library` — list configured records.
 - `GET /admin/library/{branch}/{semester}` — read one record.
-- `PUT /admin/library/{branch}/{semester}` — create or replace one record.
+- `PUT /admin/library/{branch}/{semester}` — create or replace the draft.
+- `POST /admin/library/{branch}/{semester}/publish` — promote the current
+  revision to the live snapshot.
 - `DELETE /admin/library/{branch}/{semester}` — remove one record; baselines
   are not affected.
 - `POST /admin/library-import/preview` *(multipart PDF + branch)* — parse a
   scheme without writing.
-- `POST /admin/library-import/apply` — apply a reviewed preview plan to the
-  Library only.
+- `POST /admin/library-import/apply` — save a reviewed preview plan as drafts.
 
-The PDF preview includes L/T/P baseline suggestions for the administrator's
-reference, but the Library apply endpoint never writes `BaselineDoc` records.
+The Library workflow never writes `BaselineDoc` records.
 
 ---
 

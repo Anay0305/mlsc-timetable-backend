@@ -237,9 +237,18 @@ class CurriculumLibraryDoc(Document):
     key: Annotated[str, Indexed(unique=True)]  # e.g. "C:S3", "CE-2+2:S3"
     branch: str
     semester: int = Field(ge=1, le=8)
+    # ``sections`` is the admin's editable draft.  Published data lives in a
+    # separate snapshot so an incomplete save can never reclassify student
+    # timetables.  Defaults make existing Mongo documents migration-free:
+    # older rows keep their sections as a draft and start unpublished.
     sections: list[CurriculumSection] = Field(default_factory=list)
     source: Optional[str] = None
     revision: int = 1
+    published_sections: list[CurriculumSection] = Field(default_factory=list)
+    published_revision: int = 0
+    published_source: Optional[str] = None
+    published_by: Optional[str] = None
+    published_at: Optional[datetime] = None
     created_by: Optional[str] = None
     updated_by: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)

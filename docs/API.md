@@ -325,6 +325,7 @@ below requires `Authorization: Bearer <ADMIN_TOKEN>`.
 - `POST /admin/ingest` *(multipart)* → parse uploaded `.xlsx/.xlsm`
 - `POST /admin/baselines/{key}` / `DELETE /admin/baselines/{key}`
 - `GET /admin/library` / `GET|PUT|DELETE /admin/library/{branch}/{semester}`
+- `POST /admin/library/{branch}/{semester}/publish`
 - `POST /admin/library-import/preview` / `POST /admin/library-import/apply`
 - `POST /admin/contributors` / `DELETE /admin/contributors/{username}`
 - `GET /admin/change-requests?status=pending&limit=100`

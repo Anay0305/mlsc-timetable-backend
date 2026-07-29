@@ -138,8 +138,22 @@ async def project_curriculum_payload(
     except ValueError:
         return payload, []
     doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == context.resolved_key)
-    sections = doc.sections if doc is not None else []
-    revision = doc.revision if doc is not None else None
+    # Missing and draft-only Library rows are deliberately inert.  This lets
+    # admins build curricula gradually without changing student timetables or
+    # flooding Fix with SUBJECT_NOT_IN_LIBRARY warnings.
+    is_published = _library_is_published(doc)
+    if not is_published:
+        projected = {**payload}
+        projected["curriculum"] = {
+            "key": context.requested_key,
+            "resolved_key": context.resolved_key,
+            "revision": None,
+            "available": False,
+        }
+        return projected, []
+
+    sections = doc.published_sections
+    revision = doc.published_revision
     classes, issues = project_curriculum_classes(
         payload.get("classes") or [],
         context=context,
@@ -910,6 +924,24 @@ class LibraryRevisionConflict(Exception):
         self.current_revision = current_revision
 
 
+def _library_is_published(doc: CurriculumLibraryDoc | None) -> bool:
+    """Whether a Library document has an active, non-empty snapshot."""
+    if doc is None or int(doc.published_revision or 0) <= 0:
+        return False
+    return any(
+        section.subject_codes
+        for section in (doc.published_sections or [])
+    )
+
+
+def _library_subject_codes(sections: Any) -> set[str]:
+    return {
+        code
+        for section in (sections or [])
+        for code in (section.subject_codes or [])
+    }
+
+
 async def _clean_library_sections(raw_sections: Any) -> list[CurriculumSection]:
     if raw_sections is None:
         raw_sections = []
@@ -965,11 +997,8 @@ async def _library_payload(
     *,
     include_subjects: bool = True,
 ) -> dict[str, Any]:
-    codes = {
-        code
-        for section in (doc.sections or [])
-        for code in (section.subject_codes or [])
-    }
+    codes = _library_subject_codes(doc.sections)
+    published_codes = _library_subject_codes(doc.published_sections)
     subjects = ({
         subject.code: _subject_payload(subject)
         async for subject in SubjectDoc.find({"code": {"$in": sorted(codes)}})
@@ -993,6 +1022,9 @@ async def _library_payload(
             "subjects": [],
         })
     sections.sort(key=lambda row: _LIBRARY_SECTION_ORDER.index(row["kind"]))
+    is_published = _library_is_published(doc)
+    has_unpublished_changes = is_published and doc.published_revision != doc.revision
+    status = "changes_pending" if has_unpublished_changes else "published" if is_published else "draft"
     return {
         "key": doc.key,
         "branch": doc.branch,
@@ -1001,6 +1033,14 @@ async def _library_payload(
         "subject_count": len(codes),
         "source": doc.source,
         "revision": doc.revision,
+        "status": status,
+        "published": is_published,
+        "has_unpublished_changes": has_unpublished_changes,
+        "published_revision": doc.published_revision if is_published else 0,
+        "published_subject_count": len(published_codes) if is_published else 0,
+        "published_source": doc.published_source if is_published else None,
+        "published_by": doc.published_by if is_published else None,
+        "published_at": _iso_z(doc.published_at) if is_published and doc.published_at else None,
         "created_by": doc.created_by,
         "updated_by": doc.updated_by,
         "created_at": _iso_z(doc.created_at),
@@ -1105,12 +1145,53 @@ async def write_library_entry(
             updates["source"] = source
         await doc.set(updates)
         doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
-    payload = await _library_payload(doc)
+    return await _library_payload(doc)
+
+
+async def publish_library_entry(
+    branch: str,
+    semester: int,
+    *,
+    expected_revision: int | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Atomically promote the current draft to the active snapshot."""
+    clean_branch = normalize_library_branch(branch)
+    if clean_branch in LIBRARY_BRANCH_INHERITANCE:
+        parent = LIBRARY_BRANCH_INHERITANCE[clean_branch]
+        raise ValueError(f"{clean_branch} inherits automatically from {parent} and cannot be published separately")
+    key = library_key(clean_branch, semester)
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+    if doc is None:
+        raise DataMissing(f"no curriculum library draft for {key}")
+    if expected_revision is not None and expected_revision != doc.revision:
+        raise LibraryRevisionConflict(doc.revision)
+
+    # Re-run catalog and duplicate validation at the publication boundary in
+    # case the Catalog changed after the draft was saved.
+    clean_sections = await _clean_library_sections([
+        section.model_dump() for section in (doc.sections or [])
+    ])
+    if not _library_subject_codes(clean_sections):
+        raise ValueError("add at least one subject before publishing this curriculum")
+
+    now = datetime.now(timezone.utc)
+    await doc.set({
+        "sections": clean_sections,
+        "published_sections": clean_sections,
+        "published_revision": doc.revision,
+        "published_source": doc.source,
+        "published_by": actor,
+        "published_at": now,
+        "updated_by": actor,
+        "updated_at": now,
+    })
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
     try:
         await refresh_curriculum_errors_for_library(clean_branch, int(semester))
     except Exception:
-        logger.exception("Failed to refresh curriculum Fix errors for %s", key)
-    return payload
+        logger.exception("Failed to refresh curriculum Fix errors after publishing %s", key)
+    return await _library_payload(doc)
 
 
 async def delete_library_entry(branch: str, semester: int) -> bool:
@@ -1133,14 +1214,22 @@ async def library_references_for_subject(code: str) -> list[dict[str, Any]]:
     norm = _normalize_subject_code(code)
     references: list[dict[str, Any]] = []
     async for doc in CurriculumLibraryDoc.find_all():
-        for section in doc.sections or []:
-            if norm in (section.subject_codes or []):
-                references.append({
-                    "key": doc.key,
-                    "branch": doc.branch,
-                    "semester": doc.semester,
-                    "section": section.kind,
-                })
+        seen: set[tuple[str, str]] = set()
+        for snapshot, sections in (
+            ("draft", doc.sections),
+            ("published", doc.published_sections),
+        ):
+            for section in sections or []:
+                marker = (snapshot, section.kind)
+                if norm in (section.subject_codes or []) and marker not in seen:
+                    seen.add(marker)
+                    references.append({
+                        "key": doc.key,
+                        "branch": doc.branch,
+                        "semester": doc.semester,
+                        "section": section.kind,
+                        "snapshot": snapshot,
+                    })
     return references
 
 

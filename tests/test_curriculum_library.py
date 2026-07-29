@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from server import storage
+from server.db.models import CurriculumLibraryDoc, CurriculumSection
 from server.routers.admin import (
     _library_kind_for_scheme_course,
     _library_plan_from_scheme_rows,
@@ -11,6 +13,14 @@ from server.routers.admin import (
 
 
 class CurriculumLibraryTests(unittest.IsolatedAsyncioTestCase):
+    class _LibraryRepo:
+        class _Key:
+            def __eq__(self, _other):
+                return True
+
+        key = _Key()
+        find_one = AsyncMock()
+
     def test_library_key_supports_regular_and_special_branches(self) -> None:
         self.assertEqual(storage.library_key("c", 3), "C:S3")
         self.assertEqual(storage.library_key("CE-2+2", 4), "CE-2+2:S4")
@@ -43,6 +53,76 @@ class CurriculumLibraryTests(unittest.IsolatedAsyncioTestCase):
                 {"kind": "core", "subject_codes": ["UCS301"]},
                 {"kind": "elective_1", "subject_codes": ["UCS301"]},
             ])
+
+    async def test_existing_document_is_preserved_as_inactive_draft(self) -> None:
+        doc = CurriculumLibraryDoc.model_construct(
+            key="X:S3",
+            branch="X",
+            semester=3,
+            sections=[CurriculumSection(kind="core", subject_codes=["UCS301"])],
+        )
+        payload = await storage._library_payload(doc, include_subjects=False)
+        self.assertEqual(payload["subject_count"], 1)
+        self.assertEqual(payload["sections"][0]["subject_codes"], ["UCS301"])
+        self.assertEqual(payload["status"], "draft")
+        self.assertFalse(payload["published"])
+        self.assertEqual(payload["published_subject_count"], 0)
+
+    async def test_missing_or_draft_library_does_not_project_or_warn(self) -> None:
+        source = {
+            "batch": "2X11",
+            "semester": {"label": "ODD 26-27"},
+            "classes": [{"code": "UCS301L", "type": "Lecture", "options": []}],
+        }
+        draft = CurriculumLibraryDoc.model_construct(
+            key="X:S3",
+            branch="X",
+            semester=3,
+            sections=[CurriculumSection(kind="elective_1", subject_codes=["UCS301"])],
+        )
+        for row in (None, draft):
+            repo = self._LibraryRepo
+            repo.find_one = AsyncMock(return_value=row)
+            with patch.object(storage, "CurriculumLibraryDoc", repo):
+                projected, issues = await storage.project_curriculum_payload("2X11", source)
+            self.assertEqual(projected["classes"], source["classes"])
+            self.assertFalse(projected["curriculum"]["available"])
+            self.assertEqual(issues, [])
+
+    async def test_published_snapshot_is_independent_from_newer_draft(self) -> None:
+        doc = CurriculumLibraryDoc.model_construct(
+            key="X:S3",
+            branch="X",
+            semester=3,
+            sections=[CurriculumSection(kind="core", subject_codes=["UCS301"])],
+            revision=2,
+            published_sections=[CurriculumSection(kind="elective_1", subject_codes=["UCS301"])],
+            published_revision=1,
+        )
+        payload = await storage._library_payload(doc, include_subjects=False)
+        self.assertEqual(payload["status"], "changes_pending")
+        self.assertTrue(payload["published"])
+        self.assertEqual(payload["published_revision"], 1)
+
+        source = {
+            "batch": "2X11",
+            "semester": {"label": "ODD 26-27"},
+            "classes": [{
+                "code": "UCS301L",
+                "subject": "Data Structures",
+                "type": "Lecture",
+                "room": "LT301",
+                "teacher": "ABC",
+                "options": [],
+            }],
+        }
+        repo = self._LibraryRepo
+        repo.find_one = AsyncMock(return_value=doc)
+        with patch.object(storage, "CurriculumLibraryDoc", repo):
+            projected, _ = await storage.project_curriculum_payload("2X11", source)
+        self.assertTrue(projected["curriculum"]["available"])
+        self.assertTrue(projected["classes"][0]["requires_selection"])
+        self.assertEqual(projected["classes"][0]["curriculum_section"], "elective_1")
 
     def test_pdf_placeholder_classification(self) -> None:
         self.assertEqual(

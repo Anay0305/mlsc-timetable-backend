@@ -49,6 +49,14 @@ class BatchNotFound(Exception):
         self.batch = batch
 
 
+class TimetableUnavailable(Exception):
+    """Raised when a valid timetable is temporarily hidden from students."""
+
+    def __init__(self, batch: str) -> None:
+        super().__init__(f"First-year timetable is coming soon: {batch}")
+        self.batch = batch
+
+
 class DataMissing(Exception):
     """Raised when expected baseline data (semester label, batch list) is absent."""
 
@@ -80,8 +88,11 @@ async def read_timetable(
     settings: Settings | None = None,
     *,
     include_hidden_teachers: bool = False,
+    include_unavailable: bool = False,
 ) -> dict[str, Any]:
     code = _safe_batch(batch)
+    if code.startswith("1") and not include_unavailable:
+        raise TimetableUnavailable(code)
     doc = await TimetableDoc.find_one(TimetableDoc.code == code)
     if doc is None:
         raise BatchNotFound(batch)

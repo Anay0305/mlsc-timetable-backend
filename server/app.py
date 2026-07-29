@@ -131,6 +131,20 @@ def create_app() -> FastAPI:
             content={"error": str(exc), "code": "data_missing"},
         )
 
+    @app.exception_handler(storage.TimetableUnavailable)
+    async def _handle_timetable_unavailable(
+        _: Request,
+        exc: storage.TimetableUnavailable,
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "First-year timetables are coming soon",
+                "code": "first_year_timetable_unavailable",
+                "batch": exc.batch,
+            },
+        )
+
     app.include_router(batch.router)
     app.include_router(current.router)
     app.include_router(timetable.router)

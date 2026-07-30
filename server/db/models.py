@@ -96,6 +96,20 @@ class UserDoc(Document):
 
     class Settings:
         name = "users"
+        indexes = [
+            IndexModel(
+                [("user_id", ASCENDING), ("last_seen_at", -1)],
+                name="signed_in_user_activity",
+            ),
+            IndexModel(
+                [("user_id", ASCENDING), ("created_at", -1)],
+                name="signed_in_user_created",
+            ),
+            IndexModel(
+                [("user_id", ASCENDING), ("default_batch", ASCENDING)],
+                name="signed_in_user_batch",
+            ),
+        ]
 
 
 class OverrideEntry(BaseModel):

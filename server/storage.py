@@ -1205,6 +1205,44 @@ async def publish_library_entry(
     return await _library_payload(doc)
 
 
+async def unpublish_library_entry(
+    branch: str,
+    semester: int,
+    *,
+    expected_revision: int | None = None,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    """Deactivate the published snapshot while preserving the editable draft."""
+    clean_branch = normalize_library_branch(branch)
+    if clean_branch in LIBRARY_BRANCH_INHERITANCE:
+        parent = LIBRARY_BRANCH_INHERITANCE[clean_branch]
+        raise ValueError(f"{clean_branch} inherits automatically from {parent} and cannot be unpublished separately")
+    key = library_key(clean_branch, semester)
+    doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+    if doc is None:
+        raise DataMissing(f"no curriculum library draft for {key}")
+    if expected_revision is not None and expected_revision != doc.revision:
+        raise LibraryRevisionConflict(doc.revision)
+
+    if int(doc.published_revision or 0) > 0:
+        now = datetime.now(timezone.utc)
+        await doc.set({
+            "published_sections": [],
+            "published_revision": 0,
+            "published_source": None,
+            "published_by": None,
+            "published_at": None,
+            "updated_by": actor,
+            "updated_at": now,
+        })
+        doc = await CurriculumLibraryDoc.find_one(CurriculumLibraryDoc.key == key)
+        try:
+            await refresh_curriculum_errors_for_library(clean_branch, int(semester))
+        except Exception:
+            logger.exception("Failed to refresh curriculum Fix errors after unpublishing %s", key)
+    return await _library_payload(doc)
+
+
 async def delete_library_entry(branch: str, semester: int) -> bool:
     clean_branch = normalize_library_branch(branch)
     if clean_branch in LIBRARY_BRANCH_INHERITANCE:

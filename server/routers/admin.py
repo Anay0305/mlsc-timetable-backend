@@ -49,6 +49,17 @@ class CurriculumPublishBody(BaseModel):
     revision: Optional[int] = None
 
 
+class CurriculumBulkItem(BaseModel):
+    branch: str
+    semester: int
+    revision: Optional[int] = None
+
+
+class CurriculumBulkBody(BaseModel):
+    action: str
+    entries: list[CurriculumBulkItem]
+
+
 @router.get("/health")
 async def admin_health() -> dict[str, object]:
     return {"ok": True, "scope": "admin"}
@@ -807,9 +818,9 @@ def _library_kind_for_scheme_course(course: dict) -> str:
     ).upper().replace("_", " ")
     if any(token in text for token in ("GENERAL ELECTIVE", "GENERIC ELECTIVE", "OPEN ELECTIVE")):
         return "general_elective"
-    match = re.search(r"ELECTIVE\s*[-–]?\s*(III|II|I|3|2|1)\b", text)
+    match = re.search(r"ELECTIVE\s*[-–]?\s*(IV|III|II|I|4|3|2|1)\b", text)
     if match:
-        number = {"I": 1, "II": 2, "III": 3}.get(match.group(1), int(match.group(1)) if match.group(1).isdigit() else 1)
+        number = {"I": 1, "II": 2, "III": 3, "IV": 4}.get(match.group(1), int(match.group(1)) if match.group(1).isdigit() else 1)
         return f"elective_{number}"
     return "core"
 
@@ -913,6 +924,80 @@ def _library_plan_from_scheme_rows(rows: list[dict], source: str | None) -> list
     return plan
 
 
+def _library_elective_tables_from_parsed(
+    parsed: dict,
+    plan: list[dict] | None = None,
+) -> list[dict]:
+    """Normalize detached elective catalogue tables for admin assignment.
+
+    These tables have a reliable elective heading and course roster but no
+    semester anchor.  They stay separate from the import plan until an admin
+    explicitly chooses the student-facing semester in the preview.
+    """
+    result: list[dict] = []
+    for index, table in enumerate(parsed.get("elective_tables") or []):
+        if not isinstance(table, dict):
+            continue
+        section = str(table.get("section") or "").strip().lower()
+        if section == "core" or section not in storage.LIBRARY_SECTION_LABELS:
+            continue
+        subject_codes: list[str] = []
+        parsed_subjects: list[dict[str, str]] = []
+        extracted_courses: list[dict[str, str | None]] = []
+        seen: set[str] = set()
+        for course in table.get("courses") or []:
+            if not isinstance(course, dict):
+                continue
+            raw_code = str(course.get("code") or "").strip()
+            if not raw_code:
+                continue
+            try:
+                code = storage._normalize_subject_code(raw_code)
+            except ValueError:
+                continue
+            if code in seen:
+                continue
+            seen.add(code)
+            title = str(course.get("title") or "").strip()
+            subject_codes.append(code)
+            parsed_subjects.append({"code": code, "title": title})
+            extracted_courses.append({
+                "code": code,
+                "title": title,
+                "category": str(course.get("category") or "").strip() or None,
+                "credits": str(course.get("Cr") or "").strip() or None,
+                "section": section,
+            })
+        if not subject_codes:
+            continue
+        candidate_semesters = sorted({
+            int(entry.get("semester") or 0)
+            for entry in (plan or [])
+            if any(
+                candidate.get("kind") == section
+                for candidate in (entry.get("sections") or [])
+                if isinstance(candidate, dict)
+            )
+        })
+        suggested_semester = candidate_semesters[0] if len(candidate_semesters) == 1 else None
+        result.append({
+            "id": str(table.get("id") or f"{section}:{index}"),
+            "section": section,
+            "label": storage.LIBRARY_SECTION_LABELS[section],
+            "heading": str(table.get("heading") or storage.LIBRARY_SECTION_LABELS[section]),
+            "page": table.get("page"),
+            "subject_count": len(subject_codes),
+            "sections": [{"kind": section, "subject_codes": subject_codes}],
+            "extracted_courses": extracted_courses,
+            "parsed_subjects": parsed_subjects,
+            # A placeholder such as Elective-II in exactly one semester is a
+            # reliable default. The admin can still change or skip it in the
+            # preview before anything is written.
+            "target_semester": suggested_semester,
+        })
+    return result
+
+
 @router.post("/library-import/preview")
 async def preview_library_scheme(
     branch: str = Form(...),
@@ -929,6 +1014,7 @@ async def preview_library_scheme(
         _library_scheme_rows(parsed, branch),
         file.filename,
     )
+    elective_tables = _library_elective_tables_from_parsed(parsed, plan)
     existing_items, _ = await storage.list_library_entries(limit=500)
     existing_by_key = {item["key"]: item for item in existing_items}
     for entry in plan:
@@ -942,12 +1028,18 @@ async def preview_library_scheme(
         for subject in entry.pop("parsed_subjects", []):
             if subject["code"] not in catalog_codes:
                 missing_by_code.setdefault(subject["code"], subject)
+    for table in elective_tables:
+        for subject in table.pop("parsed_subjects", []):
+            if subject["code"] not in catalog_codes:
+                missing_by_code.setdefault(subject["code"], subject)
     return {
         "ok": True,
         "source": file.filename,
         "branch": branch,
         "plan": plan,
         "entry_count": len(plan),
+        "elective_tables": elective_tables,
+        "elective_table_count": len(elective_tables),
         "missing_subjects": list(missing_by_code.values()),
     }
 
@@ -1100,6 +1192,77 @@ async def publish_library(
             "error": str(exc), "code": "invalid_library",
         }) from exc
     return {"ok": True, "item": item}
+
+
+@router.post("/library/bulk")
+async def bulk_library_entries(
+    body: CurriculumBulkBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    """Publish, unpublish, or delete a reviewed set of Library entries."""
+    action = body.action.strip().lower()
+    if action not in {"publish", "unpublish", "delete"}:
+        raise HTTPException(status_code=400, detail={
+            "error": "action must be publish, unpublish, or delete",
+            "code": "invalid_bulk_action",
+        })
+    if not body.entries:
+        raise HTTPException(status_code=400, detail={
+            "error": "select at least one Library entry",
+            "code": "empty_bulk_selection",
+        })
+    if len(body.entries) > 500:
+        raise HTTPException(status_code=400, detail={
+            "error": "bulk actions are limited to 500 entries",
+            "code": "bulk_limit_exceeded",
+        })
+
+    completed: list[dict[str, object]] = []
+    errors: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for entry in body.entries:
+        try:
+            key = storage.library_key(entry.branch, entry.semester)
+            if key in seen:
+                continue
+            seen.add(key)
+            if action == "publish":
+                item = await storage.publish_library_entry(
+                    entry.branch,
+                    entry.semester,
+                    expected_revision=entry.revision,
+                    actor=principal.label,
+                )
+                completed.append({"key": key, "item": item})
+            elif action == "unpublish":
+                item = await storage.unpublish_library_entry(
+                    entry.branch,
+                    entry.semester,
+                    expected_revision=entry.revision,
+                    actor=principal.label,
+                )
+                completed.append({"key": key, "item": item})
+            else:
+                deleted = await storage.delete_library_entry(entry.branch, entry.semester)
+                if not deleted:
+                    raise storage.DataMissing(f"no curriculum library draft for {key}")
+                completed.append({"key": key})
+        except (storage.LibraryRevisionConflict, storage.DataMissing, TypeError, ValueError) as exc:
+            errors.append({
+                "key": f"{entry.branch}:S{entry.semester}",
+                "error": str(exc),
+            })
+
+    logger.info(
+        "Bulk Library %s by %s: completed=%d errors=%d",
+        action, principal.label, len(completed), len(errors),
+    )
+    return {
+        "ok": not errors,
+        "action": action,
+        "completed": completed,
+        "errors": errors,
+    }
 
 
 @router.delete("/library/{branch}/{semester}")

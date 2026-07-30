@@ -221,6 +221,7 @@ class CurriculumSection(BaseModel):
         "elective_1",
         "elective_2",
         "elective_3",
+        "elective_4",
         "general_elective",
     ]
     subject_codes: list[str] = Field(default_factory=list)

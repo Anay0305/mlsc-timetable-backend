@@ -64,6 +64,24 @@ class Semester:
     options: list[dict[str, Any]] = field(default_factory=list)
 
 
+STANDALONE_ELECTIVE_LABELS = {
+    "elective_1": "Elective 1",
+    "elective_2": "Elective 2",
+    "elective_3": "Elective 3",
+    "elective_4": "Elective 4",
+    "general_elective": "General Elective",
+}
+
+_STANDALONE_ELECTIVE_RE = re.compile(
+    r"\bELECTIVE\s*[-–]?\s*(IV|III|II|I|4|3|2|1)\b",
+    re.I,
+)
+_GENERAL_ELECTIVE_RE = re.compile(
+    r"\b(?:GENERAL|GENERIC|OPEN)\s+ELECTIVE\b",
+    re.I,
+)
+
+
 # ── low-level helpers ────────────────────────────────────────────────────
 def _norm(cell: Any) -> str:
     if cell is None:
@@ -83,6 +101,61 @@ def _clean_title(value: str) -> str:
             words.append(normalized)
         return " ".join(words)
     return value
+
+
+def _standalone_elective_kind(text: str) -> str | None:
+    """Classify a heading above a detached elective catalogue table."""
+    normalized = re.sub(r"\s+", " ", text or "").strip().upper()
+    if _GENERAL_ELECTIVE_RE.search(normalized):
+        return "general_elective"
+    match = _STANDALONE_ELECTIVE_RE.search(normalized)
+    if not match:
+        return None
+    number = {
+        "I": 1,
+        "II": 2,
+        "III": 3,
+        "IV": 4,
+    }.get(match.group(1).upper())
+    if number is None:
+        number = int(match.group(1))
+    return f"elective_{number}"
+
+
+def _elective_heading_above_table(page, table_top: float) -> tuple[str, str] | None:
+    """Return ``(section kind, printed heading)`` nearest a table.
+
+    Scheme PDFs frequently place elective catalogues on separate pages with
+    no semester marker.  We inspect only the 190pt band immediately above the
+    table, group words into visual lines, and use the closest recognized
+    heading so unrelated page text cannot classify the table accidentally.
+    """
+    nearby = [
+        word for word in page.extract_words()
+        if float(word.get("bottom", word.get("top", 0))) <= table_top + 2
+        and float(word.get("top", 0)) >= table_top - 190
+    ]
+    if not nearby:
+        return None
+    lines: list[tuple[float, list[dict[str, Any]]]] = []
+    for word in sorted(nearby, key=lambda item: (float(item["top"]), float(item["x0"]))):
+        top = float(word["top"])
+        if not lines or abs(lines[-1][0] - top) > 3:
+            lines.append((top, [word]))
+        else:
+            lines[-1][1].append(word)
+    for _, words in reversed(lines):
+        text = " ".join(str(word.get("text") or "") for word in sorted(words, key=lambda item: float(item["x0"]))).strip()
+        # A semester heading is a hard boundary. Without this guard, an
+        # elective placeholder in the preceding semester table can be the
+        # nearest matching text in our search band and misclassify the next
+        # semester's complete course table as a standalone elective list.
+        if SEMESTER_HEADER_RE.match(text):
+            return None
+        kind = _standalone_elective_kind(text)
+        if kind:
+            return kind, text
+    return None
 
 
 def _build_column_map(header_rows: list[list[Any]]) -> dict[str, list[int]]:
@@ -433,19 +506,24 @@ def parse_scheme_pdf(pdf_path: str | Path) -> dict[str, Any]:
                 { "courses": [...], "totals": { "printed": {...}, "computed": {...} } }
               ]
             }, ...
+          ],
+          "elective_tables": [
+            {
+              "id": "elective_1:p9:t1", "section": "elective_1",
+              "page": 9, "courses": [...], "totals": {...}
+            }, ...
           ]
         }
     """
     pdf_path = Path(pdf_path)
     semesters: dict[int, Semester] = {}
+    elective_tables: list[dict[str, Any]] = []
 
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
+        for page_number, page in enumerate(pdf.pages, start=1):
             anchors = _semester_anchors(page)
-            if not anchors:
-                continue
 
-            for ft in page.find_tables():
+            for table_number, ft in enumerate(page.find_tables(), start=1):
                 table = ft.extract()
                 if not table:
                     continue
@@ -454,7 +532,25 @@ def parse_scheme_pdf(pdf_path: str | Path) -> dict[str, Any]:
                 courses, printed_totals = _extract_courses_from_table(table)
                 if not courses:
                     continue
-                sem_num = _sem_from_table_body(table) or _sem_for_table(ft.bbox[1], anchors)
+                sem_from_body = _sem_from_table_body(table)
+                elective_heading = _elective_heading_above_table(page, float(ft.bbox[1]))
+                if sem_from_body is None and elective_heading is not None:
+                    kind, printed_heading = elective_heading
+                    elective_tables.append({
+                        "id": f"{kind}:p{page_number}:t{table_number}",
+                        "section": kind,
+                        "label": STANDALONE_ELECTIVE_LABELS[kind],
+                        "heading": printed_heading,
+                        "page": page_number,
+                        "courses": [asdict(course) for course in courses],
+                        "totals": {
+                            "printed": printed_totals,
+                            "computed": _computed_totals(courses),
+                        },
+                    })
+                    continue
+
+                sem_num = sem_from_body or _sem_for_table(ft.bbox[1], anchors)
                 if sem_num is None:
                     continue
 
@@ -483,4 +579,5 @@ def parse_scheme_pdf(pdf_path: str | Path) -> dict[str, Any]:
             "sem_to_keyline": {i: keyline_for(i)[0] for i in range(1, 9)},
         },
         "semesters": [asdict(s) for s in ordered],
+        "elective_tables": elective_tables,
     }

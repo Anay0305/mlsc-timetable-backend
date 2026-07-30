@@ -19,6 +19,7 @@ LIBRARY_SECTION_LABELS = {
     "elective_1": "Elective 1",
     "elective_2": "Elective 2",
     "elective_3": "Elective 3",
+    "elective_4": "Elective 4",
     "general_elective": "General Elective",
 }
 LIBRARY_SECTION_ORDER = tuple(LIBRARY_SECTION_LABELS)

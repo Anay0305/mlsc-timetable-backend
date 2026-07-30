@@ -6,9 +6,15 @@ from unittest.mock import AsyncMock, patch
 from server import storage
 from server.db.models import CurriculumLibraryDoc, CurriculumSection
 from server.routers.admin import (
+    _library_elective_tables_from_parsed,
     _library_kind_for_scheme_course,
     _library_plan_from_scheme_rows,
     _library_scheme_rows,
+)
+from server.scheme_parser import (
+    _elective_heading_above_table,
+    _extract_courses_from_table,
+    _standalone_elective_kind,
 )
 
 
@@ -124,15 +130,123 @@ class CurriculumLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(projected["classes"][0]["requires_selection"])
         self.assertEqual(projected["classes"][0]["curriculum_section"], "elective_1")
 
+    async def test_unpublish_preserves_the_draft(self) -> None:
+        doc = CurriculumLibraryDoc.model_construct(
+            key="X:S3",
+            branch="X",
+            semester=3,
+            sections=[CurriculumSection(kind="core", subject_codes=["UCS301"])],
+            revision=2,
+            published_sections=[CurriculumSection(kind="core", subject_codes=["UCS301"])],
+            published_revision=2,
+        )
+
+        async def apply_updates(updates):
+            for field, value in updates.items():
+                object.__setattr__(doc, field, value)
+
+        object.__setattr__(doc, "set", AsyncMock(side_effect=apply_updates))
+        repo = self._LibraryRepo
+        repo.find_one = AsyncMock(return_value=doc)
+        with (
+            patch.object(storage, "CurriculumLibraryDoc", repo),
+            patch.object(storage, "refresh_curriculum_errors_for_library", AsyncMock()),
+            patch.object(storage, "_library_payload", AsyncMock(return_value={
+                "sections": [{"kind": "core", "subject_codes": ["UCS301"]}],
+                "revision": 2,
+                "published": False,
+                "published_revision": 0,
+            })),
+        ):
+            payload = await storage.unpublish_library_entry(
+                "X", 3, expected_revision=2, actor="admin@example.com",
+            )
+
+        self.assertEqual(payload["sections"][0]["subject_codes"], ["UCS301"])
+        self.assertEqual(payload["revision"], 2)
+        self.assertFalse(payload["published"])
+        self.assertEqual(payload["published_revision"], 0)
+
     def test_pdf_placeholder_classification(self) -> None:
         self.assertEqual(
             _library_kind_for_scheme_course({"title": "Elective-II"}),
             "elective_2",
         )
         self.assertEqual(
+            _library_kind_for_scheme_course({"title": "Elective-IV"}),
+            "elective_4",
+        )
+        self.assertEqual(
             _library_kind_for_scheme_course({"title": "General Elective"}),
             "general_elective",
         )
+
+    def test_standalone_elective_table_schema_is_extracted(self) -> None:
+        table = [
+            ["S.\nNo.", "COURSE\nNO.", "TITLE", "CODE", "L", "T", "P", "CR"],
+            ["1", "UCS531", "CLOUD COMPUTING", "PEC", "2", "0", "2", "3.0"],
+            ["2", "UEC646", "CONNECTED VEHICLES", "PEC", "3", "0", "0", "3.0"],
+        ]
+        courses, _ = _extract_courses_from_table(table)
+        self.assertEqual([course.code for course in courses], ["UCS531", "UEC646"])
+        self.assertEqual(courses[0].category, "PEC")
+        self.assertEqual(_standalone_elective_kind("Elective IV"), "elective_4")
+
+        class _Page:
+            @staticmethod
+            def extract_words():
+                return [
+                    {"text": "Elective", "top": 50, "bottom": 62, "x0": 20},
+                    {"text": "I", "top": 50, "bottom": 62, "x0": 80},
+                ]
+
+        self.assertEqual(
+            _elective_heading_above_table(_Page(), 130),
+            ("elective_1", "Elective I"),
+        )
+
+        class _SemesterTablePage:
+            @staticmethod
+            def extract_words():
+                return [
+                    {"text": "GENERIC", "top": 50, "bottom": 62, "x0": 20},
+                    {"text": "ELECTIVE", "top": 50, "bottom": 62, "x0": 80},
+                    {"text": "SEMESTER-VII", "top": 100, "bottom": 112, "x0": 45},
+                ]
+
+        self.assertIsNone(
+            _elective_heading_above_table(_SemesterTablePage(), 130),
+        )
+
+        normalized = _library_elective_tables_from_parsed({
+            "elective_tables": [{
+                "id": "elective_1:p9:t1",
+                "section": "elective_1",
+                "heading": "Elective I",
+                "page": 9,
+                "courses": [course.__dict__ for course in courses],
+            }],
+        })
+        self.assertEqual(normalized[0]["section"], "elective_1")
+        self.assertEqual(normalized[0]["sections"][0]["subject_codes"], ["UCS531", "UEC646"])
+        self.assertIsNone(normalized[0]["target_semester"])
+
+        assigned = _library_elective_tables_from_parsed({
+            "elective_tables": [{
+                "id": "elective_1:p9:t1",
+                "section": "elective_1",
+                "heading": "Elective I",
+                "page": 9,
+                "courses": [course.__dict__ for course in courses],
+            }],
+        }, [{
+            "semester": 5,
+            "sections": [
+                {"kind": "core", "subject_codes": ["UCS415"]},
+                {"kind": "elective_1", "subject_codes": []},
+            ],
+        }])
+        self.assertEqual(assigned[0]["target_semester"], 5)
 
     def test_pool_rotation_and_library_plan(self) -> None:
         parsed = {"semesters": [

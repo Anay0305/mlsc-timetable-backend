@@ -19,19 +19,6 @@ router = APIRouter()
 admin_router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
 
-SIGNED_IN_USER_FILTER = {"user_id": {"$regex": r"^user_"}}
-
-
-def _signed_in_user_filter(**extra: object) -> dict[str, object]:
-    """Return a Mongo filter that excludes anonymous browser identities.
-
-    Clerk user subjects begin with ``user_``. Guest timetable sessions use a
-    locally generated UUID, so this lets the dashboard report authenticated
-    account activity without collecting email addresses or display names.
-    """
-    return {**SIGNED_IN_USER_FILTER, **extra}
-
-
 def _empty_daily_user_trend(start_date: datetime, days: int = 30) -> dict[str, int]:
     return {
         (start_date + timedelta(days=offset)).strftime("%Y-%m-%d"): 0
@@ -40,7 +27,7 @@ def _empty_daily_user_trend(start_date: datetime, days: int = 30) -> dict[str, i
 
 
 async def _get_user_analytics(now: datetime) -> dict[str, object]:
-    """Aggregate privacy-safe analytics for Clerk-authenticated users."""
+    """Aggregate privacy-safe analytics for unique timetable identities."""
     active_24h_at = now - timedelta(hours=24)
     active_7d_at = now - timedelta(days=7)
     active_30d_at = now - timedelta(days=30)
@@ -49,28 +36,26 @@ async def _get_user_analytics(now: datetime) -> dict[str, object]:
         - timedelta(days=29)
     )
 
-    total = await UserDoc.find(_signed_in_user_filter()).count()
+    total = await UserDoc.find({}).count()
     active_24h = await UserDoc.find(
-        _signed_in_user_filter(last_seen_at={"$gte": active_24h_at})
+        {"last_seen_at": {"$gte": active_24h_at}}
     ).count()
     active_7d = await UserDoc.find(
-        _signed_in_user_filter(last_seen_at={"$gte": active_7d_at})
+        {"last_seen_at": {"$gte": active_7d_at}}
     ).count()
     active_30d = await UserDoc.find(
-        _signed_in_user_filter(last_seen_at={"$gte": active_30d_at})
+        {"last_seen_at": {"$gte": active_30d_at}}
     ).count()
     new_30d = await UserDoc.find(
-        _signed_in_user_filter(created_at={"$gte": active_30d_at})
+        {"created_at": {"$gte": active_30d_at}}
     ).count()
     with_default_batch = await UserDoc.find(
-        _signed_in_user_filter(default_batch={"$nin": [None, ""]})
+        {"default_batch": {"$nin": [None, ""]}}
     ).count()
 
     top_batches_raw = await UserDoc.aggregate([
         {
-            "$match": _signed_in_user_filter(
-                default_batch={"$nin": [None, ""]},
-            )
+            "$match": {"default_batch": {"$nin": [None, ""]}}
         },
         {"$group": {"_id": "$default_batch", "count": {"$sum": 1}}},
         {"$sort": {"count": -1, "_id": 1}},
@@ -79,9 +64,7 @@ async def _get_user_analytics(now: datetime) -> dict[str, object]:
 
     registration_raw = await UserDoc.aggregate([
         {
-            "$match": _signed_in_user_filter(
-                created_at={"$gte": registration_start},
-            )
+            "$match": {"created_at": {"$gte": registration_start}}
         },
         {
             "$group": {
@@ -103,17 +86,14 @@ async def _get_user_analytics(now: datetime) -> dict[str, object]:
             registration_trend[date] = row.get("count", 0)
 
     personalization_raw = await PersonalCustomizationDoc.aggregate([
-        {"$match": SIGNED_IN_USER_FILTER},
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]).to_list()
     with_personalization = personalization_raw[0]["count"] if personalization_raw else 0
 
-    calendar_connected = await CalendarConnectionDoc.find(
-        SIGNED_IN_USER_FILTER
-    ).count()
+    calendar_connected = await CalendarConnectionDoc.find({}).count()
     calendar_enabled = await CalendarConnectionDoc.find(
-        _signed_in_user_filter(enabled=True)
+        {"enabled": True}
     ).count()
 
     return {
@@ -134,7 +114,7 @@ async def _get_user_analytics(now: datetime) -> dict[str, object]:
             {"date": date, "count": count}
             for date, count in sorted(registration_trend.items())
         ],
-        "scope": "Clerk accounts that opened a timetable",
+        "scope": "Unique timetable identities that opened a timetable",
         "window_timezone": "UTC",
     }
 

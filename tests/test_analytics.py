@@ -7,7 +7,6 @@ from unittest.mock import patch
 from server.routers.analytics import (
     _empty_daily_user_trend,
     _get_user_analytics,
-    _signed_in_user_filter,
 )
 from server.db.models import CalendarConnectionDoc, PersonalCustomizationDoc, UserDoc
 
@@ -29,11 +28,6 @@ class _AggregateResult:
 
 
 class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
-    def test_signed_in_filter_keeps_clerk_scope_and_extra_constraints(self):
-        result = _signed_in_user_filter(last_seen_at={"$gte": "cutoff"})
-        self.assertEqual(result["user_id"], {"$regex": r"^user_"})
-        self.assertEqual(result["last_seen_at"], {"$gte": "cutoff"})
-
     def test_empty_trend_has_exact_window(self):
         trend = _empty_daily_user_trend(
             datetime(2026, 7, 1, 12, tzinfo=timezone.utc),
@@ -47,6 +41,7 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_user_summary_is_aggregate_only_and_fills_missing_days(self):
         user_counts = iter([100, 10, 35, 70, 12, 80])
+        user_filters: list[dict] = []
         user_aggregates = iter([
             _AggregateResult([
                 {"_id": "3C11", "count": 22},
@@ -57,9 +52,18 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
             ]),
         ])
         calendar_counts = iter([14, 9])
+        calendar_filters: list[dict] = []
+
+        def user_find(query: dict) -> _CountQuery:
+            user_filters.append(query)
+            return _CountQuery(next(user_counts))
+
+        def calendar_find(query: dict) -> _CountQuery:
+            calendar_filters.append(query)
+            return _CountQuery(next(calendar_counts))
 
         with (
-            patch.object(UserDoc, "find", side_effect=lambda *_args, **_kwargs: _CountQuery(next(user_counts))),
+            patch.object(UserDoc, "find", side_effect=user_find),
             patch.object(UserDoc, "aggregate", side_effect=lambda *_args, **_kwargs: next(user_aggregates)),
             patch.object(
                 PersonalCustomizationDoc,
@@ -69,7 +73,7 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
             patch.object(
                 CalendarConnectionDoc,
                 "find",
-                side_effect=lambda *_args, **_kwargs: _CountQuery(next(calendar_counts)),
+                side_effect=calendar_find,
             ),
         ):
             result = await _get_user_analytics(
@@ -95,6 +99,9 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotIn("email", result)
         self.assertNotIn("user_ids", result)
+        self.assertEqual(user_filters[0], {})
+        self.assertTrue(all("user_id" not in query for query in user_filters))
+        self.assertEqual(calendar_filters, [{}, {"enabled": True}])
 
 
 if __name__ == "__main__":

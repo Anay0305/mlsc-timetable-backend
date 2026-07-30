@@ -289,6 +289,103 @@ def _parse_time(time_str: str) -> str:
         return "00:00:00"
 
 
+def _time_minutes(time_str: str) -> int | None:
+    """Return minutes after midnight for a timetable clock value."""
+    t = str(time_str or "").strip().upper()
+    if not t:
+        return None
+    try:
+        if "AM" in t or "PM" in t:
+            parsed = datetime.strptime(t, "%I:%M %p")
+        elif ":" in t:
+            hour, minute = t.split(":", 1)
+            parsed = datetime.strptime(f"{hour.zfill(2)}:{minute}", "%H:%M")
+        else:
+            return None
+    except ValueError:
+        return None
+    return parsed.hour * 60 + parsed.minute
+
+
+def _calendar_merge_value(value: Any) -> str:
+    return " ".join(str(value or "").split()).casefold()
+
+
+def _merge_teacher_codes(left: Any, right: Any) -> str:
+    """Keep every teacher code when otherwise-identical slots are joined."""
+    teachers: list[str] = []
+    seen: set[str] = set()
+    for raw in (left, right):
+        for teacher in re.split(r"\s*/\s*", str(raw or "").strip()):
+            teacher = teacher.strip()
+            key = teacher.casefold()
+            if teacher and key not in seen:
+                seen.add(key)
+                teachers.append(teacher)
+    return " / ".join(teachers)
+
+
+def _merge_adjacent_classes_for_calendar(classes: list[dict]) -> list[dict]:
+    """Join contiguous slots that describe the same calendar class.
+
+    The parser intentionally keeps every timetable period as a separate grid
+    cell. Google Calendar is easier to read as a continuous block, so adjacent
+    entries are merged only when their day, course code and room match. An
+    alternate-week rule is part of the recurrence and must match as well.
+    Entries without a code or room stay separate to avoid joining unrelated
+    incomplete observations.
+    """
+    indexed = list(enumerate(classes or []))
+
+    def sort_key(pair: tuple[int, dict]) -> tuple[int, int, int]:
+        index, entry = pair
+        day_index = _day_to_weekday_idx(str(entry.get("day") or ""))
+        start = _time_minutes(str(entry.get("start_time") or ""))
+        return (
+            day_index if day_index is not None else 99,
+            start if start is not None else 10_000,
+            index,
+        )
+
+    indexed.sort(key=sort_key)
+
+    merged: list[dict] = []
+    latest_by_class: dict[tuple[str, str, str, Any], dict] = {}
+    for _, raw_entry in indexed:
+        entry = dict(raw_entry)
+        day = _calendar_merge_value(entry.get("day"))
+        code = _calendar_merge_value(entry.get("code"))
+        room = _calendar_merge_value(entry.get("room"))
+        start = _time_minutes(entry.get("start_time", ""))
+        merge_key = (
+            day,
+            code,
+            room,
+            entry.get("alternate_week_start"),
+        ) if day and code and room else None
+        previous = latest_by_class.get(merge_key) if merge_key is not None else None
+        previous_end = _time_minutes(previous.get("end_time", "")) if previous else None
+        can_merge = bool(
+            previous
+            and start is not None
+            and previous_end == start
+        )
+        if not can_merge:
+            merged.append(entry)
+            if merge_key is not None:
+                latest_by_class[merge_key] = entry
+            continue
+
+        previous["end_time"] = entry.get("end_time") or previous.get("end_time")
+        previous["teacher"] = _merge_teacher_codes(
+            previous.get("teacher"), entry.get("teacher")
+        )
+        if not previous.get("subject") and entry.get("subject"):
+            previous["subject"] = entry["subject"]
+
+    return merged
+
+
 def _next_occurrence_of_weekday(weekday_idx: int) -> date:
     today = date.today()
     days_ahead = weekday_idx - today.weekday()
@@ -785,6 +882,10 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
             if override.kind == "add" and override.entry is not None:
                 merged_classes.append(override.entry.model_dump(exclude_none=False))
         classes = merged_classes
+
+    # Grid cells remain period-by-period. Only the Google Calendar projection
+    # joins a contiguous run into one readable event.
+    classes = _merge_adjacent_classes_for_calendar(classes)
 
     # Subject names are stripped on write and resolved on read; the calendar
     # path must resolve them too so events show course names, not bare codes.

@@ -105,25 +105,33 @@ async def _load_personal_v2(user_id: str, batch: str) -> Optional[PersonalCustom
     )
 
 
-async def _enqueue_calendar_sync(user_id: str) -> None:
+async def _enqueue_calendar_sync(user_id: str) -> str:
     """Re-sync Google Calendar after a personal timetable change, if connected.
 
-    No-op when the user has no enabled calendar. De-dups against a pending job
-    so rapid edits don't pile up (the sync itself is a full idempotent reconcile).
+    Returns a short status string that callers surface in their JSON response so
+    the browser can see whether a sync fired: "enqueued" (new job created),
+    "already_pending" (a job was already waiting), "not_connected" (no enabled
+    calendar), or "error". No-op-safe: never raises.
     """
     try:
         conn = await calendar_storage.get_connection(user_id)
         if conn is None or not conn.enabled:
-            return
+            logger.info("calendar sync skipped for %s: not connected/enabled", user_id)
+            return "not_connected"
         existing = await CalendarSyncJobDoc.find_one(
             CalendarSyncJobDoc.user_id == user_id,
             CalendarSyncJobDoc.trigger == "override_changed",
             CalendarSyncJobDoc.status == "pending",
         )
-        if existing is None:
-            await calendar_storage.enqueue_job(user_id, "override_changed")
+        if existing is not None:
+            logger.info("calendar sync already pending for %s", user_id)
+            return "already_pending"
+        await calendar_storage.enqueue_job(user_id, "override_changed")
+        logger.info("calendar sync enqueued for %s after personal edit", user_id)
+        return "enqueued"
     except Exception:
         logger.exception("calendar sync enqueue failed for user %s", user_id)
+        return "error"
 
 
 def _normalize_batch(value: str) -> str:
@@ -355,12 +363,13 @@ async def apply_personal_changes(
                 status_code=409,
                 detail={"error": "Concurrent personal save; reload before retrying", "code": "revision_conflict"},
             )
-    await _enqueue_calendar_sync(user_id)
+    calendar_sync = await _enqueue_calendar_sync(user_id)
     return {
         "ok": True,
         "batch": code,
         "revision": next_revision,
         "saved_operations": len(merged),
+        "calendar_sync": calendar_sync,
     }
 
 
@@ -384,8 +393,8 @@ async def reset_personal_changes(
             ).insert()
         except DuplicateKeyError as exc:
             raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"}) from exc
-        await _enqueue_calendar_sync(user_id)
-        return {"ok": True, "batch": code, "revision": 1, "saved_operations": 0}
+        calendar_sync = await _enqueue_calendar_sync(user_id)
+        return {"ok": True, "batch": code, "revision": 1, "saved_operations": 0, "calendar_sync": calendar_sync}
     if current.revision != expected_revision:
         raise HTTPException(
             status_code=409,
@@ -400,8 +409,8 @@ async def reset_personal_changes(
     )
     if updated is None:
         raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"})
-    await _enqueue_calendar_sync(user_id)
-    return {"ok": True, "batch": code, "revision": current.revision + 1, "saved_operations": 0}
+    calendar_sync = await _enqueue_calendar_sync(user_id)
+    return {"ok": True, "batch": code, "revision": current.revision + 1, "saved_operations": 0, "calendar_sync": calendar_sync}
 
 
 @router.get("/overrides")

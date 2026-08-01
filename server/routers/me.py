@@ -115,9 +115,16 @@ async def _enqueue_calendar_sync(user_id: str) -> str:
     """
     try:
         conn = await calendar_storage.get_connection(user_id)
-        if conn is None or not conn.enabled:
-            logger.info("calendar sync skipped for %s: not connected/enabled", user_id)
-            return "not_connected"
+        if conn is None:
+            # No calendar connection under this identity. If the user *has*
+            # connected Google, this points to an identity mismatch between the
+            # /me/* path (this call) and /api/calendar/* (where the connection
+            # was stored) — log the id so we can compare the two.
+            logger.info("calendar sync skipped: no connection for user_id=%s", user_id)
+            return "no_connection"
+        if not conn.enabled:
+            logger.info("calendar sync skipped: auto-sync disabled for user_id=%s", user_id)
+            return "not_enabled"
         existing = await CalendarSyncJobDoc.find_one(
             CalendarSyncJobDoc.user_id == user_id,
             CalendarSyncJobDoc.trigger == "override_changed",

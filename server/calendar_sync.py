@@ -808,7 +808,8 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
 
     When ``force=True`` (manual trigger), runs even if auto-sync is disabled.
     """
-    from server.db.models import OverrideDoc, TimetableDoc
+    from server.db.models import OverrideDoc, PersonalCustomizationDoc, TimetableDoc
+    from server.personal_timetable import apply_operations, with_stable_class_ids
     from server import storage as main_storage
 
     conn = await calendar_storage.get_connection(user_id)
@@ -859,29 +860,42 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
         logger.warning("calendar_sync: no timetable for batch %s", batch)
         return
 
-    classes = [
+    base_classes = [
         c.model_dump() if hasattr(c, "model_dump") else dict(c)
         for c in (tt.classes or [])
     ]
-    user_overrides = await OverrideDoc.find_one(
-        OverrideDoc.user_id == user_id,
-        OverrideDoc.batch == batch,
+    # Resolve the user's personalized schedule the same way GET /me/timetable
+    # does: the V2 PersonalCustomizationDoc is the source of truth the app writes
+    # to, so the calendar must honour it. Fall back to the legacy V1 OverrideDoc
+    # only for users who haven't migrated to V2.
+    canonical_classes = with_stable_class_ids(batch, base_classes)
+    personal = await PersonalCustomizationDoc.find_one(
+        PersonalCustomizationDoc.user_id == user_id,
+        PersonalCustomizationDoc.batch == batch,
     )
-    if user_overrides is not None:
-        by_slot = user_overrides.entries or {}
-        merged_classes: list[dict] = []
-        for entry in classes:
-            override = by_slot.get(f"{entry.get('day', '')}|{entry.get('start_time', '')}")
-            if override is not None:
-                if override.kind == "delete" or override.entry is None:
-                    continue
-                merged_classes.append(override.entry.model_dump(exclude_none=False))
-            else:
-                merged_classes.append(entry)
-        for key, override in by_slot.items():
-            if override.kind == "add" and override.entry is not None:
-                merged_classes.append(override.entry.model_dump(exclude_none=False))
-        classes = merged_classes
+    if personal is not None:
+        classes, _stale = apply_operations(canonical_classes, personal.operations)
+    else:
+        classes = canonical_classes
+        user_overrides = await OverrideDoc.find_one(
+            OverrideDoc.user_id == user_id,
+            OverrideDoc.batch == batch,
+        )
+        if user_overrides is not None:
+            by_slot = user_overrides.entries or {}
+            merged_classes: list[dict] = []
+            for entry in classes:
+                override = by_slot.get(f"{entry.get('day', '')}|{entry.get('start_time', '')}")
+                if override is not None:
+                    if override.kind == "delete" or override.entry is None:
+                        continue
+                    merged_classes.append(override.entry.model_dump(exclude_none=False))
+                else:
+                    merged_classes.append(entry)
+            for key, override in by_slot.items():
+                if override.kind == "add" and override.entry is not None:
+                    merged_classes.append(override.entry.model_dump(exclude_none=False))
+            classes = merged_classes
 
     # Grid cells remain period-by-period. Only the Google Calendar projection
     # joins a contiguous run into one readable event.

@@ -16,9 +16,12 @@ from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-from server import storage
+import logging
+
+from server import calendar_storage, storage
 from server.auth import require_user_id
 from server.db.models import (
+    CalendarSyncJobDoc,
     ClassEntry,
     OverrideDoc,
     OverrideEntry,
@@ -26,6 +29,8 @@ from server.db.models import (
     PersonalOverrideOperation,
     UserDoc,
 )
+
+logger = logging.getLogger(__name__)
 from server.personal_timetable import (
     apply_operations,
     merge_draft_operations,
@@ -98,6 +103,27 @@ async def _load_personal_v2(user_id: str, batch: str) -> Optional[PersonalCustom
         PersonalCustomizationDoc.user_id == user_id,
         PersonalCustomizationDoc.batch == batch,
     )
+
+
+async def _enqueue_calendar_sync(user_id: str) -> None:
+    """Re-sync Google Calendar after a personal timetable change, if connected.
+
+    No-op when the user has no enabled calendar. De-dups against a pending job
+    so rapid edits don't pile up (the sync itself is a full idempotent reconcile).
+    """
+    try:
+        conn = await calendar_storage.get_connection(user_id)
+        if conn is None or not conn.enabled:
+            return
+        existing = await CalendarSyncJobDoc.find_one(
+            CalendarSyncJobDoc.user_id == user_id,
+            CalendarSyncJobDoc.trigger == "override_changed",
+            CalendarSyncJobDoc.status == "pending",
+        )
+        if existing is None:
+            await calendar_storage.enqueue_job(user_id, "override_changed")
+    except Exception:
+        logger.exception("calendar sync enqueue failed for user %s", user_id)
 
 
 def _normalize_batch(value: str) -> str:
@@ -329,6 +355,7 @@ async def apply_personal_changes(
                 status_code=409,
                 detail={"error": "Concurrent personal save; reload before retrying", "code": "revision_conflict"},
             )
+    await _enqueue_calendar_sync(user_id)
     return {
         "ok": True,
         "batch": code,
@@ -357,6 +384,7 @@ async def reset_personal_changes(
             ).insert()
         except DuplicateKeyError as exc:
             raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"}) from exc
+        await _enqueue_calendar_sync(user_id)
         return {"ok": True, "batch": code, "revision": 1, "saved_operations": 0}
     if current.revision != expected_revision:
         raise HTTPException(
@@ -372,6 +400,7 @@ async def reset_personal_changes(
     )
     if updated is None:
         raise HTTPException(status_code=409, detail={"error": "revision conflict", "code": "revision_conflict"})
+    await _enqueue_calendar_sync(user_id)
     return {"ok": True, "batch": code, "revision": current.revision + 1, "saved_operations": 0}
 
 
@@ -432,6 +461,7 @@ async def upsert_override(
         doc.updated_at = now
         await doc.save()
 
+    await _enqueue_calendar_sync(user_id)
     return {"key": key, "override": {"kind": entry.kind, "entry": entry.entry.model_dump(exclude_none=False) if entry.entry else None}}
 
 
@@ -451,6 +481,7 @@ async def delete_override(
     del doc.entries[key]
     doc.updated_at = datetime.now(timezone.utc)
     await doc.save()
+    await _enqueue_calendar_sync(user_id)
     return {"deleted": True, "key": key}
 
 
@@ -468,4 +499,5 @@ async def delete_overrides(
     if result is None:
         return {"deleted": False, "batch": code}
     await result.delete()
+    await _enqueue_calendar_sync(user_id)
     return {"deleted": True, "batch": code}

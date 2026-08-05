@@ -60,6 +60,10 @@ class CurriculumBulkBody(BaseModel):
     entries: list[CurriculumBulkItem]
 
 
+class IngestDecisionBody(BaseModel):
+    decisions: dict[str, str]
+
+
 @router.get("/health")
 async def admin_health() -> dict[str, object]:
     return {"ok": True, "scope": "admin"}
@@ -305,6 +309,8 @@ async def post_ingest(
             sheet=sheet,
             actor_kind=principal.kind,
             actor_email=principal.email,
+            stage_only=True,
+            source_filename=file.filename,
         )
     finally:
         tmp_path.unlink(missing_ok=True)
@@ -392,6 +398,68 @@ async def get_upload(attempt_id: str) -> dict[str, object]:
             "code": "not_found",
         })
     return doc
+
+
+@router.get("/uploads/{attempt_id}/changes")
+async def get_upload_changes(
+    attempt_id: str,
+    batch: Optional[str] = Query(default=None),
+) -> dict[str, object]:
+    review = await storage.get_ingest_review(attempt_id, batch=batch)
+    if review is None:
+        raise HTTPException(status_code=404, detail={
+            "error": f"no upload attempt {attempt_id!r}",
+            "code": "not_found",
+        })
+    return review
+
+
+@router.patch("/uploads/{attempt_id}/decisions")
+async def patch_upload_decisions(
+    attempt_id: str,
+    body: IngestDecisionBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        return await storage.save_ingest_decisions(
+            attempt_id,
+            body.decisions,
+            actor=principal.label,
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "not_found"}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc), "code": "review_conflict"}) from exc
+
+
+@router.post("/uploads/{attempt_id}/apply")
+async def post_upload_apply(
+    attempt_id: str,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        result = await storage.apply_ingest_review(attempt_id, actor=principal.label)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "not_found"}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc), "code": "review_conflict"}) from exc
+    logger.info("Ingest review %s applied by %s", attempt_id, principal.label)
+    return result
+
+
+@router.post("/uploads/{attempt_id}/discard")
+async def post_upload_discard(
+    attempt_id: str,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    try:
+        result = await storage.discard_ingest_review(attempt_id, actor=principal.label)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail={"error": str(exc), "code": "not_found"}) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail={"error": str(exc), "code": "review_conflict"}) from exc
+    logger.info("Ingest review %s discarded by %s", attempt_id, principal.label)
+    return result
 
 
 @router.post("/baselines/sync-counts")

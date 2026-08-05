@@ -47,7 +47,9 @@ from server.db.models import (
     CurriculumLibraryDoc,
     CurriculumSection,
     ExamDateDoc,
+    IngestBatchDraftDoc,
     IngestSnapshotDoc,
+    LastIngestChange,
     ParsingErrorDoc,
     SemesterDoc,
     SubjectDoc,
@@ -313,7 +315,9 @@ async def write_timetable(
     *,
     source_sheet: str | None = None,
     source_file: str | None = None,
-) -> None:
+    last_ingest_change: dict[str, Any] | LastIngestChange | None = None,
+    expected_revision: int | None = None,
+) -> dict[str, Any]:
     settings = settings or get_settings()
     code = _safe_batch(batch)
     semester_obj = payload.get("semester") or {}
@@ -341,23 +345,35 @@ async def write_timetable(
 
     doc = await TimetableDoc.find_one(TimetableDoc.code == code)
     if doc is None:
+        if expected_revision not in (None, 0):
+            raise ValueError(f"timetable {code} changed while the upload was being reviewed")
         await TimetableDoc(
             code=code,
             semester=semester_label,
             classes=classes,
             source=source,
+            revision=1,
+            last_ingest_change=last_ingest_change,
         ).insert()
+        revision = 1
     else:
-        await doc.set({
+        if expected_revision is not None and int(doc.revision or 0) != int(expected_revision):
+            raise ValueError(f"timetable {code} changed while the upload was being reviewed")
+        revision = int(doc.revision or 0) + 1
+        updates: dict[str, Any] = {
             "semester": semester_label,
             "classes": classes,
             "source": source,
+            "revision": revision,
+            "last_ingest_change": last_ingest_change,
             "updated_at": datetime.now(timezone.utc),
-        })
+        }
+        await doc.set(updates)
 
     if settings.json_mirror:
         path = settings.data_dir / "timetable" / f"{code}.json"
         _mirror_json(path, _timetable_payload_from_raw(code, semester_label, classes, catalog))
+    return {"batch": code, "revision": revision}
 
 
 async def delete_timetable(batch: str, settings: Settings | None = None) -> bool:
@@ -1856,11 +1872,19 @@ def maybe_git_commit(message: str, settings: Settings | None = None) -> None:
 
 # ── Internals ────────────────────────────────────────────────────────────
 def _timetable_payload(doc: TimetableDoc, catalog: Any = None) -> dict[str, Any]:
-    return {
+    payload = {
         "batch": doc.code,
         "semester": {"label": doc.semester},
         "classes": [_serialize_class(c, catalog) for c in doc.classes],
     }
+    if doc.last_ingest_change is not None:
+        change = doc.last_ingest_change
+        payload["schedule_update"] = {
+            "changed_at": change.changed_at.isoformat() if change.changed_at else None,
+            "source_file": change.source_file,
+            "changed_count": int(change.changed_count or 0),
+        }
+    return payload
 
 
 def _timetable_payload_from_raw(
@@ -2149,6 +2173,13 @@ def _serialize_upload_attempt(doc: UploadAttemptDoc) -> dict[str, Any]:
         "confidence_summary": dict(doc.confidence_summary or {}),
         "doctor": doc.doctor,
         "failure_message": doc.failure_message,
+        "ingest_state": doc.ingest_state,
+        "changes_total": int(doc.changes_total or 0),
+        "changes_unresolved": int(doc.changes_unresolved or 0),
+        "batches_changed": int(doc.batches_changed or 0),
+        "reviewed_by": doc.reviewed_by,
+        "reviewed_at": doc.reviewed_at.isoformat() if doc.reviewed_at else None,
+        "applied_at": doc.applied_at.isoformat() if doc.applied_at else None,
     }
 
 
@@ -2172,12 +2203,34 @@ async def record_upload_attempt(payload: dict[str, Any]) -> dict[str, Any]:
             confidence_summary=dict(payload.get("confidence_summary") or {}),
             doctor=payload.get("doctor"),
             failure_message=payload.get("failure_message"),
+            ingest_state=payload.get("ingest_state") or (
+                "failed" if payload.get("status") == "failed" else "legacy_applied"
+            ),
+            changes_total=int(payload.get("changes_total") or 0),
+            changes_unresolved=int(payload.get("changes_unresolved") or 0),
+            batches_changed=int(payload.get("batches_changed") or 0),
         )
         await doc.insert()
         return _serialize_upload_attempt(doc)
     except Exception:
         logger.exception("failed to persist UploadAttemptDoc")
         return {}
+
+
+async def fail_upload_attempt(attempt_id: str, message: str) -> None:
+    """Mark an already-created staged attempt failed without duplicating it."""
+    from bson import ObjectId
+    try:
+        doc = await UploadAttemptDoc.get(ObjectId(attempt_id))
+    except Exception:
+        doc = None
+    if doc is not None:
+        await doc.set({
+            "status": "failed",
+            "ingest_state": "failed",
+            "failure_message": message,
+            "finished_at": datetime.now(timezone.utc),
+        })
 
 
 async def list_upload_attempts(
@@ -2299,6 +2352,393 @@ async def get_upload_attempt(attempt_id: str) -> dict[str, Any] | None:
     if doc is None:
         return None
     return _serialize_upload_attempt(doc)
+
+
+async def _get_upload_attempt_doc(attempt_id: str) -> UploadAttemptDoc | None:
+    from bson import ObjectId
+    try:
+        oid = ObjectId(attempt_id)
+    except Exception:
+        return None
+    return await UploadAttemptDoc.get(oid)
+
+
+# ── Staged ingest review ─────────────────────────────────────────────────
+def _serialize_ingest_draft(doc: IngestBatchDraftDoc) -> dict[str, Any]:
+    decisions = dict(doc.decisions or {})
+    changes = []
+    for raw in doc.changes or []:
+        change = dict(raw)
+        change["decision"] = decisions.get(str(change.get("change_id") or ""))
+        changes.append(change)
+    return {
+        "id": str(doc.id),
+        "upload_id": doc.upload_id,
+        "batch_code": doc.batch_code,
+        "semester_label": doc.semester_label,
+        "source_sheet": doc.source_sheet,
+        "base_exists": bool(doc.base_exists),
+        "candidate_exists": bool(doc.candidate_exists),
+        "base_revision": int(doc.base_revision or 0),
+        "status": doc.status,
+        "changes": changes,
+        "changes_total": len(changes),
+        "changes_unresolved": sum(
+            1 for change in changes if not change.get("decision")
+        ),
+        "created_at": doc.created_at.isoformat() if doc.created_at else None,
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+    }
+
+
+async def stage_ingest_review(
+    *,
+    upload_id: str,
+    semester_label: str,
+    payloads: dict[str, dict[str, Any]],
+    sheet_by_code: dict[str, str],
+    include_missing_batches: bool = True,
+) -> dict[str, Any]:
+    """Persist immutable before/after rows without changing live timetables."""
+    from server.ingest_review import diff_batch, payload_hash
+    from timetable_parser.core.subject_catalog import ensure_catalog
+
+    catalog = await ensure_catalog()
+    current_docs = {doc.code: doc async for doc in TimetableDoc.find_all()}
+    codes = set(payloads)
+    if include_missing_batches:
+        codes.update(current_docs)
+
+    await IngestBatchDraftDoc.find(
+        IngestBatchDraftDoc.upload_id == upload_id,
+    ).delete()
+
+    changes_total = 0
+    batches_changed = 0
+    for code in sorted(codes):
+        live = current_docs.get(code)
+        candidate = payloads.get(code)
+        before_raw = (
+            [_serialize_class(entry, catalog) for entry in live.classes]
+            if live is not None else []
+        )
+        after_raw = list((candidate or {}).get("classes") or [])
+        before, after, changes = diff_batch(code, before_raw, after_raw)
+        if not changes:
+            continue
+        batches_changed += 1
+        changes_total += len(changes)
+        await IngestBatchDraftDoc(
+            upload_id=upload_id,
+            batch_code=code,
+            semester_label=semester_label,
+            source_sheet=sheet_by_code.get(code),
+            base_exists=live is not None,
+            candidate_exists=candidate is not None,
+            base_revision=int(live.revision or 0) if live is not None else 0,
+            base_hash=payload_hash(before),
+            before_classes=before,
+            after_classes=after,
+            changes=changes,
+        ).insert()
+
+    from bson import ObjectId
+    attempt = await UploadAttemptDoc.get(ObjectId(upload_id))
+    if attempt is not None:
+        await attempt.set({
+            "ingest_state": "pending_review",
+            "changes_total": changes_total,
+            "changes_unresolved": changes_total,
+            "batches_changed": batches_changed,
+        })
+    return {
+        "ingest_state": "pending_review",
+        "changes_total": changes_total,
+        "changes_unresolved": changes_total,
+        "batches_changed": batches_changed,
+    }
+
+
+async def get_ingest_review(
+    upload_id: str,
+    *,
+    batch: str | None = None,
+) -> dict[str, Any] | None:
+    attempt = await get_upload_attempt(upload_id)
+    if attempt is None:
+        return None
+    if batch:
+        query = IngestBatchDraftDoc.find(
+            IngestBatchDraftDoc.upload_id == upload_id,
+            IngestBatchDraftDoc.batch_code == _safe_batch(batch),
+        ).sort("batch_code")
+    else:
+        query = IngestBatchDraftDoc.find(
+            IngestBatchDraftDoc.upload_id == upload_id,
+        ).sort("batch_code")
+    batches = [_serialize_ingest_draft(doc) async for doc in query]
+    return {"upload": attempt, "batches": batches, "count": len(batches)}
+
+
+async def save_ingest_decisions(
+    upload_id: str,
+    decisions: dict[str, str],
+    *,
+    actor: str | None = None,
+) -> dict[str, Any]:
+    attempt = await _get_upload_attempt_doc(upload_id)
+    if attempt is None:
+        raise LookupError("Upload review not found")
+    if attempt.ingest_state != "pending_review":
+        raise ValueError("This upload is no longer awaiting review")
+    invalid = sorted({value for value in decisions.values() if value not in {"keep_current", "use_uploaded"}})
+    if invalid:
+        raise ValueError(f"Invalid ingest decision: {', '.join(invalid)}")
+
+    known: set[str] = set()
+    drafts = [
+        doc async for doc in IngestBatchDraftDoc.find(
+            IngestBatchDraftDoc.upload_id == upload_id,
+        )
+    ]
+    now = datetime.now(timezone.utc)
+    for draft in drafts:
+        change_ids = {str(row.get("change_id") or "") for row in draft.changes or []}
+        known.update(change_ids)
+        updates = dict(draft.decisions or {})
+        for change_id, decision in decisions.items():
+            if change_id in change_ids:
+                updates[change_id] = decision  # type: ignore[assignment]
+        if updates != dict(draft.decisions or {}):
+            await draft.set({"decisions": updates, "updated_at": now})
+
+    unknown = sorted(set(decisions) - known)
+    if unknown:
+        raise ValueError(f"Unknown change id(s): {', '.join(unknown[:3])}")
+    unresolved = sum(
+        1
+        for draft in drafts
+        for change in draft.changes or []
+        if str(change.get("change_id") or "") not in (
+            dict(draft.decisions or {}) | {
+                key: value for key, value in decisions.items()
+                if key in {str(row.get("change_id") or "") for row in draft.changes or []}
+            }
+        )
+    )
+    await attempt.set({
+        "changes_unresolved": unresolved,
+        "reviewed_by": actor,
+        "reviewed_at": now,
+    })
+    return {
+        "ok": True,
+        "changes_total": int(attempt.changes_total or 0),
+        "changes_unresolved": unresolved,
+    }
+
+
+async def _rebase_personal_operations(
+    batch: str,
+    accepted_changes: list[dict[str, Any]],
+) -> int:
+    """Keep personal edits valid when the same official class was revised."""
+    from server.db.models import PersonalCustomizationDoc
+    from server.personal_timetable import class_fingerprint
+
+    fingerprints: dict[str, str] = {}
+    for change in accepted_changes:
+        if change.get("kind") not in {"modified", "moved"}:
+            continue
+        after = change.get("after") or {}
+        class_id = str(after.get("class_id") or "")
+        if class_id:
+            fingerprints[class_id] = class_fingerprint(after)
+    if not fingerprints:
+        return 0
+
+    updated = 0
+    async for doc in PersonalCustomizationDoc.find(
+        PersonalCustomizationDoc.batch == batch,
+    ):
+        operations = dict(doc.operations or {})
+        changed = False
+        for key, operation in operations.items():
+            fingerprint = fingerprints.get(operation.target_id)
+            if fingerprint and operation.base_fingerprint != fingerprint:
+                operation.base_fingerprint = fingerprint
+                operations[key] = operation
+                changed = True
+        if changed:
+            await doc.set({
+                "operations": operations,
+                "revision": int(doc.revision or 0) + 1,
+                "updated_at": datetime.now(timezone.utc),
+            })
+            updated += 1
+    return updated
+
+
+async def apply_ingest_review(
+    upload_id: str,
+    *,
+    actor: str | None = None,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    """Atomically-as-practical publish only explicitly accepted differences."""
+    from server.ingest_review import payload_hash, resolve_reviewed_classes
+    from timetable_parser.core.subject_catalog import ensure_catalog
+
+    settings = settings or get_settings()
+    attempt = await _get_upload_attempt_doc(upload_id)
+    if attempt is None:
+        raise LookupError("Upload review not found")
+    if attempt.ingest_state != "pending_review":
+        raise ValueError("This upload is no longer awaiting review")
+    drafts = [
+        doc async for doc in IngestBatchDraftDoc.find(
+            IngestBatchDraftDoc.upload_id == upload_id,
+        ).sort("batch_code")
+    ]
+    unresolved = [
+        str(change.get("change_id") or "")
+        for draft in drafts
+        for change in draft.changes or []
+        if str(change.get("change_id") or "") not in (draft.decisions or {})
+    ]
+    if unresolved:
+        raise ValueError(f"Resolve all changes before applying ({len(unresolved)} remaining)")
+
+    catalog = await ensure_catalog()
+    for draft in drafts:
+        live = await TimetableDoc.find_one(TimetableDoc.code == draft.batch_code)
+        if draft.base_exists and live is None:
+            raise ValueError(f"{draft.batch_code} was deleted while this upload was being reviewed")
+        if not draft.base_exists and live is not None:
+            raise ValueError(f"{draft.batch_code} was created while this upload was being reviewed")
+        if live is not None:
+            current_classes = [_serialize_class(entry, catalog) for entry in live.classes]
+            if int(live.revision or 0) != int(draft.base_revision or 0) or payload_hash(current_classes) != draft.base_hash:
+                raise ValueError(f"{draft.batch_code} changed while this upload was being reviewed")
+
+    has_uploaded_changes = any(
+        decision == "use_uploaded"
+        for draft in drafts
+        for decision in (draft.decisions or {}).values()
+    )
+    snapshot = await save_ingest_snapshot(settings=settings) if has_uploaded_changes else None
+    now = datetime.now(timezone.utc)
+    changed_batches: list[str] = []
+    changed_classes = 0
+    rebased_personal = 0
+    try:
+        for draft in drafts:
+            accepted = [
+                dict(change)
+                for change in draft.changes or []
+                if (draft.decisions or {}).get(str(change.get("change_id") or "")) == "use_uploaded"
+            ]
+            if not accepted:
+                await draft.set({"status": "applied", "updated_at": now})
+                continue
+            final_classes = resolve_reviewed_classes(
+                draft.before_classes,
+                draft.changes,
+                draft.decisions,
+            )
+            changed_count = len(accepted)
+            if not final_classes:
+                await delete_timetable(draft.batch_code, settings=settings)
+            else:
+                await write_timetable(
+                    draft.batch_code,
+                    {
+                        "semester": {"label": draft.semester_label},
+                        "classes": final_classes,
+                    },
+                    settings=settings,
+                    source_sheet=draft.source_sheet,
+                    source_file=attempt.filename,
+                    expected_revision=int(draft.base_revision or 0),
+                    last_ingest_change={
+                        "upload_id": upload_id,
+                        "source_file": attempt.filename,
+                        "source_sheets": [draft.source_sheet] if draft.source_sheet else [],
+                        "changed_at": now,
+                        "changed_count": changed_count,
+                    },
+                )
+                rebased_personal += await _rebase_personal_operations(draft.batch_code, accepted)
+            changed_batches.append(draft.batch_code)
+            changed_classes += changed_count
+            await draft.set({"status": "applied", "updated_at": now})
+
+        if changed_batches:
+            await write_current({"label": attempt.semester_label or drafts[0].semester_label}, settings=settings)
+            batch_docs = {doc.code: doc async for doc in BatchDoc.find_all()}
+            live_codes = sorted({doc.code async for doc in TimetableDoc.find_all()})
+            sheet_map = {
+                code: batch_docs[code].source_sheet
+                for code in live_codes
+                if code in batch_docs and batch_docs[code].source_sheet
+            }
+            sheet_map.update({
+                draft.batch_code: draft.source_sheet
+                for draft in drafts
+                if draft.source_sheet and draft.batch_code in live_codes
+            })
+            await write_batch_list(live_codes, settings=settings, sheet_by_code=sheet_map)
+
+        await attempt.set({
+            "ingest_state": "applied",
+            "changes_unresolved": 0,
+            "reviewed_by": actor,
+            "reviewed_at": now,
+            "applied_at": now,
+        })
+        maybe_git_commit(
+            f"ingest review: {attempt.filename or upload_id} ({len(changed_batches)} batches, {changed_classes} changes)",
+            settings=settings,
+        )
+        if changed_batches:
+            try:
+                from server.calendar_storage import enqueue_jobs_for_batches
+                await enqueue_jobs_for_batches(changed_batches)
+            except Exception:
+                logger.exception("Failed to enqueue calendar refresh after ingest review")
+        return {
+            "ok": True,
+            "upload_id": upload_id,
+            "ingest_state": "applied",
+            "changed_batches": changed_batches,
+            "batches_changed": len(changed_batches),
+            "changes_applied": changed_classes,
+            "personal_timetables_rebased": rebased_personal,
+            "snapshot": snapshot,
+        }
+    except Exception:
+        logger.exception("Applying staged ingest %s failed; restoring snapshot", upload_id)
+        if snapshot is not None:
+            await restore_ingest_snapshot()
+        raise
+
+
+async def discard_ingest_review(upload_id: str, *, actor: str | None = None) -> dict[str, Any]:
+    attempt = await _get_upload_attempt_doc(upload_id)
+    if attempt is None:
+        raise LookupError("Upload review not found")
+    if attempt.ingest_state != "pending_review":
+        raise ValueError("This upload is no longer awaiting review")
+    now = datetime.now(timezone.utc)
+    await IngestBatchDraftDoc.find(
+        IngestBatchDraftDoc.upload_id == upload_id,
+    ).update({"$set": {"status": "discarded", "updated_at": now}})
+    await attempt.set({
+        "ingest_state": "discarded",
+        "reviewed_by": actor,
+        "reviewed_at": now,
+    })
+    return {"ok": True, "upload_id": upload_id, "ingest_state": "discarded"}
 
 
 async def compute_admin_stats() -> dict[str, Any]:

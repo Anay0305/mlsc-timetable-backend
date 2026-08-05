@@ -251,6 +251,26 @@ async def enqueue_jobs_for_override(override_doc: dict[str, Any]) -> int:
     return count
 
 
+async def enqueue_jobs_for_batches(batch_codes: list[str]) -> int:
+    """Refresh connected calendars whose canonical timetable was published."""
+    affected = {str(code).strip().upper() for code in batch_codes if str(code).strip()}
+    if not affected:
+        return 0
+    count = 0
+    async for conn in CalendarConnectionDoc.find(CalendarConnectionDoc.enabled == True):  # noqa: E712
+        if (conn.batch_code or "").upper() not in affected:
+            continue
+        existing = await CalendarSyncJobDoc.find_one(
+            CalendarSyncJobDoc.user_id == conn.user_id,
+            CalendarSyncJobDoc.status == "pending",
+        )
+        if existing is not None:
+            continue
+        await enqueue_job(conn.user_id, "batch_changed")
+        count += 1
+    return count
+
+
 # ── Event map ─────────────────────────────────────────────────────────
 
 async def clear_event_maps(user_id: str) -> int:

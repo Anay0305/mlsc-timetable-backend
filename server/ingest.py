@@ -73,12 +73,19 @@ async def parse_workbook(
     actor_kind: str | None = None,
     actor_email: str | None = None,
     record_attempt: bool = True,
+    stage_only: bool = False,
+    source_filename: str | None = None,
 ) -> dict[str, object]:
-    """Parse `xlsx_path` and upsert results into Mongo. Returns a small summary."""
+    """Parse a workbook and either stage a review or apply it directly.
+
+    Admin uploads use ``stage_only=True``. The direct path remains available
+    for trusted CLI/bootstrap jobs and preserves the pre-review behaviour.
+    """
     settings = settings or get_settings()
     xlsx_path = Path(xlsx_path).resolve()
     started_at = datetime.now(timezone.utc)
-    filename = xlsx_path.name
+    filename = (source_filename or xlsx_path.name).strip()
+    recorded_attempt_id: str | None = None
 
     if not xlsx_path.exists():
         if record_attempt:
@@ -91,6 +98,7 @@ async def parse_workbook(
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
                 "status": "failed",
+                "ingest_state": "failed",
                 "failure_message": f"Spreadsheet not found: {xlsx_path}",
             })
         raise FileNotFoundError(f"Spreadsheet not found: {xlsx_path}")
@@ -166,6 +174,86 @@ async def parse_workbook(
         error_rows.extend(curriculum_errors)
         batches = sorted(merged.keys())
 
+        total_classes = sum(len(payload["classes"]) for payload in payloads.values())
+        prefix = storage.semester_prefix(semester_label)
+        baselines = await storage.read_baselines_for_prefix(prefix, settings=settings)
+        baseline_courses = await storage.read_baseline_courses_for_prefix(prefix, settings=settings)
+        doctor = build_doctor_report(
+            {code: count_classes(payload["classes"]) for code, payload in payloads.items()},
+            baselines_by_group=baselines,
+            semester_prefix=prefix,
+            codes_by_batch={code: codes_in(payload["classes"]) for code, payload in payloads.items()},
+            courses_by_group=baseline_courses,
+        )
+        total_blocks = sum(confidence_summary.values())
+        attempt_status: str = "ok"
+        if not batches:
+            attempt_status = "failed"
+        elif error_rows or doctor.get("mismatched_groups", 0) > 0:
+            attempt_status = "partial"
+
+        summary: dict[str, object] = {
+            "batches": len(batches),
+            "classes": total_classes,
+            "sheets_used": used_sheets,
+            "multi_sheet_batches": multi_sheet_list,
+            "doctor": doctor,
+            "total_blocks": total_blocks,
+            "confidence_summary": confidence_summary,
+            "error_count": len(error_rows),
+        }
+
+        if stage_only:
+            if not record_attempt:
+                raise ValueError("staged ingestion requires an upload attempt record")
+            recorded = await storage.record_upload_attempt({
+                "started_at": started_at,
+                "finished_at": datetime.now(timezone.utc),
+                "actor_kind": actor_kind,
+                "actor_email": actor_email,
+                "filename": filename,
+                "sheet_selector": sheet,
+                "semester_label": semester_label,
+                "status": attempt_status,
+                "ingest_state": "pending_review" if batches else "failed",
+                "batches_written": len(batches),
+                "classes_written": total_classes,
+                "sheets_used": used_sheets,
+                "multi_sheet_batches": multi_sheet_list,
+                "total_blocks": total_blocks,
+                "confidence_summary": confidence_summary,
+                "doctor": doctor,
+            })
+            if not recorded.get("id"):
+                raise RuntimeError("Could not create upload review")
+            recorded_attempt_id = str(recorded["id"])
+            summary["attempt_id"] = recorded["id"]
+            summary["status"] = attempt_status
+            if batches:
+                review = await storage.stage_ingest_review(
+                    upload_id=recorded["id"],
+                    semester_label=semester_label,
+                    payloads=payloads,
+                    sheet_by_code=sheet_by_code,
+                    include_missing_batches=sheet.strip().lower() == "all",
+                )
+                summary.update(review)
+            else:
+                summary["ingest_state"] = "failed"
+            try:
+                summary["errors_persisted"] = await storage.save_parsing_errors(
+                    upload_id=recorded["id"],
+                    error_rows=list(error_rows),
+                    doctor=doctor,
+                )
+            except Exception:
+                logger.exception("save_parsing_errors failed (non-fatal)")
+            logger.info(
+                "Ingest staged: %d batches, %d classes, %s changes awaiting review",
+                len(batches), total_classes, summary.get("changes_total", 0),
+            )
+            return summary
+
         # Snapshot the current state BEFORE we mutate anything, so a rollback
         # can undo this run. We only do this when there's at least one batch
         # to write — empty runs aren't worth snapshotting over (and would
@@ -189,7 +277,7 @@ async def parse_workbook(
                 payload,
                 settings=settings,
                 source_sheet=sheet_by_code.get(code),
-                source_file=xlsx_path.name,
+                source_file=filename,
             )
         # Prune ghost timetables (codes that survived from a previous ingest
         # but aren't in the new spreadsheet).
@@ -200,40 +288,10 @@ async def parse_workbook(
         except Exception:
             logger.exception("Stale-timetable prune failed (non-fatal)")
 
-        total_classes = sum(len(payload["classes"]) for payload in payloads.values())
         storage.maybe_git_commit(
-            f"ingest: {xlsx_path.name} ({len(batches)} batches, {total_classes} classes)",
+            f"ingest: {filename} ({len(batches)} batches, {total_classes} classes)",
             settings=settings,
         )
-
-        prefix = storage.semester_prefix(semester_label)
-        baselines = await storage.read_baselines_for_prefix(prefix, settings=settings)
-        baseline_courses = await storage.read_baseline_courses_for_prefix(prefix, settings=settings)
-        doctor = build_doctor_report(
-            {code: count_classes(payload["classes"]) for code, payload in payloads.items()},
-            baselines_by_group=baselines,
-            semester_prefix=prefix,
-            codes_by_batch={code: codes_in(payload["classes"]) for code, payload in payloads.items()},
-            courses_by_group=baseline_courses,
-        )
-
-        total_blocks = sum(confidence_summary.values())
-        attempt_status: str = "ok"
-        if not batches:
-            attempt_status = "failed"
-        elif error_rows or doctor.get("mismatched_groups", 0) > 0:
-            attempt_status = "partial"
-
-        summary: dict[str, object] = {
-            "batches": len(batches),
-            "classes": total_classes,
-            "sheets_used": used_sheets,
-            "multi_sheet_batches": multi_sheet_list,
-            "doctor": doctor,
-            "total_blocks": total_blocks,
-            "confidence_summary": confidence_summary,
-            "error_count": len(error_rows),
-        }
         logger.info(
             "Ingest complete: %d batches, %d classes (sheets=%s, multi-sheet=%d, "
             "mismatched-groups=%d, parser-errors=%d)",
@@ -279,7 +337,10 @@ async def parse_workbook(
 
         return summary
     except Exception as exc:
-        if record_attempt:
+        failure_message = f"{type(exc).__name__}: {exc}"
+        if recorded_attempt_id:
+            await storage.fail_upload_attempt(recorded_attempt_id, failure_message)
+        elif record_attempt:
             await storage.record_upload_attempt({
                 "started_at": started_at,
                 "finished_at": datetime.now(timezone.utc),
@@ -289,7 +350,8 @@ async def parse_workbook(
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
                 "status": "failed",
-                "failure_message": f"{type(exc).__name__}: {exc}",
+                "ingest_state": "failed",
+                "failure_message": failure_message,
             })
         raise
 

@@ -49,6 +49,16 @@ class TimetableSource(BaseModel):
     ingested_at: Optional[datetime] = None
 
 
+class LastIngestChange(BaseModel):
+    """Public-safe provenance for the last reviewed Excel change."""
+
+    upload_id: Optional[str] = None
+    source_file: Optional[str] = None
+    source_sheets: list[str] = Field(default_factory=list)
+    changed_at: datetime = Field(default_factory=_utcnow)
+    changed_count: int = 0
+
+
 # ── Documents ─────────────────────────────────────────────────────────────
 class SemesterDoc(Document):
     """Singleton — only one doc with `key == "current"` ever exists."""
@@ -81,6 +91,8 @@ class TimetableDoc(Document):
     semester: str
     classes: list[ClassEntry]
     source: Optional[TimetableSource] = None
+    revision: int = 0
+    last_ingest_change: Optional[LastIngestChange] = None
     updated_at: datetime = Field(default_factory=_utcnow)
 
     class Settings:
@@ -396,12 +408,65 @@ class UploadAttemptDoc(Document):
     confidence_summary: dict[str, int] = Field(default_factory=dict)
     doctor: Optional[dict] = None
     failure_message: Optional[str] = None
+    # Parsing quality (`status`) and publishing lifecycle (`ingest_state`) are
+    # deliberately separate. A syntactically clean upload may still be waiting
+    # for an admin to decide which timetable differences to publish.
+    ingest_state: Literal[
+        "legacy_applied",
+        "pending_review",
+        "applied",
+        "discarded",
+        "failed",
+    ] = "legacy_applied"
+    changes_total: int = 0
+    changes_unresolved: int = 0
+    batches_changed: int = 0
+    reviewed_by: Optional[str] = None
+    reviewed_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
 
     class Settings:
         name = "upload_attempts"
         indexes = [
             [("started_at", -1)],
             "status",
+            "ingest_state",
+        ]
+
+
+class IngestBatchDraftDoc(Document):
+    """One batch from a staged spreadsheet ingest.
+
+    Payloads are split by batch so even very large semester workbooks stay
+    below MongoDB's per-document limit. `changes` holds immutable before/after
+    observations while `decisions` is the admin-owned review state.
+    """
+
+    upload_id: Annotated[str, Indexed()]
+    batch_code: str
+    semester_label: str
+    source_sheet: Optional[str] = None
+    base_exists: bool = False
+    candidate_exists: bool = False
+    base_revision: int = 0
+    base_hash: str
+    before_classes: list[dict] = Field(default_factory=list)
+    after_classes: list[dict] = Field(default_factory=list)
+    changes: list[dict] = Field(default_factory=list)
+    decisions: dict[str, Literal["keep_current", "use_uploaded"]] = Field(default_factory=dict)
+    status: Literal["pending", "applied", "discarded"] = "pending"
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow)
+
+    class Settings:
+        name = "ingest_batch_drafts"
+        indexes = [
+            IndexModel(
+                [("upload_id", ASCENDING), ("batch_code", ASCENDING)],
+                unique=True,
+                name="unique_ingest_batch_draft",
+            ),
+            [("upload_id", ASCENDING), ("status", ASCENDING)],
         ]
 
 
@@ -678,6 +743,7 @@ ALL_DOCUMENTS = [
     SubjectRequestDoc,
     AdminEmailDoc,
     UploadAttemptDoc,
+    IngestBatchDraftDoc,
     AnnouncementDoc,
     ExamDateDoc,
     CalendarOverrideDoc,

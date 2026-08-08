@@ -34,7 +34,7 @@ from server.curriculum_projection import (
     project_curriculum_classes,
     resolve_curriculum_context,
 )
-from server.personal_timetable import with_stable_class_ids
+from server.personal_timetable import class_fingerprint, with_stable_class_ids
 from server.db.models import (
     AdminEmailDoc,
     AnnouncementDoc,
@@ -125,6 +125,11 @@ async def read_timetable(
     payload["classes"] = with_stable_class_ids(code, payload.get("classes") or [])
     if project_curriculum:
         payload, _ = await project_curriculum_payload(code, payload)
+    # Personal operations fingerprint the live projected shape. Carry that
+    # fingerprint in public data so the browser can reject stale operations
+    # without another canonical database read.
+    for entry in payload["classes"]:
+        entry["base_fingerprint"] = class_fingerprint(entry)
     batch_doc = await BatchDoc.find_one(BatchDoc.code == code)
     teacher_codes_visible = bool(batch_doc and batch_doc.teacher_codes_visible)
     payload["teacher_codes_visible"] = teacher_codes_visible
@@ -194,6 +199,46 @@ async def read_teacher_visibility() -> list[dict[str, Any]]:
         }
         async for doc in BatchDoc.find_all(sort=[("code", 1)])
     ]
+
+
+async def public_batches_for_library(branch: str, semester: int) -> list[str]:
+    """Return batches whose live projection depends on one Library key."""
+    clean_branch = normalize_library_branch(branch)
+    target_branch = LIBRARY_BRANCH_INHERITANCE.get(clean_branch, clean_branch)
+    target_key = library_key(target_branch, semester)
+    try:
+        current = await read_current()
+    except DataMissing:
+        return []
+    label = str(current.get("label") or "")
+    affected: list[str] = []
+    async for doc in TimetableDoc.find_all():
+        try:
+            context = resolve_curriculum_context(doc.code, label)
+        except ValueError:
+            continue
+        if context.resolved_key == target_key:
+            affected.append(doc.code)
+    return sorted(affected)
+
+
+async def public_batches_for_subjects(codes: list[str] | set[str]) -> list[str]:
+    """Return batches containing any normalized catalog course code."""
+    wanted = {base_course_code(code) for code in codes if base_course_code(code)}
+    if not wanted:
+        return []
+    affected: list[str] = []
+    async for doc in TimetableDoc.find_all():
+        observed: set[str] = set()
+        for klass in doc.classes or []:
+            if klass.code:
+                observed.add(base_course_code(klass.code))
+            for option in klass.options or []:
+                if option.subject_code:
+                    observed.add(base_course_code(option.subject_code))
+        if wanted & observed:
+            affected.append(doc.code)
+    return sorted(affected)
 
 
 async def replace_teacher_visibility(batches: list[str]) -> list[str]:
@@ -373,7 +418,17 @@ async def write_timetable(
     if settings.json_mirror:
         path = settings.data_dir / "timetable" / f"{code}.json"
         _mirror_json(path, _timetable_payload_from_raw(code, semester_label, classes, catalog))
-    return {"batch": code, "revision": revision}
+    public_snapshot: dict[str, Any] | None = None
+    try:
+        from server.public_snapshots import publish_batch
+
+        public_snapshot = await publish_batch(code, settings=settings)
+    except Exception:
+        # MongoDB has committed successfully; retain the previous public
+        # revision and make the publication failure visible in logs/admin
+        # responses so it can be retried safely.
+        logger.exception("Public snapshot publish failed after writing %s", code)
+    return {"batch": code, "revision": revision, "public_snapshot": public_snapshot}
 
 
 async def delete_timetable(batch: str, settings: Settings | None = None) -> bool:
@@ -389,6 +444,12 @@ async def delete_timetable(batch: str, settings: Settings | None = None) -> bool
             path.unlink()
         except FileNotFoundError:
             pass
+    try:
+        from server.public_snapshots import unpublish_batch
+
+        await unpublish_batch(code, settings=settings)
+    except Exception:
+        logger.exception("Could not remove %s from the public snapshot manifest", code)
     return True
 
 

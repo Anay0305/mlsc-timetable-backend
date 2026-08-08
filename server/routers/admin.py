@@ -18,6 +18,8 @@ from pydantic import BaseModel
 from server import storage
 from server.auth import AdminPrincipal, require_admin
 from server.ingest import parse_workbook
+from server.public_snapshots import publish_all as publish_all_snapshots
+from server.public_snapshots import publish_batches as publish_batch_snapshots
 from server.scheme_parser import baseline_key_for, parse_scheme_pdf
 from server.calendar_parser import parse_calendar_pdf
 
@@ -62,6 +64,23 @@ class CurriculumBulkBody(BaseModel):
 
 class IngestDecisionBody(BaseModel):
     decisions: dict[str, str]
+
+
+async def _publish_all_public() -> dict[str, object]:
+    """Rebuild shared read models after a global projection dependency changes."""
+    try:
+        return await publish_all_snapshots()
+    except Exception as exc:
+        logger.exception("Public snapshot rebuild failed")
+        return {"published": 0, "failures": [{"error": str(exc)}]}
+
+
+async def _publish_public_batches(batches: list[str]) -> dict[str, object]:
+    try:
+        return await publish_batch_snapshots(batches)
+    except Exception as exc:
+        logger.exception("Public snapshot batch rebuild failed")
+        return {"published": 0, "batches": [], "failures": [{"error": str(exc)}]}
 
 
 @router.get("/health")
@@ -235,6 +254,11 @@ async def put_teacher_visibility(
     body: TeacherVisibilityBody,
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
+    previous = {
+        item["batch"]
+        for item in await storage.read_teacher_visibility()
+        if item["enabled"]
+    }
     try:
         enabled = await storage.replace_teacher_visibility(body.batches)
     except ValueError as exc:
@@ -243,15 +267,20 @@ async def put_teacher_visibility(
             "code": "invalid_batch",
         }) from exc
     logger.info("Teacher visibility updated by %s: %d batch(es)", principal.label, len(enabled))
-    return {"ok": True, "enabled_batches": enabled, "count": len(enabled)}
+    snapshots = await _publish_public_batches(sorted(previous ^ set(enabled)))
+    return {"ok": True, "enabled_batches": enabled, "count": len(enabled), "public_snapshots": snapshots}
 
 
 @router.put("/timetable/{batch}")
 async def put_timetable(batch: str, payload: dict) -> dict[str, object]:
     _validate_timetable_payload(payload)
-    await storage.write_timetable(batch, payload)
+    result = await storage.write_timetable(batch, payload)
     storage.maybe_git_commit(f"admin: replace timetable for {batch}")
-    return {"ok": True, "batch": batch}
+    return {
+        "ok": True,
+        "batch": batch,
+        "public_snapshot": result.get("public_snapshot"),
+    }
 
 
 @router.put("/current")
@@ -269,7 +298,8 @@ async def put_current(payload: dict) -> dict[str, object]:
             "code": "invalid_semester_label",
         })
     storage.maybe_git_commit(f"admin: update semester label to {payload['label']!r}")
-    return {"ok": True, "label": payload["label"]}
+    snapshots = await _publish_all_public()
+    return {"ok": True, "label": payload["label"], "public_snapshots": snapshots}
 
 
 @router.post("/ingest")
@@ -444,6 +474,7 @@ async def post_upload_apply(
     except ValueError as exc:
         raise HTTPException(status_code=409, detail={"error": str(exc), "code": "review_conflict"}) from exc
     logger.info("Ingest review %s applied by %s", attempt_id, principal.label)
+    result["public_snapshots"] = await _publish_public_batches(result.get("changed_batches") or [])
     return result
 
 
@@ -1259,7 +1290,9 @@ async def publish_library(
         raise HTTPException(status_code=400, detail={
             "error": str(exc), "code": "invalid_library",
         }) from exc
-    return {"ok": True, "item": item}
+    batches = await storage.public_batches_for_library(branch, semester)
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, "item": item, "public_snapshots": snapshots}
 
 
 @router.post("/library/bulk")
@@ -1287,6 +1320,7 @@ async def bulk_library_entries(
 
     completed: list[dict[str, object]] = []
     errors: list[dict[str, object]] = []
+    affected_batches: set[str] = set()
     seen: set[str] = set()
     for entry in body.entries:
         try:
@@ -1294,6 +1328,7 @@ async def bulk_library_entries(
             if key in seen:
                 continue
             seen.add(key)
+            batches = await storage.public_batches_for_library(entry.branch, entry.semester)
             if action == "publish":
                 item = await storage.publish_library_entry(
                     entry.branch,
@@ -1315,6 +1350,7 @@ async def bulk_library_entries(
                 if not deleted:
                     raise storage.DataMissing(f"no curriculum library draft for {key}")
                 completed.append({"key": key})
+            affected_batches.update(batches)
         except (storage.LibraryRevisionConflict, storage.DataMissing, TypeError, ValueError) as exc:
             errors.append({
                 "key": f"{entry.branch}:S{entry.semester}",
@@ -1325,16 +1361,19 @@ async def bulk_library_entries(
         "Bulk Library %s by %s: completed=%d errors=%d",
         action, principal.label, len(completed), len(errors),
     )
+    snapshots = await _publish_public_batches(sorted(affected_batches))
     return {
         "ok": not errors,
         "action": action,
         "completed": completed,
         "errors": errors,
+        "public_snapshots": snapshots,
     }
 
 
 @router.delete("/library/{branch}/{semester}")
 async def remove_library(branch: str, semester: int) -> dict[str, object]:
+    batches = await storage.public_batches_for_library(branch, semester)
     try:
         deleted = await storage.delete_library_entry(branch, semester)
     except ValueError as exc:
@@ -1345,7 +1384,8 @@ async def remove_library(branch: str, semester: int) -> dict[str, object]:
         raise HTTPException(status_code=404, detail={
             "error": "curriculum library entry not found", "code": "library_not_found",
         })
-    return {"ok": True}
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, "public_snapshots": snapshots}
 
 
 @router.post("/contributors")
@@ -2022,7 +2062,9 @@ async def create_subject(
     except Exception:
         # logging happens inside storage; don't block the response
         resolved = 0
-    return {"ok": True, "subject": row, "errors_resolved": resolved}
+    batches = await storage.public_batches_for_subjects([row["code"], *(row.get("aliases") or [])])
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, "subject": row, "errors_resolved": resolved, "public_snapshots": snapshots}
 
 
 @router.patch("/subjects/{code}")
@@ -2058,7 +2100,14 @@ async def patch_subject(
         raise HTTPException(status_code=400, detail={
             "error": str(exc), "code": "invalid_payload",
         }) from exc
-    return {"ok": True, "subject": row}
+    affected_codes = {
+        row["code"],
+        *(existing.get("aliases") or []),
+        *(row.get("aliases") or []),
+    }
+    batches = await storage.public_batches_for_subjects(affected_codes)
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, "subject": row, "public_snapshots": snapshots}
 
 
 @router.delete("/subjects/{code}")
@@ -2067,6 +2116,14 @@ async def delete_subject(
     force: bool = False,
 ) -> dict[str, object]:
     try:
+        normalized_code = storage._normalize_subject_code(code)
+        rows = await storage.list_subjects(q=code, limit=10)
+        existing = next(
+            (row for row in rows if row["code"].upper() == normalized_code),
+            None,
+        )
+        affected_codes = [code, *((existing or {}).get("aliases") or [])]
+        batches = await storage.public_batches_for_subjects(affected_codes)
         ok = await storage.delete_subject(code, force=force)
     except PermissionError as exc:
         error_code = "subject_in_use" if "Curriculum Library" in str(exc) else "seed_protected"
@@ -2082,7 +2139,8 @@ async def delete_subject(
             "error": f"subject {code!r} not found",
             "code": "not_found",
         })
-    return {"ok": True, "code": code}
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, "code": code, "public_snapshots": snapshots}
 
 
 @router.post("/subjects/bulk")
@@ -2091,7 +2149,17 @@ async def bulk_subjects(
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
     summary = await storage.bulk_upsert_subjects(body.items, created_by=principal.label)
-    return {"ok": True, **summary}
+    codes: list[str] = []
+    for item in body.items:
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("code"), str):
+            codes.append(item["code"])
+        if isinstance(item.get("aliases"), list):
+            codes.extend(alias for alias in item["aliases"] if isinstance(alias, str))
+    batches = await storage.public_batches_for_subjects(codes)
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, **summary, "public_snapshots": snapshots}
 
 
 @router.post("/subjects/import")
@@ -2101,7 +2169,9 @@ async def import_subject_mapping(
 ) -> dict[str, object]:
     items = [{"code": code, "name": name} for code, name in body.items.items()]
     summary = await storage.bulk_upsert_subjects(items, created_by=principal.label)
-    return {"ok": True, **summary}
+    batches = await storage.public_batches_for_subjects(list(body.items))
+    snapshots = await _publish_public_batches(batches)
+    return {"ok": True, **summary, "public_snapshots": snapshots}
 
 
 @router.post("/subjects/backfill-timetables")
@@ -2112,4 +2182,5 @@ async def backfill_timetables_against_catalog(
     older data drops redundant subject names. Safe to call any time.
     """
     summary = await storage.normalize_all_timetables()
-    return {"ok": True, **summary}
+    snapshots = await _publish_all_public()
+    return {"ok": True, **summary, "public_snapshots": snapshots}

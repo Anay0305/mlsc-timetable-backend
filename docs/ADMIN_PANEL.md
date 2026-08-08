@@ -1,12 +1,10 @@
 # Admin Panel — Backend Feature Reference
 
-Every endpoint below is mounted under `/admin` and protected by a single
-`Authorization: Bearer <ADMIN_TOKEN>` check (`server.auth.require_admin`,
-constant-time compare via `hmac.compare_digest`). There is no per-user admin
-role yet — anyone with the token is fully privileged.
-
-`ADMIN_TOKEN` comes from the process env. If unset, the dependency raises 503
-`admin_token_unset` for every admin request.
+Every endpoint below is mounted under `/admin` and protected by
+`server.auth.require_admin`. It accepts either the shared
+`Authorization: Bearer <ADMIN_TOKEN>` credential used by CLI/automation or a
+verified Clerk JWT whose email appears in the environment/database admin
+allowlist.
 
 For raw OpenAPI: [openapi.json](openapi.json). For payload shapes shared with
 public endpoints: [API.md](API.md).
@@ -255,3 +253,18 @@ way to admit new ones.
 - **Backups**: turn on `JSON_MIRROR=1` so each write produces a JSON file in
   `DATA_DIR/timetable/`. The frontend's `public/fallback/` snapshot is built
   by copying this directory.
+
+---
+
+## 10. Public snapshot publication
+
+`POST /admin/public-snapshots/rebuild` publishes the current projected public
+read model. Body `{}` rebuilds all batches with one final manifest activation;
+`{"batch":"3C11"}` rebuilds one batch.
+
+Timetable writes and accepted ingestion changes publish affected batches
+automatically. Global projection dependencies—semester metadata, teacher
+visibility, Curriculum Library publication and Subject Catalog changes—rebuild
+all snapshots so cached users receive the same resolved data as dynamic API
+users. Publication failures leave the previous manifest revision active and
+can be retried safely. See [PUBLIC_SNAPSHOTS.md](PUBLIC_SNAPSHOTS.md).

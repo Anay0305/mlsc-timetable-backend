@@ -16,7 +16,7 @@ unchanged.
 | Surface | Header(s) | Notes |
 | --- | --- | --- |
 | Public reads (`/batch`, `/current`, `/timetable/{batch}`, `/contributors`, `/baselines*`) | none | Anonymous. |
-| Per-user (`/me/*`) | `X-User-Id: <opaque-id>` | Opaque client-minted id, 4–64 chars, `[A-Za-z0-9_-]`. Server upserts a `UserDoc` row keyed on this. Missing/invalid → 400. |
+| Per-user (`/me/*`) | Clerk bearer JWT or `X-User-Id: <opaque-id>` | Verified Clerk `sub` wins when configured; the opaque 4–64 character fallback remains for compatibility. Read-only preference/timetable calls do not touch user activity. |
 | Public submit (`POST /change-requests`) | `X-User-Id` recommended | Used for the rate-limit key (falls back to client IP). |
 | Admin (`/admin/*`) | `Authorization: Bearer <ADMIN_TOKEN>` | Single shared token from env. |
 
@@ -124,6 +124,22 @@ Canonical timetable for one batch.
 
 - 404 `batch_not_found` with `detail.batch` echoing the requested code.
 
+Canonical classes also include stable `class_id` and `base_fingerprint`
+fields. They allow a browser to merge private personal operations without a
+second canonical database read.
+
+### `GET /public/v1/manifest.json`
+
+Mutable, short-cached manifest of active immutable canonical projections.
+Each `batches.<code>` entry contains `revision`, SHA-256 `etag`, `path`, and
+`generated_at`; R2 deployments may also include an absolute `url`.
+
+### `GET /public/v1/timetables/{batch}/{revision-hash}.json`
+
+Immutable public timetable projection. Local deployments serve it through
+FastAPI; production clients normally read the same key from a Cloudflare R2
+custom domain. See [PUBLIC_SNAPSHOTS.md](PUBLIC_SNAPSHOTS.md).
+
 ### `GET /contributors`
 Enriched contributor list (avatar fetched live from GitHub, cached 1 h).
 
@@ -220,7 +236,30 @@ Returns `[]` (200) when the asset file is missing or empty.
 
 ---
 
-## Per-user endpoints (`X-User-Id` required)
+## Per-user endpoints (Clerk JWT or `X-User-Id` required)
+
+### `GET /me/preferences/{batch}`
+
+Private V2 operation delta used with the public canonical snapshot:
+
+```json
+{
+  "batch": "3C11",
+  "revision": 4,
+  "operations": {
+    "c_stable_class_id": {
+      "kind": "edit",
+      "target_id": "c_stable_class_id",
+      "entry": { "day": "Monday", "start_time": "09:40" },
+      "base_fingerprint": "sha256..."
+    }
+  }
+}
+```
+
+This endpoint performs one indexed `PersonalCustomizationDoc` lookup. It does
+not read the canonical timetable, update `last_seen_at`, or query legacy
+overrides.
 
 ### `GET /me`
 Upserts `last_seen_at` and returns the public profile.
@@ -234,7 +273,7 @@ Persist user's default batch.
 
 Body: `{ "batch": "1A11" }` → response same as `GET /me`.
 
-### `GET /me/timetable?batch=1A11`
+### `GET /me/timetable?batch=1A11` *(compatibility)*
 Canonical timetable merged with the user's `OverrideDoc`.
 
 ```json
@@ -250,6 +289,8 @@ Canonical timetable merged with the user's `OverrideDoc`.
   `no_batch` otherwise.
 - Merge rules: `delete` removes the slot; `edit` / `elective_pick` replaces it;
   `add` appends a new slot.
+- Retained during migration for older clients; new clients use public
+  canonical data plus `/me/preferences/{batch}`.
 
 ### `GET /me/overrides?batch=1A11`
 Full override map.

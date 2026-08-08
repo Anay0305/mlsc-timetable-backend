@@ -7,11 +7,14 @@ services:
       - .env
     environment:
       PORT: "8000"
+      PUBLIC_SNAPSHOT_DIR: /var/lib/mlsc-public
       # Keep this at one unless the calendar worker is moved to a dedicated
       # process. More workers each start their own polling loop.
       WEB_CONCURRENCY: "1"
     expose:
       - "8000"
+    volumes:
+      - public_snapshots:/var/lib/mlsc-public
     init: true
     restart: unless-stopped
     healthcheck:
@@ -65,3 +68,6 @@ services:
 networks:
   app_network:
     driver: bridge
+
+volumes:
+  public_snapshots:

@@ -239,8 +239,10 @@ async def get_my_timetable(
     batch: Optional[str] = Query(default=None),
     user_id: str = Depends(require_user_id),
 ) -> dict[str, Any]:
-    user = await _touch_user(user_id)
-    code = _normalize_batch(batch) if batch else (user.default_batch or "")
+    # Compatibility endpoint. Reads must not mutate user activity; new clients
+    # use the public canonical snapshot plus /preferences/{batch} below.
+    user = await UserDoc.find_one(UserDoc.user_id == user_id)
+    code = _normalize_batch(batch) if batch else ((user.default_batch if user else None) or "")
     if not code:
         raise HTTPException(
             status_code=400,
@@ -280,6 +282,41 @@ async def get_my_timetable(
     merged["customization_source"] = source
     merged["stale_override_ids"] = stale
     return merged
+
+
+@router.get("/preferences/{batch}")
+async def get_preferences(
+    batch: str,
+    user_id: str = Depends(require_user_id),
+) -> dict[str, Any]:
+    """Return only the private operation delta for one user and batch.
+
+    This is deliberately one indexed lookup and performs no user touch,
+    timetable read, Curriculum projection or legacy-override fallback. Run
+    ``scripts/migrate_personal_overrides_v2.py`` before enabling the split
+    frontend in an environment that still has legacy OverrideDoc rows.
+    """
+    code = _normalize_batch(batch)
+    if not code:
+        raise HTTPException(
+            status_code=400,
+            detail={"error": "invalid batch", "code": "bad_batch"},
+        )
+    personal = await _load_personal_v2(user_id, code)
+    if personal is None:
+        return {
+            "batch": code,
+            "revision": 0,
+            "operations": {},
+        }
+    return {
+        "batch": code,
+        "revision": int(personal.revision or 0),
+        "operations": {
+            key: value.model_dump(mode="json", exclude_none=False)
+            for key, value in (personal.operations or {}).items()
+        },
+    }
 
 
 @router.put("/customizations/{batch}")

@@ -29,6 +29,7 @@ from server.routers import (
     contributors,
     current,
     me,
+    public_data,
     timetable,
 )
 
@@ -148,6 +149,7 @@ def create_app() -> FastAPI:
     app.include_router(batch.router)
     app.include_router(current.router)
     app.include_router(timetable.router)
+    app.include_router(public_data.router)
     app.include_router(me.router)
     app.include_router(baselines.router)
     app.include_router(contributors.router)
@@ -155,6 +157,7 @@ def create_app() -> FastAPI:
     app.include_router(change_requests.router)
     app.include_router(change_requests.admin_router)
     app.include_router(admin.router)
+    app.include_router(public_data.admin_router)
     app.include_router(calendar.router)
     app.include_router(analytics.router)
     app.include_router(analytics.admin_router)

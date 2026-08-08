@@ -15,7 +15,9 @@ COPY assets ./assets
 
 # The reverse proxy is the only public service. Run the API as an
 # unprivileged user and expose it only on the Compose network.
-RUN useradd --create-home --uid 10001 appuser
+RUN useradd --create-home --uid 10001 appuser \
+    && mkdir -p /var/lib/mlsc-public \
+    && chown -R appuser:appuser /var/lib/mlsc-public
 USER appuser
 
 EXPOSE 8000

@@ -78,6 +78,16 @@ class DataMissing(Exception):
     """Raised when expected baseline data (semester label, batch list) is absent."""
 
 
+def _invalidate_schedule_index() -> None:
+    """Drop the cached room/teacher index. Imported late to avoid a cycle."""
+    try:
+        from server import schedule_index
+
+        schedule_index.invalidate()
+    except Exception:  # pragma: no cover - cache invalidation must never fail a write
+        logger.exception("Could not invalidate the room/teacher schedule index")
+
+
 # ── Reads ────────────────────────────────────────────────────────────────
 async def read_batch_list(settings: Settings | None = None) -> list[str]:
     codes = [doc.code async for doc in BatchDoc.find_all(sort=[("code", 1)])]
@@ -418,6 +428,9 @@ async def write_timetable(
     if settings.json_mirror:
         path = settings.data_dir / "timetable" / f"{code}.json"
         _mirror_json(path, _timetable_payload_from_raw(code, semester_label, classes, catalog))
+    # Room/teacher views fold every batch together, so any batch write makes
+    # the whole cross-batch index stale.
+    _invalidate_schedule_index()
     public_snapshot: dict[str, Any] | None = None
     try:
         from server.public_snapshots import publish_batch
@@ -444,6 +457,7 @@ async def delete_timetable(batch: str, settings: Settings | None = None) -> bool
             path.unlink()
         except FileNotFoundError:
             pass
+    _invalidate_schedule_index()
     try:
         from server.public_snapshots import unpublish_batch
 

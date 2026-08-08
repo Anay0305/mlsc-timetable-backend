@@ -55,6 +55,18 @@ class Settings:
     r2_bucket: str | None
     r2_access_key_id: str | None
     r2_secret_access_key: str | None
+    # Room/teacher schedule views. Room numbers are not sensitive, but teacher
+    # codes are gated per batch by ``BatchDoc.teacher_codes_visible``; a public
+    # teacher directory would bypass that control, so it stays admin-only until
+    # explicitly opened.
+    teacher_schedule_access: str  # "admin" | "public"
+    schedule_index_ttl_seconds: float
+    # Improvement (course re-take) planning limits.
+    improvement_max_lecture_clashes: int
+    improvement_max_tutorial_clashes: int
+    improvement_max_practical_clashes: int
+    improvement_pool_first_year_semesters: bool
+    improvement_max_plan_options: int
 
 
 @lru_cache(maxsize=1)
@@ -113,6 +125,15 @@ def get_settings() -> Settings:
     r2_bucket = (os.environ.get("R2_BUCKET") or "").strip() or None
     r2_access_key_id = (os.environ.get("R2_ACCESS_KEY_ID") or "").strip() or None
     r2_secret_access_key = (os.environ.get("R2_SECRET_ACCESS_KEY") or "").strip() or None
+    teacher_schedule_access = (
+        os.environ.get("TEACHER_SCHEDULE_ACCESS") or "admin"
+    ).strip().lower()
+    if teacher_schedule_access not in {"admin", "public"}:
+        teacher_schedule_access = "admin"
+    try:
+        schedule_index_ttl_seconds = float(os.environ.get("SCHEDULE_INDEX_TTL_SECONDS", "300"))
+    except ValueError:
+        schedule_index_ttl_seconds = 300.0
     return Settings(
         data_dir=data_dir,
         cors_origins=cors_origins,
@@ -146,6 +167,15 @@ def get_settings() -> Settings:
         r2_bucket=r2_bucket,
         r2_access_key_id=r2_access_key_id,
         r2_secret_access_key=r2_secret_access_key,
+        teacher_schedule_access=teacher_schedule_access,
+        schedule_index_ttl_seconds=schedule_index_ttl_seconds,
+        improvement_max_lecture_clashes=_non_negative_int("IMPROVEMENT_MAX_LECTURE_CLASHES", 1),
+        improvement_max_tutorial_clashes=_non_negative_int("IMPROVEMENT_MAX_TUTORIAL_CLASHES", 1),
+        improvement_max_practical_clashes=_non_negative_int("IMPROVEMENT_MAX_PRACTICAL_CLASHES", 0),
+        improvement_pool_first_year_semesters=_truthy(
+            os.environ.get("IMPROVEMENT_POOL_FIRST_YEAR_SEMESTERS", "1")
+        ),
+        improvement_max_plan_options=_positive_int("IMPROVEMENT_MAX_PLAN_OPTIONS", 20),
     )
 
 

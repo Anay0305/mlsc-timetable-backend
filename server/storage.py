@@ -3520,11 +3520,28 @@ def _normalize_subject_code(code: str) -> str:
 
 
 def _camel_subject_name(value: str) -> str:
-    acronyms = {"AI", "API", "CPU", "GPU", "IoT", "ML", "NLP", "UCS", "UI", "URL", "XML"}
+    # Anything not listed here is title-cased, which turns an initialism into a
+    # word: "MEMS" became "Mems" on a real admin add. Engineering course titles
+    # are dense with these, so the list covers the families the schemes use
+    # rather than only the software ones it started with.
+    acronyms = {
+        "AI", "API", "CPU", "GPU", "IoT", "ML", "NLP", "UCS", "UI", "URL", "XML",
+        "UX", "OS", "HTTP", "TCP", "IP", "DBMS", "RDBMS", "ERP", "CRM", "SQL",
+        "VLSI", "MEMS", "CAD", "CAM", "CNC", "PLC", "SCADA", "HVAC", "IC", "RF",
+        "EMI", "EMC", "GIS", "GPS", "DNA", "RNA", "PCR", "HPLC", "NMR", "MRI",
+        "CT", "LED", "LASER", "CFD", "FEM", "IoE", "AR", "VR", "3D", "2D",
+    }
+    canonical = {item.upper(): item for item in acronyms}
     result = []
     for word in " ".join(str(value or "").split()).split(" "):
         bare = word.strip("()[],.:;/-")
-        result.append(word if bare.upper() in {item.upper() for item in acronyms} else word[:1].upper() + word[1:].lower())
+        fixed = canonical.get(bare.upper())
+        if fixed:
+            # Restore the canonical casing so a typed "plc" still reads "PLC",
+            # keeping any surrounding punctuation the word arrived with.
+            result.append(word.replace(bare, fixed) if bare else word)
+        else:
+            result.append(word[:1].upper() + word[1:].lower())
     return " ".join(result)
 
 

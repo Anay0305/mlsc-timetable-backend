@@ -180,6 +180,9 @@ class DesiredEvent:
     end_time: str | None
     recurrence: tuple[str, ...] = ()
     color_id: str | None = None
+    # Identity the previous implementation stamped on Google events, kept so the
+    # first sync adopts what is already there instead of rebuilding it.
+    legacy_slot_id: str | None = None
     source: Mapping[str, Any] = field(default_factory=dict, compare=False)
 
     @property
@@ -199,6 +202,19 @@ class DesiredEvent:
 
 def _slot_id(*parts: Any) -> str:
     return "s_" + hashlib.sha256("|".join(str(p) for p in parts).encode()).hexdigest()[:24]
+
+
+def legacy_slot_id(batch: str, day: str, start_time: str, code: Any, room: Any) -> str:
+    """The identity the previous implementation stamped on Google events.
+
+    Reproduced exactly so events already in a user's calendar can be adopted
+    instead of deleted and recreated. Its shape is why it is being replaced:
+    ``room`` is part of the identity, so moving a class to another room reads
+    as a different class, and ``type`` is absent, so a lecture and a practical
+    of the same course in the same slot collide.
+    """
+    raw = f"{batch}|{day.lower()}|{start_time}|{_clean(code).upper()}|{_clean(room).upper()}"
+    return hashlib.sha1(raw.encode()).hexdigest()
 
 
 def course_title(entry: Mapping[str, Any], catalog: Any = None) -> str:
@@ -337,6 +353,9 @@ def project(
                         _clean(entry.get("code")).upper(), _clean(entry.get("type")).lower())
         events.append(DesiredEvent(
             slot_id=slot,
+            legacy_slot_id=legacy_slot_id(
+                code, _clean(entry.get("day")), _clean(entry.get("start_time")),
+                entry.get("code"), entry.get("room")),
             kind="class",
             summary=_summary(entry, catalog),
             description=_describe(entry, code, catalog),
@@ -373,6 +392,9 @@ def project(
                             _clean(entry.get("code")).upper(), _clean(entry.get("type")).lower())
             events.append(DesiredEvent(
                 slot_id=slot,
+                legacy_slot_id=legacy_slot_id(
+                    code, f"shift:{on}", _clean(entry.get("start_time")),
+                    entry.get("code"), entry.get("room")),
                 kind="follow_day",
                 summary=_summary(entry, catalog),
                 description=_describe(entry, code, catalog)
@@ -394,6 +416,9 @@ def project(
         reason = _clean(override.get("reason"))
         events.append(DesiredEvent(
             slot_id=_slot_id(code, "allday", on, kind),
+            legacy_slot_id=legacy_slot_id(
+                code, f"{_clean(override.get('kind')).lower()}:{on}", "",
+                str(override.get("id", "")), ""),
             kind="all_day",
             summary=reason or kind,
             description=f"{kind} period.\nNo regular classes.\nSynced from MLSC Timetable.",

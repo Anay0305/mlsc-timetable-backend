@@ -32,6 +32,15 @@ class InvalidGrantError(Exception):
     """Refresh token has been revoked or has expired."""
 
 
+class InsufficientScopeError(Exception):
+    """The user withheld the Calendar permission on Google's consent screen.
+
+    Distinct from InvalidGrantError: the tokens are valid, they just do not
+    authorise calendar access. Retrying can never fix it — the user has to
+    re-consent — so this must stop the job rather than burn five attempts.
+    """
+
+
 class CalendarNotConfiguredError(Exception):
     """Google OAuth credentials are not set in the environment."""
 
@@ -82,6 +91,14 @@ async def _refresh_access_token(refresh_token_plain: str) -> tuple[str, datetime
         raise InvalidGrantError(f"{error}: {description}")
     resp.raise_for_status()
     data = resp.json()
+    from server.gcal import oauth as gcal_oauth
+
+    granted = gcal_oauth.granted_scopes(data)
+    # A refresh response omits `scope` when nothing changed, so only complain
+    # when Google actively tells us the calendar scope is absent.
+    if granted and not gcal_oauth.has_calendar_access(granted):
+        raise InsufficientScopeError(gcal_oauth.consent_error_message(
+            gcal_oauth.missing_scopes(granted)))
     expires_in = int(data.get("expires_in", 3600))
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
     return data["access_token"], expires_at
@@ -102,6 +119,10 @@ async def get_valid_access_token(conn: CalendarConnectionDoc) -> str:
         new_access, new_expires = await _refresh_access_token(refresh_token)
     except InvalidGrantError:
         await calendar_storage.mark_invalid_grant(conn.user_id)
+        raise
+    except InsufficientScopeError as exc:
+        await calendar_storage.mark_needs_reconnect(
+            conn.user_id, code="insufficient_scope", message=str(exc))
         raise
 
     await calendar_storage.update_token_cache(conn.user_id, new_access, new_expires)
@@ -843,9 +864,28 @@ async def full_sync_user(user_id: str, *, force: bool = False) -> None:
         term_end = settings.calendar_term_end_date or f"{date.today().year}-12-31"
         term_start = None
 
+    from server.gcal import oauth as gcal_oauth
+
+    stored_scopes = list(getattr(conn, "scopes", None) or [])
+    if stored_scopes and not gcal_oauth.has_calendar_access(stored_scopes):
+        await calendar_storage.mark_needs_reconnect(
+            user_id,
+            code="insufficient_scope",
+            message=gcal_oauth.consent_error_message(gcal_oauth.missing_scopes(stored_scopes)),
+        )
+        logger.warning("calendar_sync: user %s has no calendar scope; needs reconnect", user_id)
+        return
+
     try:
         access_token = await get_valid_access_token(conn)
     except InvalidGrantError:
+        # Previously a bare return, so the job was marked done and the user was
+        # never told their connection had stopped working.
+        await calendar_storage.mark_needs_reconnect(
+            user_id, code="invalid_grant",
+            message="Google access was revoked. Please connect your calendar again.")
+        return
+    except InsufficientScopeError:
         return
 
     calendar_id = await _ensure_calendar(conn, access_token)

@@ -34,7 +34,9 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/calendar", tags=["calendar"])
 
 _GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
-_SCOPES = "https://www.googleapis.com/auth/calendar email openid"
+from server.gcal import oauth as gcal_oauth
+
+_SCOPES = gcal_oauth.SCOPE_PARAM
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -162,6 +164,18 @@ async def oauth_callback(
             message="No refresh token returned — please revoke app access in Google and try again",
         )
 
+    # Google's consent screen has a tick box per permission. If Calendar was
+    # left unticked the tokens are valid but useless, and every sync would 403.
+    # Refuse the connection here rather than storing one that cannot work.
+    granted = gcal_oauth.granted_scopes(token_data)
+    missing = gcal_oauth.missing_scopes(granted)
+    if missing:
+        logger.warning(
+            "calendar oauth_callback: user %s granted %s, missing %s",
+            user_id, sorted(granted), sorted(missing),
+        )
+        return _popup_html(success=False, message=gcal_oauth.consent_error_message(missing))
+
     access_token = token_data["access_token"]
     expires_in = int(token_data.get("expires_in", 3600))
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
@@ -201,6 +215,7 @@ async def oauth_callback(
         access_token_plain=access_token,
         access_expires_at=expires_at,
         google_email=google_email,
+        scopes=sorted(granted),
     )
 
     return _popup_html(success=True)

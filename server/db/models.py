@@ -568,6 +568,14 @@ class CalendarConnectionDoc(Document):
     calendar_id: Optional[str] = None
     batch_code: Optional[str] = None
     enabled: bool = False
+    # Scopes Google actually granted. A user can untick Calendar on the consent
+    # screen, which used to leave the connection looking healthy while every
+    # API call returned 403; recording the grant lets us say so instead.
+    scopes: list[str] = Field(default_factory=list)
+    # "ok" | "needs_reconnect" — grant/token health, distinct from the
+    # transient "syncing"/"idle" the status endpoint computes per request.
+    connection_state: str = "ok"
+    last_error_code: Optional[str] = None
     created_at: datetime = Field(default_factory=_utcnow)
     last_synced_at: Optional[datetime] = None
     last_error: Optional[str] = None

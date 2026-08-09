@@ -78,6 +78,9 @@ async def get_status(user_id: str) -> dict[str, Any]:
         sort=[("created_at", -1)],
     )
     payload["sync_state"] = "syncing" if job is not None else "idle"
+    payload["connection_state"] = getattr(conn, "connection_state", "ok") or "ok"
+    payload["last_error_code"] = getattr(conn, "last_error_code", None)
+    payload["needs_reconnect"] = payload["connection_state"] == "needs_reconnect"
     payload["sync_job_id"] = str(job.id) if job is not None and job.id else None
     return payload
 
@@ -89,6 +92,7 @@ async def create_or_replace_connection(
     access_token_plain: str,
     access_expires_at: datetime,
     google_email: str,
+    scopes: list[str] | None = None,
 ) -> CalendarConnectionDoc:
     """Upsert connection.
 
@@ -104,6 +108,9 @@ async def create_or_replace_connection(
             "access_token": encrypt_token(access_token_plain),
             "access_expires_at": access_expires_at,
             "google_email": google_email,
+            "scopes": list(scopes or []),
+            "connection_state": "ok",
+            "last_error_code": None,
             "last_error": None,
         })
         return existing
@@ -114,9 +121,27 @@ async def create_or_replace_connection(
         access_token=encrypt_token(access_token_plain),
         access_expires_at=access_expires_at,
         google_email=google_email,
+        scopes=list(scopes or []),
     )
     await doc.insert()
     return doc
+
+
+async def mark_needs_reconnect(user_id: str, *, code: str, message: str) -> None:
+    """Flag a connection the user must re-authorise, and stop auto-sync.
+
+    Left enabled, a connection with a withheld scope retries five times and
+    fails silently; the user sees a working toggle and an empty calendar.
+    """
+    conn = await get_connection(user_id)
+    if conn is None:
+        return
+    await conn.set({
+        "connection_state": "needs_reconnect",
+        "last_error_code": code,
+        "last_error": message[:200],
+        "enabled": False,
+    })
 
 
 async def set_enabled(user_id: str, *, enabled: bool, batch_code: str | None = None) -> bool:

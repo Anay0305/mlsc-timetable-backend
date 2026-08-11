@@ -219,11 +219,15 @@ async def write_batch_list(
     settings: Settings | None = None,
     *,
     sheet_by_code: dict[str, str] | None = None,
+    scope_years: set[int] | None = None,
 ) -> None:
     """Replace the batch directory.
 
     Adds new codes, updates `source_sheet` on existing ones, and removes codes
     no longer present in `batches`.
+
+    ``scope_years`` limits the removal to those year groups, so an upload
+    covering only one year leaves the other years' directory entries in place.
     """
     settings = settings or get_settings()
     codes = sorted({str(b) for b in batches})
@@ -251,10 +255,17 @@ async def write_batch_list(
                 updates["section"] = meta["section"]
             await doc.set(updates)
     for stale in existing.values():
+        if scope_years is not None:
+            year = stale.year if stale.year is not None else _derive_batch_meta(stale.code).get("year")
+            if year is None or year not in scope_years:
+                continue
         await stale.delete()
 
     if settings.json_mirror:
-        _mirror_json(settings.data_dir / "batch.json", codes)
+        # The mirror is a full directory listing, so write every surviving
+        # code rather than only the ones this run touched.
+        surviving = sorted({doc.code async for doc in BatchDoc.find_all()})
+        _mirror_json(settings.data_dir / "batch.json", surviving)
 
 
 async def write_current(payload: dict[str, Any], settings: Settings | None = None) -> None:
@@ -2963,21 +2974,35 @@ async def restore_ingest_snapshot() -> dict[str, Any]:
     }
 
 
-async def replace_timetables(codes_to_keep: list[str]) -> int:
+async def replace_timetables(
+    codes_to_keep: list[str],
+    *,
+    scope_years: set[int] | None = None,
+) -> int:
     """Delete TimetableDoc rows whose ``code`` is not in ``codes_to_keep``.
 
-    Mirrors the prune behaviour of ``replace_batch_directory``. Returns the
-    number of stale rows removed.
+    ``scope_years`` confines the prune to those year groups. Without it a
+    workbook covering only the incoming first year would delete every other
+    year, because anything absent from the upload counts as stale. With it,
+    a first-year ingest can only ever remove first-year rows.
+
+    Batches whose year cannot be derived are never pruned while a scope is in
+    force — an unrecognised code is not evidence that the batch is gone.
     """
     keep = {str(c).upper() for c in codes_to_keep}
     stale_count = 0
     async for doc in TimetableDoc.find_all():
-        if doc.code.upper() not in keep:
-            try:
-                await doc.delete()
-                stale_count += 1
-            except Exception:
-                logger.exception("replace_timetables: failed to delete %s", doc.code)
+        if doc.code.upper() in keep:
+            continue
+        if scope_years is not None:
+            year = _derive_batch_meta(doc.code).get("year")
+            if year is None or year not in scope_years:
+                continue
+        try:
+            await doc.delete()
+            stale_count += 1
+        except Exception:
+            logger.exception("replace_timetables: failed to delete %s", doc.code)
     return stale_count
 
 

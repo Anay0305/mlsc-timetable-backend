@@ -399,6 +399,9 @@ class UploadAttemptDoc(Document):
     filename: Optional[str] = None
     sheet_selector: Optional[str] = None
     semester_label: Optional[str] = None
+    # Year groups this upload was allowed to touch. Empty means the whole
+    # institute, which is what every run before year scoping existed did.
+    years: list[int] = Field(default_factory=list)
     status: Literal["ok", "partial", "failed"] = "ok"
     batches_written: int = 0
     classes_written: int = 0

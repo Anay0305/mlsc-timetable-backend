@@ -74,6 +74,7 @@ async def parse_workbook(
     actor_email: str | None = None,
     record_attempt: bool = True,
     stage_only: bool = False,
+    years: Any = None,
     source_filename: str | None = None,
 ) -> dict[str, object]:
     """Parse a workbook and either stage a review or apply it directly.
@@ -97,6 +98,7 @@ async def parse_workbook(
                 "filename": filename,
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
+                "years": sorted(year_scope) if year_scope else [],
                 "status": "failed",
                 "ingest_state": "failed",
                 "failure_message": f"Spreadsheet not found: {xlsx_path}",
@@ -158,6 +160,20 @@ async def parse_workbook(
             {"batch": code, "sheets": ss} for code, ss in sorted(multi_sheet.items())
         ]
 
+        year_scope = parse_year_selector(years)
+        if year_scope is not None:
+            merged, skipped_codes = filter_blocks_by_year(merged, year_scope)
+            sheet_by_code = {c: t for c, t in sheet_by_code.items() if c in merged}
+            if skipped_codes:
+                logger.info(
+                    "Year scope %s: keeping %d batch(es), ignoring %d outside scope",
+                    sorted(year_scope), len(merged), len(skipped_codes),
+                )
+            if not merged:
+                raise ValueError(
+                    f"No batches for year(s) {sorted(year_scope)} were found in this workbook"
+                )
+
         confidence_summary, error_rows = _summarize_blocks(merged, sheet_by_code)
 
         payloads = class_blocks_to_api(merged, semester_label)
@@ -214,6 +230,7 @@ async def parse_workbook(
                 "filename": filename,
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
+                "years": sorted(year_scope) if year_scope else [],
                 "status": attempt_status,
                 "ingest_state": "pending_review" if batches else "failed",
                 "batches_written": len(batches),
@@ -270,7 +287,10 @@ async def parse_workbook(
                 logger.exception("Pre-ingest snapshot failed — continuing without rollback")
 
         await storage.write_current({"label": semester_label}, settings=settings)
-        await storage.write_batch_list(batches, settings=settings, sheet_by_code=sheet_by_code)
+        await storage.write_batch_list(
+            batches, settings=settings, sheet_by_code=sheet_by_code,
+            scope_years=set(year_scope) if year_scope else None,
+        )
         for code, payload in payloads.items():
             await storage.write_timetable(
                 code,
@@ -282,7 +302,10 @@ async def parse_workbook(
         # Prune ghost timetables (codes that survived from a previous ingest
         # but aren't in the new spreadsheet).
         try:
-            pruned = await storage.replace_timetables(list(payloads.keys()))
+            pruned = await storage.replace_timetables(
+                list(payloads.keys()),
+                scope_years=set(year_scope) if year_scope else None,
+            )
             if pruned:
                 logger.info("Pruned %d stale timetable(s) not in current ingest", pruned)
         except Exception:
@@ -308,6 +331,7 @@ async def parse_workbook(
                 "filename": filename,
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
+                "years": sorted(year_scope) if year_scope else [],
                 "status": attempt_status,
                 "batches_written": len(batches),
                 "classes_written": total_classes,
@@ -349,11 +373,78 @@ async def parse_workbook(
                 "filename": filename,
                 "sheet_selector": sheet,
                 "semester_label": semester_label,
+                "years": sorted(year_scope) if year_scope else [],
                 "status": "failed",
                 "ingest_state": "failed",
                 "failure_message": failure_message,
             })
         raise
+
+
+# ── Year scoping ─────────────────────────────────────────────────────────
+# A workbook usually carries the whole institute, but a new intake arrives on
+# its own: the first-year sheets are republished while years 2-4 are unchanged.
+# Ingesting that file wholesale would prune every batch it does not mention,
+# so an upload can name the years it is allowed to touch.
+
+def parse_year_selector(value: Any) -> frozenset[int] | None:
+    """``"1"`` / ``"1,2"`` / ``[1, 2]`` -> a year set. Empty or "all" -> None.
+
+    ``None`` means "the whole institute", which keeps the previous behaviour
+    for uploads that really do replace everything.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        parts = [str(item) for item in value]
+    else:
+        text = str(value).strip()
+        if not text or text.lower() == "all":
+            return None
+        parts = text.replace(" ", "").split(",")
+    years: set[int] = set()
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            year = int(part)
+        except ValueError as exc:
+            raise ValueError(f"invalid year {part!r}; expected a number 1-5") from exc
+        if not 1 <= year <= 5:
+            raise ValueError(f"year {year} out of range; expected 1-5")
+        years.add(year)
+    return frozenset(years) or None
+
+
+def batch_year(code: str) -> int | None:
+    """Year a batch code belongs to, or None when it cannot be derived."""
+    from server.storage import _derive_batch_meta
+
+    return _derive_batch_meta(str(code or "")).get("year")
+
+
+def filter_blocks_by_year(
+    merged: dict[str, Any],
+    years: frozenset[int] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Keep only batches in ``years``. Returns (kept, skipped_codes).
+
+    Filtering here rather than at the sheet level means the scope holds even
+    when a sheet mixes years or is named unhelpfully, and everything computed
+    downstream — confidence, doctor, errors — describes only what gets written.
+    """
+    if years is None:
+        return merged, []
+    kept: dict[str, Any] = {}
+    skipped: list[str] = []
+    for code, blocks in merged.items():
+        year = batch_year(code)
+        if year is not None and year in years:
+            kept[code] = blocks
+        else:
+            skipped.append(code)
+    return kept, sorted(skipped)
 
 
 def _summarize_blocks(

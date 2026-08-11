@@ -17,7 +17,7 @@ from pydantic import BaseModel
 
 from server import storage
 from server.auth import AdminPrincipal, require_admin
-from server.ingest import parse_workbook
+from server.ingest import parse_workbook, parse_year_selector
 from server.scheme_parser import baseline_key_for, parse_scheme_pdf
 from server.calendar_parser import parse_calendar_pdf
 
@@ -278,6 +278,7 @@ async def post_ingest(
     sheet: str = Form("all"),
     file: UploadFile = File(...),
     force: bool = Form(False),
+    years: str = Form(""),
     principal: AdminPrincipal = Depends(require_admin),
 ) -> dict[str, object]:
     if not file.filename or not file.filename.lower().endswith((".xlsx", ".xlsm")):
@@ -311,7 +312,13 @@ async def post_ingest(
             actor_email=principal.email,
             stage_only=True,
             source_filename=file.filename,
+            years=years,
         )
+    except ValueError as exc:
+        # Bad year selector, or a workbook with nothing in the chosen years.
+        raise HTTPException(status_code=400, detail={
+            "error": str(exc), "code": "invalid_year_scope",
+        }) from exc
     finally:
         tmp_path.unlink(missing_ok=True)
 
@@ -319,6 +326,7 @@ async def post_ingest(
         "ok": True,
         "semester": semester,
         "sheet": sheet,
+        "years": sorted(parse_year_selector(years) or []),
         "filename": file.filename,
         "forced": bool(force),
         **summary,

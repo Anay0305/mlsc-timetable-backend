@@ -17,7 +17,7 @@ class twenty times.
 
 `server/schedule_index.py` folds duplicates into one `Occupancy` carrying the
 attending batches. On current data that turns 31,854 stored class rows into
-7,519 real occupancies across 300 rooms and 629 teachers, built in ~400 ms.
+7,562 real occupancies across 300 rooms and 629 teachers, built in ~400 ms.
 
 Two normalizations happen during the build.
 
@@ -41,6 +41,13 @@ spells one room several ways:
 Without this, `AI(L307)` and `L307` index separately and availability reports
 one free while the other is occupied — exactly the question the view exists to
 answer. Normalization merges 139 duplicate spellings.
+
+**A class needs only one thing to identify it.** 95 rows across 45 batches carry
+a course code but neither a room nor a teacher. They cannot appear in a room or
+teacher view, and those buckets skip them, but they are real commitments — so
+they are still indexed by course and batch. Dropping them hid both the course
+from improvement planning and the clash it causes. Only a row with no room, no
+teacher *and* no code is discarded.
 
 **Term labels come from the current semester, not the document.** A batch
 missed by the latest ingest keeps its old label; 21 batches currently still say
@@ -107,9 +114,26 @@ lecture, that is a *practical* clash — the lab cannot be skipped, so the lectu
 would be lost every week. Practicals default to zero tolerance; lectures and
 tutorials default to one each. All three are configurable.
 
-An unresolved elective in the student's own timetable blocks its slot at the
+An **unresolved** elective in the student's own timetable blocks its slot at the
 worst severity among its options and is flagged `uncertain`, so the UI can say
 "this depends on which elective you pick" instead of silently rejecting.
+
+Once the choice is made the slot stops being uncertain. The entry keeps its
+`options` list after the pick, so the elective state has to be read from
+`electiveChoice`, not from the presence of options — otherwise a student who
+picked the lecture is still charged for the practical they are not attending,
+and the picks are merged in precisely to stop that. A slot marked
+`electiveDismissed` (the group was resolved in a different period) is free and
+blocks nothing.
+
+**A clash is counted per class, not per period.** Timetables are stored one
+period per row, so a two-hour lab is two rows; 99% of practicals and 407
+lectures in the current data run for more than one period. Pairing rows would
+make a single overlapping lab score two clashes — four against another
+two-period lab — which silently breaks a limit that was written to allow one.
+Consecutive rows of the same course, type, room and teacher are folded into the
+one session the student attends before anything is counted or displayed. This
+is also what makes `IMPROVEMENT_MAX_PRACTICAL_CLASHES=1` do what it says.
 
 ## Output shaping
 
@@ -117,6 +141,12 @@ A course is offered by many parallel batches that sit in the same lecture.
 Those are interchangeable, so options are grouped by what the student would
 actually attend: `UTA016`'s 156 candidate batches collapse to 40 distinct
 schedules, each listing its interchangeable `batches`.
+
+The grouping key includes **room and teacher**. Batches genuinely sharing one
+lecture fold into a single occupancy upstream and still group together, but two
+batches taught the same course at the same hour in different rooms are parallel
+sections, not one class — collapsing them would print one section's room beside
+the other section's batch code and send the student to the wrong place.
 
 Course codes normalize to their base form, so one course covers its L/T/P
 components — repeating `UCS301` means attending its lecture, tutorial and
@@ -128,3 +158,11 @@ When several courses are requested, `plans` proposes combined timetables: each
 course is checked against the student's timetable *plus* the offerings already
 chosen, so two improvement courses can never be scheduled on top of each other.
 The clash budget applies per course.
+
+The search is exponential in the number of courses, so it is bounded by the
+combinations it examines (20,000) rather than by the plans it keeps. Everything
+it reaches is ranked before `IMPROVEMENT_MAX_PLAN_OPTIONS` are returned, so the
+plans are the best found rather than the first found — stopping at the first N
+complete plans would return N variations on one course's first option and
+present that as a ranking. `plans_truncated` says whether anything was left
+unranked, so the UI can admit a better combination may exist.

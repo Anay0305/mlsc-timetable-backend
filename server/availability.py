@@ -40,7 +40,7 @@ def normalize_day(value: Any) -> str | None:
     if not text:
         return None
     for day in DAY_ORDER:
-        if day.lower() == text or day.lower().startswith(text) and len(text) >= 3:
+        if day.lower() == text or (day.lower().startswith(text) and len(text) >= 3):
             return day
     return None
 
@@ -91,7 +91,7 @@ def weekly_schedule(
     }
 
 
-def _window(day: str, at: str | None, start: str | None, end: str | None) -> tuple[int, int]:
+def _window(at: str | None, start: str | None, end: str | None) -> tuple[int, int]:
     """Resolve the query window, defaulting to a single instant."""
     if start is not None or end is not None:
         start_minute = parse_minute(start) if start else None
@@ -124,7 +124,7 @@ def availability(
     canonical_day = normalize_day(day)
     if canonical_day is None:
         raise ValueError(f"unknown day: {day!r}")
-    start_minute, end_minute = _window(canonical_day, at, start, end)
+    start_minute, end_minute = _window(at, start, end)
 
     bucket = _bucket(index, kind)
     wanted = {str(value).strip() for value in only or [] if str(value).strip()}

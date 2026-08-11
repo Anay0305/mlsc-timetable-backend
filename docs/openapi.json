@@ -1295,7 +1295,7 @@
     "/calendar-overrides": {
       "get": {
         "summary": "Get Calendar Overrides",
-        "description": "Calendar overrides (holidays + follow-day rules) for the mini-calendar.\n\nWhen ``batch`` is supplied, only overrides whose scope applies to the\nbatch's year (e.g. \"2\") or branch (e.g. \"2A\"), plus all global-scope\noverrides, are returned. Without ``batch`` the endpoint returns every\noverride — useful for admin/list contexts.",
+        "description": "Calendar overrides (holidays + follow-day rules) for the mini-calendar.\n\nWhen ``batch`` is supplied, only overrides whose scope applies to the\nbatch's year (e.g. \"2\") or branch (e.g. \"2A\"), plus all global-scope\noverrides, are returned. Without ``batch`` the endpoint returns every\noverride \u2014 useful for admin/list contexts.",
         "operationId": "get_calendar_overrides_calendar_overrides_get",
         "parameters": [
           {
@@ -3176,7 +3176,7 @@
     "/admin/baselines/sync-counts": {
       "post": {
         "summary": "Sync Baseline Counts",
-        "description": "Derive and back-fill ``counts`` for every baseline whose counts field\nis empty, using the stored course L / T / P columns.\n\nSafe to call repeatedly — baselines that already have explicit counts\nare not touched. Use this after a scheme-PDF upload on an older install\nwhere counts were seeded as ``{}`` before this endpoint existed.",
+        "description": "Derive and back-fill ``counts`` for every baseline whose counts field\nis empty, using the stored course L / T / P columns.\n\nSafe to call repeatedly \u2014 baselines that already have explicit counts\nare not touched. Use this after a scheme-PDF upload on an older install\nwhere counts were seeded as ``{}`` before this endpoint existed.",
         "operationId": "sync_baseline_counts_admin_baselines_sync_counts_post",
         "parameters": [
           {
@@ -3467,7 +3467,7 @@
     "/admin/scheme/apply": {
       "post": {
         "summary": "Post Scheme Apply",
-        "description": "Apply the parsed scheme to the baseline collection.\n\nFor each detected semester (filtered by cohort — see ``_build_scheme_plan``)\nupserts a baseline keyed ``<E|O><year><branch>`` and writes its\n``courses`` roster. Existing per-type ``counts`` on those baselines\nare preserved.\n\n``merge=false`` (default) fully replaces the courses list per baseline;\n``merge=true`` unions by course code with what's already stored (useful\nwhen a scheme is split across multiple PDFs).",
+        "description": "Apply the parsed scheme to the baseline collection.\n\nFor each detected semester (filtered by cohort \u2014 see ``_build_scheme_plan``)\nupserts a baseline keyed ``<E|O><year><branch>`` and writes its\n``courses`` roster. Existing per-type ``counts`` on those baselines\nare preserved.\n\n``merge=false`` (default) fully replaces the courses list per baseline;\n``merge=true`` unions by course code with what's already stored (useful\nwhen a scheme is split across multiple PDFs).",
         "operationId": "post_scheme_apply_admin_scheme_apply_post",
         "parameters": [
           {
@@ -4167,7 +4167,7 @@
     "/admin/contributors": {
       "post": {
         "summary": "Post Contributor",
-        "description": "Add (or upsert) a contributor by GitHub username.\n\nBody: ``{\"username\": \"octocat\", \"display_name\": \"The Octocat\"}`` —\n``display_name`` is optional. The avatar is always fetched live from the\nGitHub REST API by the public ``GET /contributors`` endpoint.",
+        "description": "Add (or upsert) a contributor by GitHub username.\n\nBody: ``{\"username\": \"octocat\", \"display_name\": \"The Octocat\"}`` \u2014\n``display_name`` is optional. The avatar is always fetched live from the\nGitHub REST API by the public ``GET /contributors`` endpoint.",
         "operationId": "post_contributor_admin_contributors_post",
         "parameters": [
           {
@@ -4680,7 +4680,7 @@
     "/admin/calendar-overrides/{override_id}": {
       "put": {
         "summary": "Put Calendar Override",
-        "description": "Replace an existing calendar override.\n\nAll fields are re-validated as if the row were being created fresh —\nthis keeps the update path simple and consistent with the create path.",
+        "description": "Replace an existing calendar override.\n\nAll fields are re-validated as if the row were being created fresh \u2014\nthis keeps the update path simple and consistent with the create path.",
         "operationId": "put_calendar_override_admin_calendar_overrides__override_id__put",
         "parameters": [
           {
@@ -4913,7 +4913,7 @@
     "/admin/calendar/apply-plan": {
       "post": {
         "summary": "Post Calendar Apply Plan",
-        "description": "Apply a hand-edited calendar plan (JSON, no PDF re-parse).\n\nBody:\n  { plan: [{date, kind, reason?, follows_day?}, ...],\n    scope: \"global\" | \"year\" | \"branch\",\n    scope_values: [str, ...],   # required when scope != \"global\"\n    replace_range?: {start: \"YYYY-MM-DD\", end: \"YYYY-MM-DD\"},\n    source?: str }\n\nWhen ``replace_range`` is present, every existing override whose date\nfalls in that inclusive range AND matches the same scope+scope_values\nis deleted before the plan is applied — this keeps re-uploads\nidempotent (upload same calendar twice = same result, not doubled).",
+        "description": "Apply a hand-edited calendar plan (JSON, no PDF re-parse).\n\nBody:\n  { plan: [{date, kind, reason?, follows_day?}, ...],\n    scope: \"global\" | \"year\" | \"branch\",\n    scope_values: [str, ...],   # required when scope != \"global\"\n    replace_range?: {start: \"YYYY-MM-DD\", end: \"YYYY-MM-DD\"},\n    source?: str }\n\nWhen ``replace_range`` is present, every existing override whose date\nfalls in that inclusive range AND matches the same scope+scope_values\nis deleted before the plan is applied \u2014 this keeps re-uploads\nidempotent (upload same calendar twice = same result, not doubled).",
         "operationId": "post_calendar_apply_plan_admin_calendar_apply_plan_post",
         "parameters": [
           {
@@ -5485,7 +5485,7 @@
     "/admin/timetables/{batch}": {
       "get": {
         "summary": "Get Timetable For Admin",
-        "description": "Read a batch's timetable in raw form — used by the Fix grid editor.",
+        "description": "Read a batch's timetable in raw form \u2014 used by the Fix grid editor.",
         "operationId": "get_timetable_for_admin_admin_timetables__batch__get",
         "parameters": [
           {
@@ -6131,7 +6131,7 @@
           "calendar"
         ],
         "summary": "Get Configured",
-        "description": "Public endpoint — returns whether Google Calendar integration is configured.\nNo auth required so the frontend can decide whether to show the button\nbefore the user is signed in.",
+        "description": "Public endpoint \u2014 returns whether Google Calendar integration is configured.\nNo auth required so the frontend can decide whether to show the button\nbefore the user is signed in.",
         "operationId": "get_configured_api_calendar_configured_get",
         "responses": {
           "200": {
@@ -6585,7 +6585,7 @@
           "calendar"
         ],
         "summary": "Clear Events",
-        "description": "Delete all events we created in the user's MLSC calendar and reset sync state.\n\nThe Google connection is kept — calling enable/resync will recreate\na fresh calendar and repopulate it from the current timetable.",
+        "description": "Delete all events we created in the user's MLSC calendar and reset sync state.\n\nThe Google connection is kept \u2014 calling enable/resync will recreate\na fresh calendar and repopulate it from the current timetable.",
         "operationId": "clear_events_api_calendar_clear_delete",
         "parameters": [
           {
@@ -6704,6 +6704,518 @@
                   "type": "object",
                   "additionalProperties": true,
                   "title": "Response Get Analytics Admin Analytics Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/schedule/meta": {
+      "get": {
+        "tags": [
+          "schedule"
+        ],
+        "summary": "Schedule Meta",
+        "description": "Slot grid, teaching days and directory sizes for building the UI.",
+        "operationId": "schedule_meta_schedule_meta_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Schedule Meta Schedule Meta Get"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/schedule/{kind}s": {
+      "get": {
+        "tags": [
+          "schedule"
+        ],
+        "summary": "List Resources",
+        "description": "Directory of every known room or teacher.",
+        "operationId": "list_resources_schedule__kind_s_get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "room",
+                "teacher"
+              ],
+              "type": "string",
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "q",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "maxLength": 64
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Q"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Resources Schedule  Kind S Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/schedule/{kind}s/{name}": {
+      "get": {
+        "tags": [
+          "schedule"
+        ],
+        "summary": "Resource Schedule",
+        "description": "One room's or teacher's whole week.",
+        "operationId": "resource_schedule_schedule__kind_s__name__get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "room",
+                "teacher"
+              ],
+              "type": "string",
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Resource Schedule Schedule  Kind S  Name  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/schedule/{kind}s/{name}/free": {
+      "get": {
+        "tags": [
+          "schedule"
+        ],
+        "summary": "Resource Free Windows",
+        "description": "Contiguous gaps for one resource on one day.",
+        "operationId": "resource_free_windows_schedule__kind_s__name__free_get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "room",
+                "teacher"
+              ],
+              "type": "string",
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "name",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Name"
+            }
+          },
+          {
+            "name": "day",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 12,
+              "title": "Day"
+            }
+          },
+          {
+            "name": "day_start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "08:00",
+              "title": "Day Start"
+            }
+          },
+          {
+            "name": "day_end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "default": "18:50",
+              "title": "Day End"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Resource Free Windows Schedule  Kind S  Name  Free Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/schedule/availability/{kind}": {
+      "get": {
+        "tags": [
+          "schedule"
+        ],
+        "summary": "Availability",
+        "description": "Who is free and who is busy at a given time.",
+        "operationId": "availability_schedule_availability__kind__get",
+        "parameters": [
+          {
+            "name": "kind",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "enum": [
+                "room",
+                "teacher"
+              ],
+              "type": "string",
+              "title": "Kind"
+            }
+          },
+          {
+            "name": "day",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 12,
+              "title": "Day"
+            }
+          },
+          {
+            "name": "at",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "HH:MM instant",
+              "title": "At"
+            },
+            "description": "HH:MM instant"
+          },
+          {
+            "name": "start",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "HH:MM window start",
+              "title": "Start"
+            },
+            "description": "HH:MM window start"
+          },
+          {
+            "name": "end",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "HH:MM window end",
+              "title": "End"
+            },
+            "description": "HH:MM window end"
+          },
+          {
+            "name": "only",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Comma-separated names to restrict to",
+              "title": "Only"
+            },
+            "description": "Comma-separated names to restrict to"
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Availability Schedule Availability  Kind  Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/admin/schedule/rebuild-index": {
+      "post": {
+        "tags": [
+          "admin"
+        ],
+        "summary": "Rebuild Index",
+        "description": "Force a rebuild after a bulk import, without waiting for the TTL.",
+        "operationId": "rebuild_index_admin_schedule_rebuild_index_post",
+        "parameters": [
+          {
+            "name": "authorization",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Rebuild Index Admin Schedule Rebuild Index Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/improvement/courses": {
+      "get": {
+        "tags": [
+          "improvement"
+        ],
+        "summary": "List Courses",
+        "description": "Courses a student in ``batch`` is allowed to sit for improvement.",
+        "operationId": "list_courses_improvement_courses_get",
+        "parameters": [
+          {
+            "name": "batch",
+            "in": "query",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 2,
+              "maxLength": 32,
+              "title": "Batch"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response List Courses Improvement Courses Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/improvement/plan": {
+      "post": {
+        "tags": [
+          "improvement"
+        ],
+        "summary": "Plan",
+        "description": "Rank junior batches per course and propose combined timetables.",
+        "operationId": "plan_improvement_plan_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PlanBody"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "type": "object",
+                  "title": "Response Plan Improvement Plan Post"
                 }
               }
             }
@@ -7389,6 +7901,31 @@
           "target_id"
         ],
         "title": "PersonalOperationBody"
+      },
+      "PlanBody": {
+        "properties": {
+          "batch": {
+            "type": "string",
+            "maxLength": 32,
+            "minLength": 2,
+            "title": "Batch"
+          },
+          "codes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "maxItems": 8,
+            "minItems": 1,
+            "title": "Codes"
+          }
+        },
+        "type": "object",
+        "required": [
+          "batch",
+          "codes"
+        ],
+        "title": "PlanBody"
       },
       "RebuildBody": {
         "properties": {

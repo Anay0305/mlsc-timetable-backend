@@ -103,9 +103,25 @@ class BuildIndexTests(unittest.TestCase):
         self.assertEqual(index.batch_semester["3C15"], 5)
         self.assertEqual(index.batch_semester["4C12"], 7)
 
-    def test_entries_without_room_or_teacher_are_skipped(self):
+    def test_coded_entry_without_room_or_teacher_still_counts_as_a_class(self):
+        """95 rows across 45 batches carry a code but no room and no teacher.
+
+        They cannot show up in a room or teacher view, but they are real
+        commitments — dropping them hides both the course and the clash.
+        """
         index = build_index(
             [("3C11", ODD, [klass("Monday", "08:00", "08:50", code="UCS503L")])],
+            semester_label=ODD,
+        )
+        self.assertEqual(len(index.occupancies), 1)
+        self.assertEqual(index.by_code["UCS503"][0].code, "UCS503L")
+        self.assertEqual(index.by_batch["3C11"][0].code, "UCS503L")
+        self.assertEqual(index.by_room, {})
+        self.assertEqual(index.by_teacher, {})
+
+    def test_entry_with_nothing_to_identify_it_is_skipped(self):
+        index = build_index(
+            [("3C11", ODD, [klass("Monday", "08:00", "08:50")])],
             semester_label=ODD,
         )
         self.assertEqual(index.occupancies, ())
@@ -222,12 +238,80 @@ class BusyBlockTests(unittest.TestCase):
         self.assertEqual(blocks[0].severity, 2)
         self.assertTrue(blocks[0].uncertain)
 
-    def test_resolved_elective_is_certain(self):
+    def test_plain_class_is_certain(self):
         blocks = busy_blocks_from_classes(
             [klass("Monday", "15:30", "16:20", type="Lecture", code="UCS539L", room="LT102")]
         )
         self.assertEqual(blocks[0].severity, 0)
         self.assertFalse(blocks[0].uncertain)
+
+    def test_chosen_elective_blocks_only_at_the_option_taken(self):
+        """A picked elective is narrowed; blocking at its worst option is false.
+
+        The entry keeps its ``options`` after the pick, so reading the list
+        rather than the choice charges the student for a practical they are
+        not attending — and rejects offerings that actually fit.
+        """
+        blocks = busy_blocks_from_classes(
+            [
+                klass(
+                    "Monday",
+                    "15:30",
+                    "16:20",
+                    type="Lecture",
+                    code="UCS539L",
+                    room="LT102",
+                    electiveChoice="UCS539L",
+                    options=[
+                        {"subject_code": "UCS534P", "type": "Practical", "place": "L408"},
+                        {"subject_code": "UCS539L", "type": "Lecture", "place": "LT102"},
+                    ],
+                )
+            ]
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].severity, 0)
+        self.assertFalse(blocks[0].uncertain)
+
+    def test_dismissed_elective_slot_is_free(self):
+        """Choosing a course offered elsewhere leaves this period genuinely free."""
+        blocks = busy_blocks_from_classes(
+            [
+                klass(
+                    "Monday",
+                    "15:30",
+                    "16:20",
+                    type="Elective",
+                    electiveChoice="UCS534P",
+                    electiveDismissed=True,
+                    options=[
+                        {"subject_code": "UCS539L", "type": "Lecture", "place": "LT102"},
+                        {"subject_code": "UCS541L", "type": "Lecture", "place": "LT103"},
+                    ],
+                )
+            ]
+        )
+        self.assertEqual(blocks, [])
+
+    def test_consecutive_periods_are_one_commitment(self):
+        """A two-period lab is two stored rows but one class to clash against."""
+        blocks = busy_blocks_from_classes(
+            [
+                klass("Tuesday", "10:30", "11:20", type="Practical", code="UCS503P", room="L102"),
+                klass("Tuesday", "11:20", "12:10", type="Practical", code="UCS503P", room="L102"),
+            ]
+        )
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual((blocks[0].start_time, blocks[0].end_time), ("10:30", "12:10"))
+
+    def test_unrelated_back_to_back_classes_stay_apart(self):
+        blocks = busy_blocks_from_classes(
+            [
+                klass("Tuesday", "10:30", "11:20", type="Lecture", code="UCS503L", room="LT1"),
+                klass("Tuesday", "11:20", "12:10", type="Lecture", code="UCS510L", room="LT1"),
+            ]
+        )
+        self.assertEqual(len(blocks), 2)
 
 
 class EvaluateCourseTests(unittest.TestCase):
@@ -428,6 +512,123 @@ class SessionDedupeTests(unittest.TestCase):
         self.assertTrue(option["feasible"])
 
 
+class MultiPeriodClashTests(unittest.TestCase):
+    """A clash budget counts classes, not the periods they are stored in.
+
+    Practicals are stored one period per row and 99% of them run for two, so
+    pairing rows would make a single overlapping lab score four clashes — and
+    a two-period lecture score two, breaking a limit of one that was meant to
+    allow exactly this.
+    """
+
+    def setUp(self):
+        self.index = build_index(
+            [
+                ("2C31", ODD, [
+                    klass("Monday", "08:00", "08:50", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                    klass("Monday", "08:50", "09:40", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                ]),
+            ],
+            semester_label=ODD,
+        )
+        # The student's own two-period lecture, in the very same window.
+        self.blocks = busy_blocks_from_classes([
+            klass("Monday", "08:00", "08:50", code="UCS503L", type="Lecture", room="LT102"),
+            klass("Monday", "08:50", "09:40", code="UCS503L", type="Lecture", room="LT102"),
+        ])
+
+    def _evaluate(self, limits):
+        return improvement_lib.evaluate_course(
+            self.index,
+            code="UCS301",
+            student_batch="3C15",
+            student_semester=5,
+            blocks=self.blocks,
+            limits=limits,
+        )
+
+    def test_two_periods_against_two_periods_is_one_clash(self):
+        option = self._evaluate(ClashLimits(max_lecture=1, max_tutorial=1, max_practical=0))["options"][0]
+        self.assertEqual(option["clash_counts"]["lecture"], 1)
+        self.assertEqual(option["clash_counts"]["total"], 1)
+        self.assertTrue(option["feasible"], "one allowed lecture clash must stay allowed")
+
+    def test_merged_session_is_shown_as_one_block(self):
+        option = self._evaluate(ClashLimits(max_lecture=1, max_tutorial=1, max_practical=0))["options"][0]
+        self.assertEqual(len(option["sessions"]), 1)
+        self.assertEqual(option["sessions"][0]["start_time"], "08:00")
+        self.assertEqual(option["sessions"][0]["end_time"], "09:40")
+
+    def test_relaxing_the_practical_limit_actually_relaxes_it(self):
+        """The documented escape hatch for an over-strict planner must work.
+
+        With periods counted separately a single two-period lab scored two,
+        so raising the limit to one changed nothing.
+        """
+        index = build_index(
+            [("2C31", ODD, [
+                klass("Tuesday", "10:30", "11:20", code="UCS301P", type="Practical", room="L301", teacher="KAP"),
+                klass("Tuesday", "11:20", "12:10", code="UCS301P", type="Practical", room="L301", teacher="KAP"),
+            ])],
+            semester_label=ODD,
+        )
+        blocks = busy_blocks_from_classes([
+            klass("Tuesday", "10:30", "11:20", code="UCS503P", type="Practical", room="L102"),
+            klass("Tuesday", "11:20", "12:10", code="UCS503P", type="Practical", room="L102"),
+        ])
+        evaluate = lambda limits: improvement_lib.evaluate_course(  # noqa: E731
+            index, code="UCS301", student_batch="3C15", student_semester=5,
+            blocks=blocks, limits=limits,
+        )["options"][0]
+        strict = evaluate(ClashLimits(max_lecture=1, max_tutorial=1, max_practical=0))
+        self.assertEqual(strict["clash_counts"]["practical"], 1)
+        self.assertFalse(strict["feasible"])
+        relaxed = evaluate(ClashLimits(max_lecture=1, max_tutorial=1, max_practical=1))
+        self.assertTrue(relaxed["feasible"])
+
+
+class ParallelSectionTests(unittest.TestCase):
+    def test_same_course_in_different_rooms_stays_two_options(self):
+        """Two sections are a real choice; merging them prints the wrong room."""
+        index = build_index(
+            [
+                ("2C31", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                ]),
+                ("2C32", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT302", teacher="RSH"),
+                ]),
+            ],
+            semester_label=ODD,
+        )
+        result = improvement_lib.evaluate_course(
+            index, code="UCS301", student_batch="3C15", student_semester=5,
+            blocks=[], limits=ClashLimits(),
+        )
+        self.assertEqual(len(result["options"]), 2)
+        rooms = {option["sessions"][0]["room"]: option["batch"] for option in result["options"]}
+        self.assertEqual(rooms, {"LT301": "2C31", "LT302": "2C32"})
+
+    def test_one_shared_lecture_still_collapses_to_one_option(self):
+        index = build_index(
+            [
+                ("2H21", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                ]),
+                ("2H22", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                ]),
+            ],
+            semester_label=ODD,
+        )
+        result = improvement_lib.evaluate_course(
+            index, code="UCS301", student_batch="3C15", student_semester=5,
+            blocks=[], limits=ClashLimits(),
+        )
+        self.assertEqual(len(result["options"]), 1)
+        self.assertEqual(result["options"][0]["batches"], ["2H21", "2H22"])
+
+
 class PlanSearchTests(unittest.TestCase):
     """Two improvement courses must not be scheduled on top of each other."""
 
@@ -486,6 +687,70 @@ class PlanSearchTests(unittest.TestCase):
         result = self._plan(["UCS302L"])
         self.assertTrue(result["plans"])
         self.assertEqual(len(result["plans"][0]["picks"]), 1)
+
+
+class BestPlanTests(unittest.TestCase):
+    """When only a few plans are returned they must be the best ones.
+
+    A depth-first walk that stops at the first N complete plans returns N
+    variations on the first course's first option and calls that a ranking.
+    """
+
+    def setUp(self):
+        self.index = build_index(
+            [
+                ("3C15", ODD, []),
+                # UCS301 runs in two batches; UCS302 in two more. The first
+                # combination the search reaches (2C31 + 2C33) collides, while
+                # a later one (2C31 + 2C34) is clean.
+                ("2C31", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT301", teacher="KAP"),
+                ]),
+                ("2C32", ODD, [
+                    klass("Tuesday", "09:40", "10:30", code="UCS301L", type="Lecture", room="LT302", teacher="KAP"),
+                ]),
+                ("2C33", ODD, [
+                    klass("Monday", "09:40", "10:30", code="UCS302L", type="Lecture", room="LT303", teacher="RSH"),
+                ]),
+                ("2C34", ODD, [
+                    klass("Wednesday", "09:40", "10:30", code="UCS302L", type="Lecture", room="LT304", teacher="RSH"),
+                ]),
+            ],
+            semester_label=ODD,
+        )
+
+    def _plan(self, max_plans):
+        from server.config import get_settings
+
+        settings = get_settings()
+        # One lecture clash is tolerated, so the colliding combination is a
+        # legal plan — just a worse one than the clean alternative.
+        object.__setattr__(settings, "improvement_max_lecture_clashes", 1)
+        object.__setattr__(settings, "improvement_max_tutorial_clashes", 0)
+        object.__setattr__(settings, "improvement_max_practical_clashes", 0)
+        object.__setattr__(settings, "improvement_pool_first_year_semesters", True)
+        object.__setattr__(settings, "improvement_max_plan_options", max_plans)
+        return improvement_lib.plan_improvements(
+            self.index,
+            student_batch="3C15",
+            student_semester=5,
+            student_classes=[],
+            codes=["UCS301L", "UCS302L"],
+            settings=settings,
+        )
+
+    def test_the_one_plan_returned_is_the_clean_one(self):
+        result = self._plan(max_plans=1)
+        self.assertEqual(len(result["plans"]), 1)
+        self.assertEqual(result["plans"][0]["total_clashes"], 0)
+        self.assertTrue(result["plans_truncated"])
+
+    def test_full_ranking_is_ordered_by_clash_count(self):
+        result = self._plan(max_plans=20)
+        totals = [plan["total_clashes"] for plan in result["plans"]]
+        self.assertEqual(totals, sorted(totals))
+        self.assertEqual(totals[0], 0)
+        self.assertFalse(result["plans_truncated"])
 
 
 class AvailableCoursesTests(unittest.TestCase):

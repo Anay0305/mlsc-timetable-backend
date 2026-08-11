@@ -27,7 +27,7 @@ they would lose every single week.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Iterable, Mapping, Sequence
 
 from server.config import Settings, get_settings
@@ -130,6 +130,20 @@ def is_reachable_semester(
     return candidate_semester % 2 == student_semester % 2
 
 
+def _elective_choice(entry: Mapping[str, Any]) -> Any:
+    return entry.get("electiveChoice") or entry.get("elective_choice")
+
+
+def _elective_dismissed(entry: Mapping[str, Any]) -> bool:
+    """Did the student resolve this group in another slot, freeing this one?
+
+    Picking a course offered in a different period marks every slot of the
+    group that cannot supply it as dismissed, and the grid stops rendering
+    them. The flag is saved as part of the operation, so it reaches us here.
+    """
+    return entry.get("electiveDismissed") is True or entry.get("elective_dismissed") is True
+
+
 def busy_blocks_from_classes(classes: Iterable[Any]) -> list[BusyBlock]:
     """Turn a student's own timetable into the windows they cannot leave.
 
@@ -137,6 +151,15 @@ def busy_blocks_from_classes(classes: Iterable[Any]) -> list[BusyBlock]:
     worst severity among its options and is marked ``uncertain`` — picking the
     lecture option may free the slot from the practical rule, and the caller
     can say so rather than silently rejecting good offerings.
+
+    Once the choice *is* made the slot is no longer uncertain: the entry has
+    been narrowed to the chosen option, so it blocks at that option's severity
+    alone. Treating a resolved elective as its worst option would reject
+    offerings the student can attend — the picks are merged in precisely so
+    that stops happening. A dismissed slot is free and blocks nothing.
+
+    Consecutive periods of one class are folded into the single session the
+    student actually sits through; see :func:`_merge_blocks`.
     """
     blocks: list[BusyBlock] = []
     for raw in classes or []:
@@ -146,9 +169,12 @@ def busy_blocks_from_classes(classes: Iterable[Any]) -> list[BusyBlock]:
         end_minute = parse_minute(entry.get("end_time"))
         if not day or start_minute is None or end_minute is None or end_minute <= start_minute:
             continue
+        if _elective_dismissed(entry):
+            continue
 
         options = entry.get("options")
-        if isinstance(options, list) and len(options) > 1:
+        chosen = _elective_choice(entry)
+        if isinstance(options, list) and len(options) > 1 and not chosen:
             severities = {
                 severity_for_type(option.get("type"))
                 for option in options
@@ -162,7 +188,7 @@ def busy_blocks_from_classes(classes: Iterable[Any]) -> list[BusyBlock]:
             severity = severity_for_type(entry.get("type"))
             uncertain = False
             label = entry.get("subject")
-            code = entry.get("code")
+            code = entry.get("code") or chosen
 
         blocks.append(
             BusyBlock(
@@ -177,7 +203,76 @@ def busy_blocks_from_classes(classes: Iterable[Any]) -> list[BusyBlock]:
                 uncertain=uncertain,
             )
         )
-    return blocks
+    return _merge_blocks(blocks)
+
+
+def _day_rank(day: str) -> int:
+    return DAY_ORDER.index(day) if day in DAY_ORDER else len(DAY_ORDER)
+
+
+def _merge_blocks(blocks: Sequence[BusyBlock]) -> list[BusyBlock]:
+    """Fold consecutive periods of one class into a single commitment.
+
+    Timetables are stored one period per row, so a two-hour lab is two rows.
+    A clash budget counts *classes* — "one lecture may be missed" — so leaving
+    them apart makes a single overlapping lab score two clashes and a single
+    two-period lecture score two, which silently exceeds a limit of one. Three
+    quarters of all practicals in the current data span more than one period,
+    so this is the common case rather than an edge.
+
+    Only rows carrying the same course code merge; two unrelated code-less
+    rows that happen to sit back to back are left alone.
+    """
+    ordered = sorted(blocks, key=lambda block: (_day_rank(block.day), block.start_minute))
+    merged: list[BusyBlock] = []
+    for block in ordered:
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and previous.code
+            and previous.code == block.code
+            and previous.day == block.day
+            and previous.severity == block.severity
+            and previous.uncertain == block.uncertain
+            and previous.end_minute == block.start_minute
+        ):
+            merged[-1] = replace(previous, end_minute=block.end_minute, end_time=block.end_time)
+            continue
+        merged.append(block)
+    return merged
+
+
+def _merge_periods(items: Sequence[Occupancy]) -> list[Occupancy]:
+    """The same fold, for the sessions of an offering the student would join.
+
+    Room, teacher and week pattern must match too: a class that changes room
+    half way through is two things to attend, and showing it as one block
+    would send the student to the wrong place for the second half.
+    """
+    ordered = sorted(items, key=lambda item: (_day_rank(item.day), item.start_minute))
+    merged: list[Occupancy] = []
+    for item in ordered:
+        previous = merged[-1] if merged else None
+        if (
+            previous is not None
+            and previous.code
+            and previous.code == item.code
+            and previous.day == item.day
+            and previous.type == item.type
+            and previous.room == item.room
+            and previous.teacher == item.teacher
+            and previous.alternate_week_start == item.alternate_week_start
+            and previous.end_minute == item.start_minute
+        ):
+            merged[-1] = replace(
+                previous,
+                end_minute=item.end_minute,
+                end_time=item.end_time,
+                batches=tuple(sorted(set(previous.batches) | set(item.batches))),
+            )
+            continue
+        merged.append(item)
+    return merged
 
 
 def _session_block(item: Occupancy) -> BusyBlock:
@@ -241,22 +336,26 @@ def resolve_code(index: ScheduleIndex, code: str) -> str:
     return base_course_code(raw)
 
 
-def _ordered(items: Iterable[Occupancy]) -> list[Occupancy]:
-    """Sessions in reading order: Monday first, then by start time."""
-    return sorted(
-        items,
-        key=lambda item: (
-            DAY_ORDER.index(item.day) if item.day in DAY_ORDER else len(DAY_ORDER),
-            item.start_minute,
-        ),
-    )
-
-
 def _signature(sessions: Iterable[Occupancy]) -> tuple:
-    """What a student would actually sit through, ignoring which batch it is."""
+    """What a student would actually sit through, ignoring which batch it is.
+
+    Room and teacher are part of it. Two batches sharing one lecture fold into
+    a single occupancy upstream, so they still match here; but two batches
+    taught the same course at the same hour in *different* rooms are parallel
+    sections, not one class, and collapsing them would print one section's
+    room against the other section's batch.
+    """
     return tuple(
         sorted(
-            (item.day, item.start_minute, item.end_minute, item.code or "", item.type)
+            (
+                item.day,
+                item.start_minute,
+                item.end_minute,
+                item.code or "",
+                item.type,
+                item.room or "",
+                item.teacher or "",
+            )
             for item in sessions
         )
     )
@@ -374,6 +473,87 @@ def available_courses(
     )
 
 
+def _tally_counts(tally: Mapping[int, int]) -> dict[str, int]:
+    return {
+        "lecture": tally.get(SEVERITY_LECTURE, 0),
+        "tutorial": tally.get(SEVERITY_TUTORIAL, 0),
+        "practical": tally.get(SEVERITY_PRACTICAL, 0),
+        "total": sum(tally.values()),
+    }
+
+
+def _course_options(
+    index: ScheduleIndex,
+    *,
+    code: str,
+    student_batch: str,
+    student_semester: int,
+    blocks: Sequence[BusyBlock],
+    limits: ClashLimits,
+    pool_first_year: bool,
+    include_teacher: bool,
+) -> tuple[dict[str, Any], list[list[Occupancy]]]:
+    """Rank the offerings of one course, keeping the sessions behind each.
+
+    Returns the public payload *and* the merged sessions per option in the same
+    order, so a multi-course plan can reuse them instead of recomputing the
+    grouping — and cannot drift from what the student was shown.
+    """
+    normalized = resolve_code(index, code)
+    grouped = offerings_for_code(
+        index,
+        normalized,
+        student_semester=student_semester,
+        pool_first_year=pool_first_year,
+        exclude_batches=[student_batch],
+    )
+
+    scored: list[tuple[dict[str, Any], list[Occupancy]]] = []
+    for _signature_key, batches in _group_equivalent(grouped).items():
+        sessions = _merge_periods(grouped[batches[0]])
+        found, tally = _clashes(sessions, blocks, include_teacher=include_teacher)
+        counts = _tally_counts(tally)
+        scored.append(
+            (
+                {
+                    "batches": batches,
+                    "batch": batches[0],
+                    "semester": index.batch_semester.get(batches[0]),
+                    "feasible": limits.allows(tally),
+                    "clash_counts": counts,
+                    "has_uncertain_clash": any(clash["uncertain"] for clash in found),
+                    "sessions": [
+                        item.public_dict(include_teacher=include_teacher) for item in sessions
+                    ],
+                    "clashes": found,
+                },
+                sessions,
+            )
+        )
+
+    scored.sort(
+        key=lambda pair: (
+            not pair[0]["feasible"],
+            pair[0]["clash_counts"]["practical"],
+            pair[0]["clash_counts"]["total"],
+            pair[0]["batch"],
+        )
+    )
+    options = [option for option, _ in scored]
+    subject = next(
+        (item.subject for item in index.by_code.get(normalized, ()) if item.subject),
+        None,
+    )
+    payload = {
+        "code": normalized,
+        "subject": subject,
+        "offered": bool(grouped),
+        "feasible_count": sum(1 for option in options if option["feasible"]),
+        "options": options,
+    }
+    return payload, [sessions for _, sessions in scored]
+
+
 def evaluate_course(
     index: ScheduleIndex,
     *,
@@ -386,59 +566,25 @@ def evaluate_course(
     include_teacher: bool = True,
 ) -> dict[str, Any]:
     """Rank every junior batch offering ``code`` for one student."""
-    normalized = resolve_code(index, code)
-    grouped = offerings_for_code(
+    payload, _sessions = _course_options(
         index,
-        normalized,
+        code=code,
+        student_batch=student_batch,
         student_semester=student_semester,
+        blocks=blocks,
+        limits=limits,
         pool_first_year=pool_first_year,
-        exclude_batches=[student_batch],
+        include_teacher=include_teacher,
     )
+    return payload
 
-    options: list[dict[str, Any]] = []
-    for signature, batches in _group_equivalent(grouped).items():
-        ordered = _ordered(grouped[batches[0]])
-        found, tally = _clashes(ordered, blocks, include_teacher=include_teacher)
-        feasible = limits.allows(tally)
-        options.append(
-            {
-                "batches": batches,
-                "batch": batches[0],
-                "semester": index.batch_semester.get(batches[0]),
-                "feasible": feasible,
-                "clash_counts": {
-                    "lecture": tally.get(SEVERITY_LECTURE, 0),
-                    "tutorial": tally.get(SEVERITY_TUTORIAL, 0),
-                    "practical": tally.get(SEVERITY_PRACTICAL, 0),
-                    "total": sum(tally.values()),
-                },
-                "has_uncertain_clash": any(clash["uncertain"] for clash in found),
-                "sessions": [
-                    item.public_dict(include_teacher=include_teacher) for item in ordered
-                ],
-                "clashes": found,
-            }
-        )
 
-    options.sort(
-        key=lambda option: (
-            not option["feasible"],
-            option["clash_counts"]["practical"],
-            option["clash_counts"]["total"],
-            option["batch"],
-        )
-    )
-    subject = next(
-        (item.subject for item in index.by_code.get(normalized, ()) if item.subject),
-        None,
-    )
-    return {
-        "code": normalized,
-        "subject": subject,
-        "offered": bool(grouped),
-        "feasible_count": sum(1 for option in options if option["feasible"]),
-        "options": options,
-    }
+# The search is exponential in the number of courses, so it is bounded by the
+# combinations it examines rather than by the plans it keeps. Stopping at the
+# first N *complete* plans instead would return whatever the depth-first walk
+# reached first — every one of them sharing the first course's first option —
+# and call it the ranking.
+_MAX_SEARCH_NODES = 20_000
 
 
 def _plan_search(
@@ -449,23 +595,35 @@ def _plan_search(
     index: ScheduleIndex,
     include_teacher: bool,
     max_plans: int,
-) -> list[dict[str, Any]]:
+    max_nodes: int = _MAX_SEARCH_NODES,
+) -> tuple[list[dict[str, Any]], bool]:
     """Pick one batch per course such that every pick stays inside the budget.
 
     Each course is checked against the student's own timetable *plus* the
     offerings already chosen, so two improvement courses cannot be scheduled
     on top of each other.
+
+    Returns the best ``max_plans`` combinations and whether the search was cut
+    short — the caller has to be able to say so rather than presenting a
+    truncated walk as the complete ranking.
     """
-    plans: list[dict[str, Any]] = []
+    found_plans: list[dict[str, Any]] = []
     # Fewest viable options first: the most constrained course prunes hardest.
     ordered_courses = sorted(courses, key=lambda course: len(course["viable"]))
+    nodes = 0
+    truncated = False
 
     def recurse(depth: int, blocks: list[BusyBlock], picks: list[dict[str, Any]]) -> None:
-        if len(plans) >= max_plans:
+        nonlocal nodes, truncated
+        if truncated:
+            return
+        nodes += 1
+        if nodes > max_nodes:
+            truncated = True
             return
         if depth == len(ordered_courses):
             if picks:
-                plans.append(
+                found_plans.append(
                     {
                         "picks": [dict(pick) for pick in picks],
                         "total_clashes": sum(pick["clash_counts"]["total"] for pick in picks),
@@ -478,7 +636,7 @@ def _plan_search(
 
         course = ordered_courses[depth]
         for batches, sessions in course["viable"]:
-            found, tally = _clashes(sessions, blocks, include_teacher=include_teacher)
+            clashes, tally = _clashes(sessions, blocks, include_teacher=include_teacher)
             if not limits.allows(tally):
                 continue
             pick = {
@@ -487,28 +645,31 @@ def _plan_search(
                 "batches": batches,
                 "batch": batches[0],
                 "semester": index.batch_semester.get(batches[0]),
-                "clash_counts": {
-                    "lecture": tally.get(SEVERITY_LECTURE, 0),
-                    "tutorial": tally.get(SEVERITY_TUTORIAL, 0),
-                    "practical": tally.get(SEVERITY_PRACTICAL, 0),
-                    "total": sum(tally.values()),
-                },
+                "clash_counts": _tally_counts(tally),
                 "sessions": [
                     item.public_dict(include_teacher=include_teacher) for item in sessions
                 ],
-                "clashes": found,
+                "clashes": clashes,
             }
             recurse(
                 depth + 1,
                 blocks + [_session_block(item) for item in sessions],
                 picks + [pick],
             )
-            if len(plans) >= max_plans:
+            if truncated:
                 return
 
     recurse(0, list(base_blocks), [])
-    plans.sort(key=lambda plan: (plan["practical_clashes"], plan["total_clashes"]))
-    return plans
+    # Rank across everything the search saw, then cut — so the plans returned
+    # are the best ones, not the first ones.
+    found_plans.sort(
+        key=lambda plan: (
+            plan["practical_clashes"],
+            plan["total_clashes"],
+            [pick["batch"] for pick in plan["picks"]],
+        )
+    )
+    return found_plans[:max_plans], truncated or len(found_plans) > max_plans
 
 
 def plan_improvements(
@@ -536,8 +697,11 @@ def plan_improvements(
     if not normalized_codes:
         raise ImprovementError("at least one course code is required")
 
-    results = [
-        evaluate_course(
+    results: list[dict[str, Any]] = []
+    # Only courses with at least one workable batch can take part in a plan.
+    planable: list[dict[str, Any]] = []
+    for code in normalized_codes:
+        result, sessions_per_option = _course_options(
             index,
             code=code,
             student_batch=batch,
@@ -547,22 +711,10 @@ def plan_improvements(
             pool_first_year=pool_first_year,
             include_teacher=include_teacher,
         )
-        for code in normalized_codes
-    ]
-
-    # Only courses with at least one workable batch can take part in a plan.
-    planable = []
-    for result in results:
-        grouped = offerings_for_code(
-            index,
-            result["code"],
-            student_semester=student_semester,
-            pool_first_year=pool_first_year,
-            exclude_batches=[batch],
-        )
+        results.append(result)
         viable = [
-            (option["batches"], _ordered(grouped.get(option["batch"], [])))
-            for option in result["options"]
+            (option["batches"], sessions)
+            for option, sessions in zip(result["options"], sessions_per_option)
             if option["feasible"]
         ]
         if viable:
@@ -571,8 +723,9 @@ def plan_improvements(
             )
 
     plans: list[dict[str, Any]] = []
+    plans_truncated = False
     if len(planable) == len(normalized_codes) and planable:
-        plans = _plan_search(
+        plans, plans_truncated = _plan_search(
             planable,
             blocks,
             limits,
@@ -596,6 +749,7 @@ def plan_improvements(
         "first_year_semesters_pooled": pool_first_year,
         "courses": results,
         "plans": plans,
+        "plans_truncated": plans_truncated,
         "unavailable_codes": unavailable,
         "blocked_codes": blocked,
         "has_unresolved_electives": any(block.uncertain for block in blocks),

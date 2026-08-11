@@ -294,9 +294,13 @@ def build_index(
             alternate = _clean(entry.get("alternate_week_start"))
 
             for record in _expand_entry(entry):
-                if not record["rooms"] and not record["teacher"]:
-                    # Nothing to index this against.
+                if not record["rooms"] and not record["teacher"] and not record["code"]:
+                    # Nothing to index this against at all.
                     continue
+                # A class with a course code but no room or teacher still runs:
+                # 95 rows across 45 batches look like this. It cannot appear in
+                # a room or teacher view — those buckets skip it below — but it
+                # is a real commitment, so improvement planning must see it.
                 subject = record["subject"]
                 if not subject and record["code"] and catalog is not None:
                     subject = catalog.name_for(record["code"]) or None

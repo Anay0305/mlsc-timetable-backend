@@ -43,10 +43,19 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         user_counts = iter([100, 10, 35, 70, 12, 80])
         user_filters: list[dict] = []
         user_aggregates = iter([
+            # 1. top batches
             _AggregateResult([
                 {"_id": "3C11", "count": 22},
                 {"_id": "2Q22", "count": 16},
             ]),
+            # 2. per-batch rollup, folded into years
+            _AggregateResult([
+                {"_id": "1A11", "users": 12, "active_24h": 3, "active_7d": 8},
+                {"_id": "1B12", "users": 5, "active_24h": 1, "active_7d": 4},
+                {"_id": "3C11", "users": 22, "active_24h": 6, "active_7d": 15},
+                {"_id": "????", "users": 2, "active_24h": 0, "active_7d": 1},
+            ]),
+            # 3. registration trend
             _AggregateResult([
                 {"_id": "2026-07-29", "count": 3},
             ]),
@@ -90,6 +99,16 @@ class UserAnalyticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["calendar_connected"], 14)
         self.assertEqual(result["calendar_enabled"], 9)
         self.assertEqual(result["top_batches"][0], {"batch": "3C11", "count": 22})
+
+        # Year rollup: batches fold into their year, active counts add up, and
+        # a code we cannot read is kept as its own bucket rather than dropped.
+        self.assertEqual(result["by_year"], [
+            {"year": 1, "users": 17, "active_24h": 4, "active_7d": 12, "batches": 2},
+            {"year": 3, "users": 22, "active_24h": 6, "active_7d": 15, "batches": 1},
+            {"year": None, "users": 2, "active_24h": 0, "active_7d": 1, "batches": 1},
+        ])
+        # 100 total, 80 with a saved batch.
+        self.assertEqual(result["without_batch"], 20)
         self.assertEqual(len(result["registration_trend"]), 30)
         self.assertEqual(result["registration_trend"][0]["date"], "2026-07-01")
         self.assertEqual(result["registration_trend"][-1]["date"], "2026-07-30")

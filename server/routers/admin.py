@@ -39,6 +39,11 @@ class TeacherVisibilityBody(BaseModel):
     batches: list[str]
 
 
+class SiteStatusBody(BaseModel):
+    maintenance: bool
+    message: Optional[str] = None
+
+
 class CurriculumLibraryBody(BaseModel):
     sections: list[dict]
     source: Optional[str] = None
@@ -218,6 +223,29 @@ async def delete_admin_user(email: str) -> dict[str, object]:
             "code": "not_found",
         })
     return {"ok": True, "email": email.strip().lower()}
+
+
+@router.get("/site-status")
+async def get_admin_site_status() -> dict[str, object]:
+    return await storage.read_site_status()
+
+
+@router.put("/site-status")
+async def put_site_status(
+    body: SiteStatusBody,
+    principal: AdminPrincipal = Depends(require_admin),
+) -> dict[str, object]:
+    status = await storage.write_site_status(
+        body.maintenance,
+        body.message,
+        updated_by=principal.label,
+    )
+    logger.info(
+        "Site status set to %s by %s",
+        "MAINTENANCE" if status["maintenance"] else "LIVE",
+        principal.label,
+    )
+    return {"ok": True, **status}
 
 
 @router.get("/teacher-visibility")

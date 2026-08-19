@@ -52,6 +52,7 @@ from server.db.models import (
     LastIngestChange,
     ParsingErrorDoc,
     SemesterDoc,
+    SiteStatusDoc,
     SubjectDoc,
     TimetableDoc,
     UploadAttemptDoc,
@@ -181,6 +182,59 @@ async def project_curriculum_payload(
         "available": doc is not None,
     }
     return projected, issues
+
+
+DEFAULT_MAINTENANCE_MESSAGE = "Please use excel provided by the university at thapar.edu"
+
+
+async def read_site_status() -> dict[str, Any]:
+    """Public maintenance state. Never raises — no doc means the site is up."""
+    doc = await SiteStatusDoc.find_one(SiteStatusDoc.key == "site")
+    if doc is None:
+        return {
+            "maintenance": False,
+            "message": DEFAULT_MAINTENANCE_MESSAGE,
+            "updated_at": None,
+        }
+    message = (doc.message or "").strip() or DEFAULT_MAINTENANCE_MESSAGE
+    return {
+        "maintenance": bool(doc.maintenance),
+        "message": message,
+        "updated_at": doc.updated_at.isoformat() if doc.updated_at else None,
+    }
+
+
+async def write_site_status(
+    maintenance: bool,
+    message: str | None = None,
+    *,
+    updated_by: str | None = None,
+) -> dict[str, Any]:
+    """Upsert the singleton takedown state and return the stored shape."""
+    text = (message or "").strip() or DEFAULT_MAINTENANCE_MESSAGE
+    now = datetime.now(timezone.utc)
+    doc = await SiteStatusDoc.find_one(SiteStatusDoc.key == "site")
+    if doc is None:
+        doc = SiteStatusDoc(
+            key="site",
+            maintenance=bool(maintenance),
+            message=text,
+            updated_at=now,
+            updated_by=updated_by,
+        )
+        await doc.insert()
+    else:
+        await doc.set({
+            "maintenance": bool(maintenance),
+            "message": text,
+            "updated_at": now,
+            "updated_by": updated_by,
+        })
+    return {
+        "maintenance": bool(maintenance),
+        "message": text,
+        "updated_at": now.isoformat(),
+    }
 
 
 async def read_teacher_visibility() -> list[dict[str, Any]]:

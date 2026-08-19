@@ -73,6 +73,23 @@ class SemesterDoc(Document):
         name = "semester"
 
 
+class SiteStatusDoc(Document):
+    """Singleton — only one doc with `key == "site"` ever exists.
+
+    Drives the public maintenance/takedown screen. Absence of the doc means
+    the site is up, so a fresh database needs no seeding.
+    """
+
+    key: Annotated[str, Indexed(unique=True)] = "site"
+    maintenance: bool = False
+    message: Optional[str] = None
+    updated_at: datetime = Field(default_factory=_utcnow)
+    updated_by: Optional[str] = None
+
+    class Settings:
+        name = "site_status"
+
+
 class BatchDoc(Document):
     code: Annotated[str, Indexed(unique=True)]
     year: Optional[int] = None
@@ -734,6 +751,7 @@ class DownloadEventDoc(Document):
 
 ALL_DOCUMENTS = [
     SemesterDoc,
+    SiteStatusDoc,
     BatchDoc,
     TimetableDoc,
     UserDoc,
